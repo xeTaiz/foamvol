@@ -59,7 +59,7 @@ def main():
     parser = argparse.ArgumentParser(description="Visualize volume slices")
     parser.add_argument("volume", type=str, help="Path to volume.npy")
     parser.add_argument("--gt", type=str, default=None, help="Optional ground truth volume.npy")
-    parser.add_argument("--vmax", type=float, default=None, help="Color scale max (auto if not set)")
+    parser.add_argument("--vmax", type=float, default=1.0, help="Color scale max (auto if not set)")
     args = parser.parse_args()
     visualize(args.volume, vmax=args.vmax)
 
