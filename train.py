@@ -17,6 +17,8 @@ from data_loader import DataHandler
 from configs import *
 from radfoam_model.scene import CTScene
 from radfoam_model.utils import psnr
+from voxelize import voxelize
+from visualize_volume import visualize
 import radfoam
 
 
@@ -232,6 +234,12 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         test_proj_batch_fetcher,
         pipeline_args.debug,
     )
+
+    if not pipeline_args.debug:
+        model_path = f"{out_dir}/model.pt"
+        volume_path = f"{out_dir}/volume.npy"
+        voxelize(model_path, resolution=512, output_path=volume_path)
+        visualize(volume_path)
 
 
 def main():
