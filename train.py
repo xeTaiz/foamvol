@@ -14,13 +14,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 
 from data_loader import DataHandler
 from configs import *
 from radfoam_model.scene import CTScene
-from radfoam_model.utils import psnr
 from voxelize import voxelize
 from visualize_volume import visualize
 import radfoam
@@ -29,6 +29,48 @@ import radfoam
 seed = 42
 torch.random.manual_seed(seed)
 np.random.seed(seed)
+
+
+def compute_psnr(pred, gt):
+    """PSNR between two tensors using the ground-truth data range."""
+    mse = ((pred - gt) ** 2).mean()
+    if mse == 0:
+        return float("inf")
+    data_range = gt.max() - gt.min()
+    return (10 * torch.log10(data_range ** 2 / mse)).item()
+
+
+def compute_ssim(pred, gt, window_size=11):
+    """SSIM between two (H, W, C) projection images."""
+    data_range = gt.max() - gt.min()
+    if data_range == 0:
+        return 1.0
+
+    C = pred.shape[-1]
+    pred_4d = pred.permute(2, 0, 1).unsqueeze(0)  # (1, C, H, W)
+    gt_4d = gt.permute(2, 0, 1).unsqueeze(0)
+
+    sigma = 1.5
+    coords = torch.arange(window_size, dtype=torch.float32, device=pred.device) - window_size // 2
+    gauss = torch.exp(-coords ** 2 / (2 * sigma ** 2))
+    gauss = gauss / gauss.sum()
+    kernel = (gauss[:, None] * gauss[None, :]).expand(C, 1, -1, -1)
+
+    pad = window_size // 2
+    mu1 = F.conv2d(pred_4d, kernel, padding=pad, groups=C)
+    mu2 = F.conv2d(gt_4d, kernel, padding=pad, groups=C)
+
+    sigma1_sq = F.conv2d(pred_4d ** 2, kernel, padding=pad, groups=C) - mu1 ** 2
+    sigma2_sq = F.conv2d(gt_4d ** 2, kernel, padding=pad, groups=C) - mu2 ** 2
+    sigma12 = F.conv2d(pred_4d * gt_4d, kernel, padding=pad, groups=C) - mu1 * mu2
+
+    C1 = (0.01 * data_range) ** 2
+    C2 = (0.03 * data_range) ** 2
+
+    ssim_map = ((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) / (
+        (mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2)
+    )
+    return ssim_map.mean().item()
 
 
 def log_diagnostics(model, writer, step):
@@ -170,6 +212,13 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         test_data_handler.projections, batch_size=1, shuffle=False
     )
 
+    train_ray_batch_fetcher = radfoam.BatchFetcher(
+        train_data_handler.rays, batch_size=1, shuffle=False
+    )
+    train_proj_batch_fetcher = radfoam.BatchFetcher(
+        train_data_handler.projections, batch_size=1, shuffle=False
+    )
+
     # Setting up loss
     if pipeline_args.loss_type == "l1":
         loss_fn = nn.L1Loss()
@@ -189,14 +238,16 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         max_iterations=pipeline_args.iterations,
     )
 
-    def test_render(test_data_handler, ray_batch_fetcher, proj_batch_fetcher, debug=False):
-        rays = test_data_handler.rays
+    def eval_views(data_handler, ray_batch_fetcher, proj_batch_fetcher):
+        rays = data_handler.rays
         points, _, _, _ = model.get_trace_data()
         start_points = model.get_starting_point(
             rays[:, 0, 0].cuda(), points, model.aabb_tree
         )
 
         rmse_list = []
+        psnr_list = []
+        ssim_list = []
         with torch.no_grad():
             for i in range(rays.shape[0]):
                 ray_batch = ray_batch_fetcher.next()[0]
@@ -204,17 +255,16 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 proj_output, _, _, _ = model(ray_batch, start_points[i])
 
                 mse = ((proj_output - proj_batch) ** 2).mean()
-                rmse = torch.sqrt(mse)
-                rmse_list.append(rmse.item())
+                rmse_list.append(torch.sqrt(mse).item())
+                psnr_list.append(compute_psnr(proj_output, proj_batch))
+                ssim_list.append(compute_ssim(proj_output, proj_batch))
                 torch.cuda.synchronize()
 
-        average_rmse = sum(rmse_list) / len(rmse_list)
-        if not debug and not pipeline_args.debug:
-            f = open(f"{out_dir}/metrics.txt", "w")
-            f.write(f"Average RMSE: {average_rmse:.6f}")
-            f.close()
-
-        return average_rmse
+        return {
+            "rmse": sum(rmse_list) / len(rmse_list),
+            "psnr": sum(psnr_list) / len(psnr_list),
+            "ssim": sum(ssim_list) / len(ssim_list),
+        }
 
     def train_loop(viewer):
         print("Training")
@@ -252,15 +302,25 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 if i % 100 == 99 and not pipeline_args.debug:
                     writer.add_scalar("train/loss", loss.item(), i)
                     num_points = model.primal_points.shape[0]
-                    writer.add_scalar("test/num_points", num_points, i)
+                    writer.add_scalar("train/num_points", num_points, i)
 
-                    test_rmse = test_render(
+                    test_metrics = eval_views(
                         test_data_handler,
                         test_ray_batch_fetcher,
                         test_proj_batch_fetcher,
-                        True,
                     )
-                    writer.add_scalar("test/rmse", test_rmse, i)
+                    writer.add_scalar("test/rmse", test_metrics["rmse"], i)
+                    writer.add_scalar("test/psnr", test_metrics["psnr"], i)
+                    writer.add_scalar("test/ssim", test_metrics["ssim"], i)
+
+                    train_metrics = eval_views(
+                        train_data_handler,
+                        train_ray_batch_fetcher,
+                        train_proj_batch_fetcher,
+                    )
+                    writer.add_scalar("train/rmse", train_metrics["rmse"], i)
+                    writer.add_scalar("train/psnr", train_metrics["psnr"], i)
+                    writer.add_scalar("train/ssim", train_metrics["ssim"], i)
 
                     writer.add_scalar(
                         "lr/points_lr", model.xyz_scheduler_args(i), i
@@ -333,14 +393,26 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     if not pipeline_args.debug:
         writer.close()
 
-    test_render(
+    test_metrics = eval_views(
         test_data_handler,
         test_ray_batch_fetcher,
         test_proj_batch_fetcher,
-        pipeline_args.debug,
+    )
+    train_metrics = eval_views(
+        train_data_handler,
+        train_ray_batch_fetcher,
+        train_proj_batch_fetcher,
     )
 
     if not pipeline_args.debug:
+        with open(f"{out_dir}/metrics.txt", "w") as f:
+            f.write(f"Test  RMSE: {test_metrics['rmse']:.6f}\n")
+            f.write(f"Test  PSNR: {test_metrics['psnr']:.4f}\n")
+            f.write(f"Test  SSIM: {test_metrics['ssim']:.6f}\n")
+            f.write(f"Train RMSE: {train_metrics['rmse']:.6f}\n")
+            f.write(f"Train PSNR: {train_metrics['psnr']:.4f}\n")
+            f.write(f"Train SSIM: {train_metrics['ssim']:.6f}\n")
+
         model_path = f"{out_dir}/model.pt"
         volume_path = f"{out_dir}/volume.npy"
         voxelize(model_path, resolution=512, output_path=volume_path, extent=1.0)
