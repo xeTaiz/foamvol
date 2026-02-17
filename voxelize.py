@@ -8,6 +8,8 @@ Usage:
 """
 
 import argparse
+import os
+
 import numpy as np
 import torch
 import radfoam
@@ -86,11 +88,15 @@ def main():
     parser = argparse.ArgumentParser(description="Voxelize a CT reconstruction")
     parser.add_argument("--model", type=str, required=True, help="Path to model.pt")
     parser.add_argument("--resolution", type=int, default=128, help="Grid resolution per axis")
-    parser.add_argument("--output", type=str, default="volume.npy", help="Output file path (.npy)")
+    parser.add_argument("--output", type=str, default=None, help="Output file path (.npy), defaults to volume.npy next to model")
     parser.add_argument("--extent", type=float, default=None, help="Half-extent of the grid (auto if not set)")
     args = parser.parse_args()
 
-    voxelize(args.model, args.resolution, args.output, args.extent)
+    output = args.output
+    if output is None:
+        output = os.path.join(os.path.dirname(args.model), "volume.npy")
+
+    voxelize(args.model, args.resolution, output, args.extent)
 
 
 if __name__ == "__main__":
