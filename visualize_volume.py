@@ -20,16 +20,11 @@ def coord_to_index(coord, resolution):
     return int((coord + 1) / 2 * (resolution - 1))
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Visualize volume slices")
-    parser.add_argument("volume", type=str, help="Path to volume.npy")
-    parser.add_argument("--gt", type=str, default=None, help="Optional ground truth volume.npy")
-    parser.add_argument("--vmax", type=float, default=None, help="Color scale max (auto if not set)")
-    args = parser.parse_args()
-
-    vol = np.load(args.volume)
+def visualize(volume_path, vmax=None):
+    vol = np.load(volume_path)
     res = vol.shape[0]
-    vmax = args.vmax if args.vmax is not None else vol.max()
+    if vmax is None:
+        vmax = vol.max()
 
     axes = ["X", "Y", "Z"]
     coords = [-0.5, 0.0, 0.5]
@@ -51,13 +46,22 @@ def main():
             ax.set_title(f"{axis}={c:.1f} (i={idx})")
             ax.axis("off")
 
-    fig.suptitle(os.path.basename(args.volume), fontsize=14)
+    fig.suptitle(os.path.basename(volume_path), fontsize=14)
     fig.tight_layout()
 
-    out_path = os.path.join(os.path.dirname(args.volume), "vis.jpg")
+    out_path = os.path.join(os.path.dirname(volume_path), "vis.jpg")
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"Saved {out_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Visualize volume slices")
+    parser.add_argument("volume", type=str, help="Path to volume.npy")
+    parser.add_argument("--gt", type=str, default=None, help="Optional ground truth volume.npy")
+    parser.add_argument("--vmax", type=float, default=None, help="Color scale max (auto if not set)")
+    args = parser.parse_args()
+    visualize(args.volume, vmax=args.vmax)
 
 
 if __name__ == "__main__":
