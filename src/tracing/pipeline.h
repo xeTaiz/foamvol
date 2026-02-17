@@ -15,7 +15,7 @@ struct TraceSettings {
 inline TraceSettings default_trace_settings() {
     TraceSettings settings;
     settings.weight_threshold = 0.001f;
-    settings.max_intersections = 1024;
+    settings.max_intersections = 2048;
     return settings;
 }
 
@@ -62,43 +62,34 @@ class Pipeline {
     virtual void trace_forward(const TraceSettings &settings,
                                uint32_t num_points,
                                const Vec3f *points,
-                               const void *attributes,
+                               const float *density,
                                uint32_t point_adjacency_size,
                                const uint32_t *point_adjacency,
                                const uint32_t *point_adjacency_offsets,
                                uint32_t num_rays,
                                const Ray *rays,
                                const uint32_t *start_point_index,
-                               uint32_t num_depth_quantiles,
-                               const float *depth_quantiles,
-                               void *ray_rgba,
-                               float *quantile_dpeths,
-                               uint32_t *quantile_point_indices,
+                               float *ray_projection,
                                uint32_t *num_intersections,
-                               void *point_contribution) = 0;
+                               float *point_contribution) = 0;
 
     virtual void trace_backward(const TraceSettings &settings,
                                 uint32_t num_points,
                                 const Vec3f *points,
-                                const void *attributes,
+                                const float *density,
                                 uint32_t point_adjacency_size,
                                 const uint32_t *point_adjacency,
                                 const uint32_t *point_adjacency_offsets,
                                 uint32_t num_rays,
                                 const Ray *rays,
                                 const uint32_t *start_point_index,
-                                uint32_t num_depth_quantiles,
-                                const float *depth_quantiles,
-                                const uint32_t *quantile_point_indices,
-                                const void *ray_rgba,
-                                const void *ray_rgba_grad,
-                                const float *depth_grad,
-                                const void *ray_error,
-                                Ray *ray_grad,
+                                const float *ray_projection_grad,
+                                const float *ray_error,
                                 Vec3f *points_grad,
-                                void *attribute_grad,
-                                void *point_error) = 0;
+                                float *density_grad,
+                                float *point_error) = 0;
 
+    // Stub for viewer compatibility — CT pipeline does not implement this
     virtual void trace_visualization(const TraceSettings &settings,
                                      const VisualizationSettings &vis_settings,
                                      const Camera &camera,
@@ -112,8 +103,9 @@ class Pipeline {
                                      const void *adjacent_points,
                                      uint32_t start_index,
                                      uint64_t output_surface,
-                                     const void *stream = nullptr) = 0;
+                                     const void *stream = nullptr) {}
 
+    // Stub for viewer compatibility
     virtual void trace_benchmark(const TraceSettings &settings,
                                  uint32_t num_points,
                                  const Vec3f *points,
@@ -123,13 +115,13 @@ class Pipeline {
                                  const Vec4h *adjacent_diff,
                                  Camera camera,
                                  const uint32_t *start_point_index,
-                                 uint32_t *ray_rgba) = 0;
+                                 uint32_t *ray_rgba) {}
 
     virtual uint32_t attribute_dim() const = 0;
 
     virtual ScalarType attribute_type() const = 0;
 };
 
-std::shared_ptr<Pipeline> create_pipeline(int sh_degree, ScalarType attr_type);
+std::shared_ptr<Pipeline> create_ct_pipeline();
 
 } // namespace radfoam
