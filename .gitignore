@@ -10,3 +10,6 @@ __pycache__
 /*nsight
 *.mp4b
 *ipynb
+**/.DS_Store
+**/._.DS_Store
+src/radfoam/*.so
