@@ -87,7 +87,7 @@ def voxelize(model_path, resolution, output_path, extent=None):
 def main():
     parser = argparse.ArgumentParser(description="Voxelize a CT reconstruction")
     parser.add_argument("--model", type=str, required=True, help="Path to model.pt")
-    parser.add_argument("--resolution", type=int, default=128, help="Grid resolution per axis")
+    parser.add_argument("--resolution", type=int, default=256, help="Grid resolution per axis")
     parser.add_argument("--output", type=str, default=None, help="Output file path (.npy), defaults to volume.npy next to model")
     parser.add_argument("--extent", type=float, default=None, help="Half-extent of the grid (auto if not set)")
     args = parser.parse_args()
