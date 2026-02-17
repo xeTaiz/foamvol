@@ -16,7 +16,21 @@ import radfoam
 import torch.nn.functional as F
 
 
-def voxelize(model_path, resolution, output_path, extent=None):
+def gaussian_blur_3d(volume, kernel_size=3, sigma=1.0):
+    """Apply 3D Gaussian blur to a volume tensor (X, Y, Z) on GPU."""
+    pad = kernel_size // 2
+    coords = torch.arange(kernel_size, dtype=torch.float32, device=volume.device) - pad
+    gauss_1d = torch.exp(-coords ** 2 / (2 * sigma ** 2))
+    gauss_1d = gauss_1d / gauss_1d.sum()
+    kernel = gauss_1d[:, None, None] * gauss_1d[None, :, None] * gauss_1d[None, None, :]
+    kernel = kernel.reshape(1, 1, kernel_size, kernel_size, kernel_size)
+
+    vol_5d = volume.unsqueeze(0).unsqueeze(0)  # (1, 1, X, Y, Z)
+    blurred = F.conv3d(vol_5d, kernel, padding=pad)
+    return blurred.squeeze(0).squeeze(0)
+
+
+def voxelize(model_path, resolution, output_path, extent=None, blur_sigma=0.0):
     device = torch.device("cuda")
 
     scene_data = torch.load(model_path)
@@ -59,6 +73,8 @@ def voxelize(model_path, resolution, output_path, extent=None):
         volume[start:end] = density[nn_indices].squeeze(-1)
 
     volume = volume.reshape(resolution, resolution, resolution)
+    if blur_sigma > 0:
+        volume = gaussian_blur_3d(volume, kernel_size=3, sigma=blur_sigma)
     volume_np = volume.cpu().numpy()
 
     # Save as .npy
@@ -87,16 +103,17 @@ def voxelize(model_path, resolution, output_path, extent=None):
 def main():
     parser = argparse.ArgumentParser(description="Voxelize a CT reconstruction")
     parser.add_argument("--model", type=str, required=True, help="Path to model.pt")
-    parser.add_argument("--resolution", type=int, default=256, help="Grid resolution per axis")
+    parser.add_argument("--resolution", type=int, default=512, help="Grid resolution per axis")
     parser.add_argument("--output", type=str, default=None, help="Output file path (.npy), defaults to volume.npy next to model")
-    parser.add_argument("--extent", type=float, default=None, help="Half-extent of the grid (auto if not set)")
+    parser.add_argument("--extent", type=float, default=1.0, help="Half-extent of the grid (auto if not set)")
+    parser.add_argument("--blur_sigma", type=float, default=0.0, help="Gaussian blur sigma (0 = disabled)")
     args = parser.parse_args()
 
     output = args.output
     if output is None:
         output = os.path.join(os.path.dirname(args.model), "volume.npy")
 
-    voxelize(args.model, args.resolution, output, args.extent)
+    voxelize(args.model, args.resolution, output, args.extent, args.blur_sigma)
 
 
 if __name__ == "__main__":
