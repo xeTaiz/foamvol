@@ -7,10 +7,12 @@ import torch
 import radfoam
 
 from .ct_synthetic import CTSyntheticDataset
+from .r2_gaussian import R2GaussianDataset
 
 
 dataset_dict = {
     "ct_synthetic": CTSyntheticDataset,
+    "r2_gaussian": R2GaussianDataset,
 }
 
 
@@ -29,7 +31,9 @@ class DataHandler:
         if hasattr(self.args, "detector_size"):
             kwargs["detector_size"] = self.args.detector_size
 
-        split_dataset = dataset(split=split, **kwargs)
+        split_dataset = dataset(
+            data_dir=self.args.data_path, split=split, **kwargs
+        )
 
         self.rays = split_dataset.all_rays
         self.projections = split_dataset.all_projections
