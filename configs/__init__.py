@@ -45,8 +45,7 @@ class PipelineParams(ParamGroup):
         self.densify_from = 2_000
         self.densify_until = 11_000
         self.densify_factor = 1.15
-        self.white_background = True
-        self.quantile_weight = 1e-4
+        self.loss_type = "l2"
         self.experiment_name = ""
         self.debug = False
         self.viewer = False
@@ -56,7 +55,6 @@ class PipelineParams(ParamGroup):
 class ModelParams(ParamGroup):
 
     def __init__(self, parser):
-        self.sh_degree = 3
         self.init_points = 131_072
         self.final_points = 2_097_152
         self.activation_scale = 1.0
@@ -71,9 +69,6 @@ class OptimizationParams(ParamGroup):
         self.points_lr_final = 5e-6
         self.density_lr_init = 1e-1
         self.density_lr_final = 1e-2
-        self.attributes_lr_init = 5e-3
-        self.attributes_lr_final = 5e-4
-        self.sh_factor = 0.1
         self.freeze_points = 18_000
         super().__init__(parser, "Setting Optimization parameters")
 
@@ -81,10 +76,9 @@ class OptimizationParams(ParamGroup):
 class DatasetParams(ParamGroup):
 
     def __init__(self, parser):
-        self.dataset = "colmap"
-        self.data_path = "data/mipnerf360"
-        self.scene = "bonsai"
-        self.patch_based = False
-        self.downsample = [4, 2, 1]
-        self.downsample_iterations = [0, 150, 500]
+        self.dataset = "ct_synthetic"
+        self.data_path = "data/ct"
+        self.scene = "sphere"
+        self.num_angles = 180
+        self.detector_size = 128
         super().__init__(parser, "Setting Dataset parameters")
