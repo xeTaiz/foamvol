@@ -238,7 +238,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     if not pipeline_args.debug:
         model_path = f"{out_dir}/model.pt"
         volume_path = f"{out_dir}/volume.npy"
-        voxelize(model_path, resolution=512, output_path=volume_path)
+        voxelize(model_path, resolution=512, output_path=volume_path, extent=1.0)
         visualize(volume_path)
 
 
