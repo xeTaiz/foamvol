@@ -27,7 +27,7 @@ def visualize(volume_path, vmax=1.0):
         vmax = vol.max()
 
     axes = ["X", "Y", "Z"]
-    coords = [-0.5, 0.0, 0.5]
+    coords = [-0.2, 0.0, 0.2]
 
     fig, axs = plt.subplots(3, 3, figsize=(9, 9))
 
