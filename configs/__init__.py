@@ -59,6 +59,7 @@ class ModelParams(ParamGroup):
         self.final_points = 2_097_152
         self.activation_scale = 1.0
         self.init_scale = 25.0
+        self.init_type = "random"
         self.device = "cuda"
         super().__init__(parser, "Setting Model parameters")
 
