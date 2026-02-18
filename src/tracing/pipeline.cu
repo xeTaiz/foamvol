@@ -215,6 +215,130 @@ void prefetch_adjacent_diff(const Vec3f *points,
                           adjacent_diff);
 }
 
+__global__ void ct_visualization(TraceSettings settings,
+                                  VisualizationSettings vis_settings,
+                                  Camera camera,
+                                  CMapTable cmap_table,
+                                  const Vec3f *__restrict__ points,
+                                  const float *__restrict__ density,
+                                  const uint32_t *__restrict__ point_adjacency,
+                                  const uint32_t *__restrict__ point_adjacency_offsets,
+                                  const Vec4h *__restrict__ adjacent_diff,
+                                  uint32_t start_index,
+                                  CUsurfObject output_surface) {
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i >= camera.width || j >= camera.height)
+        return;
+
+    Ray ray = cast_ray(camera, i, j);
+    ray.direction /= ray.direction.norm();
+
+    float beta = vis_settings.activation_beta;
+    float act_scale = vis_settings.activation_scale;
+    float den_scale = vis_settings.density_scale;
+    ColorMap cmap = vis_settings.color_map;
+    float depth_quantile = vis_settings.depth_quantile;
+
+    Vec3f color = Vec3f::Zero();
+    float transmittance = 1.0f;
+    float depth = 0.0f;
+    bool depth_quantile_passed = false;
+
+    auto functor = [&](uint32_t point_idx,
+                       float t_0,
+                       float t_1,
+                       const Vec3f &current_point,
+                       const Vec3f &next_point) {
+        float raw = density[point_idx];
+        float delta_t = fmaxf(t_1 - t_0, 0.0f);
+
+        // Softplus activation with numerical stability
+        float mu;
+        if (beta * raw > 20.0f) {
+            mu = act_scale * raw;
+        } else {
+            mu = act_scale * logf(1.0f + expf(beta * raw)) / beta;
+        }
+
+        float alpha = 1.0f - expf(-mu * delta_t);
+        float next_transmittance = transmittance * (1.0f - alpha);
+
+        // Depth: find where transmittance crosses the quantile threshold
+        if (!depth_quantile_passed && next_transmittance < depth_quantile) {
+            depth_quantile_passed = true;
+            if (mu > 1e-6f) {
+                depth = t_0 + logf(transmittance / depth_quantile) / mu;
+            } else {
+                depth = t_0;
+            }
+        }
+
+        // Map density to colormap
+        float v = fminf(mu * den_scale, 1.0f);
+        Vec3f rgb = colormap(v, cmap, cmap_table);
+
+        color += transmittance * alpha * rgb;
+        transmittance = next_transmittance;
+
+        return transmittance > settings.weight_threshold;
+    };
+
+    uint32_t n = trace<128, 4>(ray,
+                               points,
+                               point_adjacency,
+                               point_adjacency_offsets,
+                               adjacent_diff,
+                               start_index,
+                               settings.max_intersections,
+                               functor);
+
+    // Output based on visualization mode
+    Vec3f out;
+    switch (vis_settings.mode) {
+    case VolumeDensity:
+    case RGB: {
+        Vec3f bg = *vis_settings.bg_color;
+        if (vis_settings.checker_bg) {
+            int ci = i / 16;
+            int cj = j / 16;
+            if ((ci + cj) % 2 == 0) {
+                bg = Vec3f(0.8f, 0.8f, 0.8f);
+            } else {
+                bg = Vec3f(0.6f, 0.6f, 0.6f);
+            }
+        }
+        out = color + transmittance * bg;
+        break;
+    }
+    case Depth: {
+        float val = depth / vis_settings.max_depth;
+        val = fminf(fmaxf(val, 0.0f), 1.0f);
+        out = colormap(val, cmap, cmap_table);
+        break;
+    }
+    case Alpha: {
+        float opacity = 1.0f - transmittance;
+        out = Vec3f(opacity, opacity, opacity);
+        break;
+    }
+    case Intersections: {
+        float val = (n > 1) ? float(n - 1) / float(settings.max_intersections) : 0.0f;
+        val = fminf(fmaxf(val, 0.0f), 1.0f);
+        out = colormap(val, cmap, cmap_table);
+        break;
+    }
+    default:
+        out = Vec3f::Zero();
+        break;
+    }
+
+    uint32_t rgba = make_rgba8(out[0], out[1], out[2], 1.0f);
+    surf2Dwrite(rgba, output_surface, i * 4, j);
+}
+
 class CUDADensityPipeline : public Pipeline {
   public:
     CUDADensityPipeline() = default;
@@ -307,6 +431,44 @@ class CUDADensityPipeline : public Pipeline {
             points_grad,
             density_grad,
             point_error);
+    }
+
+    void trace_visualization(const TraceSettings &settings,
+                             const VisualizationSettings &vis_settings,
+                             const Camera &camera,
+                             CMapTable cmap_table,
+                             uint32_t num_points,
+                             uint32_t num_tets,
+                             const void *points,
+                             const void *attributes,
+                             const void *point_adjacency,
+                             const void *point_adjacency_offsets,
+                             const void *adjacent_points,
+                             uint32_t start_index,
+                             uint64_t output_surface,
+                             const void *stream = nullptr) override {
+
+        dim3 block(16, 16);
+        dim3 grid((camera.width + block.x - 1) / block.x,
+                  (camera.height + block.y - 1) / block.y);
+
+        CUstream cu_stream = 0;
+        if (stream) {
+            cu_stream = *reinterpret_cast<const CUstream *>(stream);
+        }
+
+        ct_visualization<<<grid, block, 0, cu_stream>>>(
+            settings,
+            vis_settings,
+            camera,
+            cmap_table,
+            reinterpret_cast<const Vec3f *>(points),
+            reinterpret_cast<const float *>(attributes),
+            reinterpret_cast<const uint32_t *>(point_adjacency),
+            reinterpret_cast<const uint32_t *>(point_adjacency_offsets),
+            reinterpret_cast<const Vec4h *>(adjacent_points),
+            start_index,
+            static_cast<CUsurfObject>(output_surface));
     }
 
     uint32_t attribute_dim() const override {

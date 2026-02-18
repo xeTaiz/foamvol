@@ -818,7 +818,7 @@ struct ViewerPrivate : public Viewer {
 
             ImGui::SeparatorText("Visualization settings");
 
-            const char *modes[] = {"RGB", "Depth", "Alpha", "Intersections"};
+            const char *modes[] = {"RGB", "Depth", "Alpha", "Intersections", "VolumeDensity"};
             ImGui::Combo("Mode",
                          reinterpret_cast<int *>(&vis_settings.mode),
                          modes,
@@ -856,6 +856,39 @@ struct ViewerPrivate : public Viewer {
                 ImGui::SliderFloat(
                     "Depth percentile", &percentile, 0.0f, 100.0f, "%.0f\%");
                 vis_settings.depth_quantile = percentile / 100.0f;
+            }
+
+            if (vis_settings.mode == VisualizationMode::VolumeDensity) {
+                const char *color_maps[] = {
+                    "Gray", "Viridis", "Inferno", "Turbo"};
+                ImGui::Combo("Color map",
+                             reinterpret_cast<int *>(&vis_settings.color_map),
+                             color_maps,
+                             IM_ARRAYSIZE(color_maps));
+                ImGui::SliderFloat("Density scale",
+                                   &vis_settings.density_scale,
+                                   0.01f,
+                                   100.0f,
+                                   "%.3f",
+                                   ImGuiSliderFlags_Logarithmic |
+                                       ImGuiSliderFlags_NoRoundToFormat);
+                ImGui::SliderFloat("Activation scale",
+                                   &vis_settings.activation_scale,
+                                   0.01f,
+                                   10.0f,
+                                   "%.3f",
+                                   ImGuiSliderFlags_Logarithmic |
+                                       ImGuiSliderFlags_NoRoundToFormat);
+                ImGui::SliderFloat("Activation beta",
+                                   &vis_settings.activation_beta,
+                                   0.1f,
+                                   100.0f,
+                                   "%.2f",
+                                   ImGuiSliderFlags_Logarithmic |
+                                       ImGuiSliderFlags_NoRoundToFormat);
+                ImGui::ColorEdit3(
+                    "Background color",
+                    reinterpret_cast<float *>(&vis_settings.bg_color));
             }
 
             gl_check(glViewport(0, 0, camera.width, camera.height));
