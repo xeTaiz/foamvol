@@ -355,6 +355,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         point_error,
                         point_contribution,
                         pipeline_args.densify_factor,
+                        pipeline_args.contrast_fraction,
                     )
 
                     model.update_triangulation(incremental=False)

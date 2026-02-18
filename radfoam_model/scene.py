@@ -309,7 +309,7 @@ class CTScene(torch.nn.Module):
         self.density = optimizable_tensors["density"]
 
     def prune_and_densify(
-        self, point_error, point_contribution, upsample_factor=1.2
+        self, point_error, point_contribution, upsample_factor=1.2, contrast_fraction=0.5
     ):
         with torch.no_grad():
             num_curr_points = self.primal_points.shape[0]
@@ -327,6 +327,29 @@ class CTScene(torch.nn.Module):
             )
             farthest_neighbor = farthest_neighbor.long()
 
+            ################### Edge contrast ###################
+            activated = self.get_primal_density().squeeze()  # [N]
+            offsets = point_adjacency_offsets.long()
+            adj = point_adjacency.long()
+
+            # Build source index for each edge
+            counts = offsets[1:] - offsets[:-1]
+            source = torch.repeat_interleave(
+                torch.arange(num_curr_points, device=points.device), counts
+            )
+
+            # Per-edge contrast
+            edge_contrast = (activated[source] - activated[adj]).abs()
+
+            # Per-point max contrast
+            max_contrast = torch.zeros(num_curr_points, device=points.device)
+            max_contrast.scatter_reduce_(0, source, edge_contrast, reduce="amax", include_self=False)
+
+            # Per-point argmax neighbor (which neighbor achieves the max contrast)
+            max_contrast_neighbor = torch.zeros(num_curr_points, dtype=torch.long, device=points.device)
+            is_max = edge_contrast == max_contrast[source]
+            max_contrast_neighbor[source[is_max]] = adj[is_max]
+
             ######################## Pruning ########################
             self_mask = point_contribution > 1e-2
             neighbor_mask = self_mask.long()[point_adjacency.long()]
@@ -335,14 +358,13 @@ class CTScene(torch.nn.Module):
             )
             nsum = torch.cumsum(neighbor_mask, dim=0)
 
-            offsets = point_adjacency_offsets.long()
             n_masked_adj = nsum[offsets[1:]] - nsum[offsets[:-1]]
 
             contrib_mask = ((n_masked_adj == 0) & ~self_mask).squeeze()
             cell_size_mask = cell_radius < 1e-1
             prune_mask = contrib_mask * cell_size_mask
 
-            ######################## Random sampling ########################
+            ######################## Sampling ########################
             primal_contribution_accum = point_contribution.squeeze()
             mask = primal_contribution_accum < 1e-3
             self.density[mask] = -1
@@ -354,13 +376,49 @@ class CTScene(torch.nn.Module):
                 0.1 * perturbation.norm(dim=-1, keepdim=True) * delta
             )
 
-            num_sample_points = num_new_points
-            sampled_inds = torch.multinomial(
-                primal_error_accum * cell_radius,
-                num_sample_points,
-                replacement=False,
-            )
-            sampled_points = (points + perturbation)[sampled_inds]
+            ################### Split budget ########################
+            num_contrast_points = int(contrast_fraction * num_new_points)
+            num_gradient_points = num_new_points - num_contrast_points
+
+            sampled_points_list = []
+            sampled_inds_list = []
+
+            # --- Gradient-based sampling (existing strategy, reduced budget) ---
+            if num_gradient_points > 0:
+                grad_inds = torch.multinomial(
+                    primal_error_accum * cell_radius,
+                    num_gradient_points,
+                    replacement=False,
+                )
+                sampled_points_list.append((points + perturbation)[grad_inds])
+                sampled_inds_list.append(grad_inds)
+
+            # --- Contrast-based sampling (new strategy) ---
+            if num_contrast_points > 0:
+                contrast_weight = max_contrast * cell_radius.squeeze()
+                # Fallback: if all contrasts are zero, redirect budget to gradient strategy
+                if contrast_weight.sum() < 1e-10:
+                    if num_gradient_points > 0:
+                        extra_inds = torch.multinomial(
+                            primal_error_accum * cell_radius,
+                            num_contrast_points,
+                            replacement=False,
+                        )
+                        sampled_points_list.append((points + perturbation)[extra_inds])
+                        sampled_inds_list.append(extra_inds)
+                else:
+                    contrast_inds = torch.multinomial(
+                        contrast_weight,
+                        num_contrast_points,
+                        replacement=False,
+                    )
+                    # Place at midpoint between point and its max-contrast neighbor
+                    midpoints = 0.5 * (points[contrast_inds] + points[max_contrast_neighbor[contrast_inds]])
+                    sampled_points_list.append(midpoints)
+                    sampled_inds_list.append(contrast_inds)
+
+            sampled_inds = torch.cat(sampled_inds_list, dim=0)
+            sampled_points = torch.cat(sampled_points_list, dim=0)
 
             new_params = {
                 "primal_points": sampled_points,
