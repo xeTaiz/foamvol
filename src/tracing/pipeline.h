@@ -24,6 +24,7 @@ enum VisualizationMode {
     Depth = 1,
     Alpha = 2,
     Intersections = 3,
+    VolumeDensity = 4,
 };
 
 struct VisualizationSettings {
@@ -33,16 +34,22 @@ struct VisualizationSettings {
     bool checker_bg;
     float max_depth;
     float depth_quantile;
+    float density_scale;
+    float activation_beta;
+    float activation_scale;
 };
 
 inline VisualizationSettings default_visualization_settings() {
     VisualizationSettings settings;
-    settings.mode = RGB;
-    settings.color_map = Turbo;
-    settings.bg_color = Vec3f(1.0f, 1.0f, 1.0f);
+    settings.mode = VolumeDensity;
+    settings.color_map = Gray;
+    settings.bg_color = Vec3f(0.0f, 0.0f, 0.0f);
     settings.checker_bg = false;
     settings.max_depth = 10.0f;
     settings.depth_quantile = 0.5f;
+    settings.density_scale = 1.0f;
+    settings.activation_beta = 10.0f;
+    settings.activation_scale = 1.0f;
     return settings;
 }
 
