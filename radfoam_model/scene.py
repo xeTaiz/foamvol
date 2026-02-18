@@ -24,11 +24,31 @@ class CTScene(torch.nn.Module):
         self.num_init_points = args.init_points
         self.num_final_points = args.final_points
         self.activation_scale = args.activation_scale
-        self.init_scale = getattr(args, "init_scale", 25.0)
+        self.init_scale = getattr(args, "init_scale", 1.1)
+        self.init_type = getattr(args, "init_type", "random")
 
-        self.random_initialize()
+        if self.init_type == "regular":
+            self.regular_initialize()
+        else:
+            self.random_initialize()
 
         self.pipeline = radfoam.create_ct_pipeline()
+
+    def regular_initialize(self):
+        s = self.init_scale
+        pt_per_axis = int(round(self.num_init_points ** (1.0 / 3.0)))
+        ax = torch.linspace(-s, s, pt_per_axis, device=self.device)
+        mg = torch.stack(torch.meshgrid([ax,ax,ax]), dim=-1).reshape(-1, 3)
+        self.triangulation = radfoam.Triangulation(mg)
+        perm = self.triangulation.permutation().to(torch.long)
+        primal_points = mg[perm]
+
+        self.primal_points = nn.Parameter(primal_points)
+        self.faces = None
+
+        self.update_triangulation(rebuild=False)
+        density = torch.zeros(mg.size(0), 1, device=self.device, dtype=torch.float32)
+        self.density = nn.Parameter(density[perm])
 
     def random_initialize(self):
         s = self.init_scale
