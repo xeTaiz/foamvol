@@ -553,6 +553,7 @@ struct ViewerPrivate : public Viewer {
     float orbit_yaw;
     float orbit_pitch;
     Vec3f orbit_base_forward; // yaw=0 reference direction (perpendicular to up)
+    int up_axis_index;        // 0=X, 1=Y, 2=Z
 
     std::atomic_bool closed;
     std::atomic_bool paused;
@@ -644,37 +645,20 @@ struct ViewerPrivate : public Viewer {
 
         // Initialize orbit/trackball state
         orbit_target = options.orbit_target;
-        Vec3f offset = options.camera_pos - orbit_target;
-        orbit_radius = offset.norm();
-        if (orbit_radius < 1e-6f) orbit_radius = 1.0f;
+        // Detect initial up axis index from options
+        // 0=+X, 1=+Y, 2=+Z, 3=-X, 4=-Y, 5=-Z
+        Vec3f abs_up = options.camera_up.cwiseAbs();
+        int axis;
+        if (abs_up.x() >= abs_up.y() && abs_up.x() >= abs_up.z())
+            axis = 0;
+        else if (abs_up.y() >= abs_up.z())
+            axis = 1;
+        else
+            axis = 2;
+        float sign = options.camera_up[axis];
+        up_axis_index = (sign >= 0.0f) ? axis : axis + 3;
 
-        Vec3f up = options.camera_up.normalized();
-        Vec3f horizontal = offset - offset.dot(up) * up;
-        float horiz_len = horizontal.norm();
-
-        if (horiz_len > 1e-6f) {
-            orbit_base_forward = horizontal / horiz_len;
-            orbit_yaw = 0.0f;
-        } else {
-            // Camera directly above/below target — pick arbitrary base
-            orbit_base_forward = Vec3f(1, 0, 0);
-            if (fabsf(up.dot(orbit_base_forward)) > 0.9f)
-                orbit_base_forward = Vec3f(0, 1, 0);
-            orbit_base_forward = (orbit_base_forward - orbit_base_forward.dot(up) * up).normalized();
-            orbit_yaw = 0.0f;
-        }
-        orbit_pitch = asinf(std::clamp(offset.dot(up) / orbit_radius, -1.0f, 1.0f));
-
-        // Rebuild camera from orbit state so it faces the target
-        {
-            Eigen::AngleAxisf yaw_rot(orbit_yaw, up);
-            Vec3f dir = yaw_rot * orbit_base_forward;
-            Vec3f right = dir.cross(up).normalized();
-            Eigen::AngleAxisf pitch_rot(orbit_pitch, right);
-            dir = pitch_rot * dir;
-            Vec3f pos = orbit_target + orbit_radius * dir;
-            camera = look_at(pos, orbit_target, up, camera.fov, camera.width, camera.height, camera.model);
-        }
+        recompute_orbit_from_position(options.camera_pos);
 
         program = create_program();
         texture = allocate_texture(width, height);
@@ -690,6 +674,55 @@ struct ViewerPrivate : public Viewer {
         gl_check(glDeleteTextures(1, &texture));
         gl_check(glDeleteProgram(program));
         glfwDestroyWindow(window);
+    }
+
+    Vec3f get_up_vector() const {
+        const Vec3f axes[] = {
+            Vec3f(1,0,0), Vec3f(0,1,0), Vec3f(0,0,1),
+            Vec3f(-1,0,0), Vec3f(0,-1,0), Vec3f(0,0,-1),
+        };
+        return axes[up_axis_index];
+    }
+
+    /// Recompute orbit_base_forward, orbit_yaw, orbit_pitch from a camera
+    /// position and the current up_axis_index. Preserves orbit_target and
+    /// orbit_radius is recomputed from `cam_pos`.
+    void recompute_orbit_from_position(const Vec3f &cam_pos) {
+        Vec3f up = get_up_vector();
+        options.camera_up = up;
+
+        Vec3f offset = cam_pos - orbit_target;
+        orbit_radius = offset.norm();
+        if (orbit_radius < 1e-6f) orbit_radius = 1.0f;
+
+        Vec3f horizontal = offset - offset.dot(up) * up;
+        float horiz_len = horizontal.norm();
+
+        if (horiz_len > 1e-6f) {
+            orbit_base_forward = horizontal / horiz_len;
+        } else {
+            // Camera directly above/below target — pick arbitrary base
+            orbit_base_forward = Vec3f(1, 0, 0);
+            if (fabsf(up.dot(orbit_base_forward)) > 0.9f)
+                orbit_base_forward = Vec3f(0, 1, 0);
+            orbit_base_forward = (orbit_base_forward - orbit_base_forward.dot(up) * up).normalized();
+        }
+        orbit_yaw = 0.0f;
+        orbit_pitch = asinf(std::clamp(offset.dot(up) / orbit_radius, -1.0f, 1.0f));
+
+        // Rebuild camera
+        rebuild_camera();
+    }
+
+    void rebuild_camera() {
+        Vec3f up = get_up_vector();
+        Eigen::AngleAxisf yaw_rot(orbit_yaw, up);
+        Vec3f dir = yaw_rot * orbit_base_forward;
+        Vec3f right = dir.cross(up).normalized();
+        Eigen::AngleAxisf pitch_rot(orbit_pitch, right);
+        dir = pitch_rot * dir;
+        Vec3f pos = orbit_target + orbit_radius * dir;
+        camera = look_at(pos, orbit_target, up, camera.fov, camera.width, camera.height, camera.model);
     }
 
     void run() {
@@ -772,30 +805,21 @@ struct ViewerPrivate : public Viewer {
                 if (glfwGetKey(window, GLFW_KEY_D))
                     pan_delta += *camera.right;
                 if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT))
-                    pan_delta += options.camera_up;
+                    pan_delta += get_up_vector();
                 if (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL))
-                    pan_delta -= options.camera_up;
+                    pan_delta -= get_up_vector();
                 float speed = 0.5f * orbit_radius * delta_t;
                 orbit_target += speed * pan_delta;
             }
 
             // Rebuild camera from orbit state
-            {
-                Vec3f up = options.camera_up.normalized();
-                Eigen::AngleAxisf yaw_rot(orbit_yaw, up);
-                Vec3f dir = yaw_rot * orbit_base_forward;
-                Vec3f right = dir.cross(up).normalized();
-                Eigen::AngleAxisf pitch_rot(orbit_pitch, right);
-                dir = pitch_rot * dir;
-                Vec3f pos = orbit_target + orbit_radius * dir;
-                camera = look_at(pos, orbit_target, up, camera.fov, camera.width, camera.height, camera.model);
-            }
+            rebuild_camera();
 
             ImGui_ImplOpenGL3_NewFrame();
             ImGui_ImplGlfw_NewFrame();
             ImGui::NewFrame();
 
-            ImGui::SetNextWindowSize(ImVec2(400, 440), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(400, 500), ImGuiCond_FirstUseEver);
             ImGui::Begin("Controls");
 
             if (training.load()) {
@@ -851,6 +875,15 @@ struct ViewerPrivate : public Viewer {
                          reinterpret_cast<int *>(&camera.model),
                          camera_models,
                          IM_ARRAYSIZE(camera_models));
+
+            {
+                const char *up_axes[] = {"+X", "+Y", "+Z", "-X", "-Y", "-Z"};
+                int prev_up = up_axis_index;
+                ImGui::Combo("Up axis", &up_axis_index, up_axes, IM_ARRAYSIZE(up_axes));
+                if (up_axis_index != prev_up) {
+                    recompute_orbit_from_position(*camera.position);
+                }
+            }
 
             ImGui::Text("Frame rate: %d frames/s", int(frame_rate + 0.5f));
             ImGui::Checkbox("Limit viewer frame rate while training",
