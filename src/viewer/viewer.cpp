@@ -1069,6 +1069,11 @@ struct ViewerPrivate : public Viewer {
                     ImGui::SliderFloat("TF Density Max",
                                        &vis_settings.tf_density_max,
                                        0.0f, 10.0f, "%.3f");
+                    ImGui::SliderFloat("TF Opacity Scale",
+                                       &vis_settings.tf_opacity_scale,
+                                       1.0f, 1000.0f, "%.1f",
+                                       ImGuiSliderFlags_Logarithmic |
+                                           ImGuiSliderFlags_NoRoundToFormat);
 
                     // Canvas for TF editor
                     const float canvas_w = 300.0f;

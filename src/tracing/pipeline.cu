@@ -251,6 +251,7 @@ __global__ void ct_visualization(TraceSettings settings,
     bool use_tf = vis_settings.use_transfer_function;
     float tf_density_min = vis_settings.tf_density_min;
     float tf_density_max = vis_settings.tf_density_max;
+    float tf_opacity_scale = vis_settings.tf_opacity_scale;
 
     auto functor = [&](uint32_t point_idx,
                        float t_0,
@@ -279,7 +280,7 @@ __global__ void ct_visualization(TraceSettings settings,
                 : 0.0f;
             float tf_opacity;
             sample_transfer_function(v, tf_table, rgb, tf_opacity);
-            alpha = 1.0f - expf(-tf_opacity * delta_t);
+            alpha = 1.0f - expf(-tf_opacity * tf_opacity_scale * delta_t);
         } else {
             // Original colormap path
             float v = fminf(mu * den_scale, 1.0f);
