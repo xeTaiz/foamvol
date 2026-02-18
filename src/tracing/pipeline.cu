@@ -219,6 +219,7 @@ __global__ void ct_visualization(TraceSettings settings,
                                   VisualizationSettings vis_settings,
                                   Camera camera,
                                   CMapTable cmap_table,
+                                  TransferFunctionTable tf_table,
                                   const Vec3f *__restrict__ points,
                                   const float *__restrict__ density,
                                   const uint32_t *__restrict__ point_adjacency,
@@ -247,6 +248,10 @@ __global__ void ct_visualization(TraceSettings settings,
     float depth = 0.0f;
     bool depth_quantile_passed = false;
 
+    bool use_tf = vis_settings.use_transfer_function;
+    float tf_density_min = vis_settings.tf_density_min;
+    float tf_density_max = vis_settings.tf_density_max;
+
     auto functor = [&](uint32_t point_idx,
                        float t_0,
                        float t_1,
@@ -263,7 +268,25 @@ __global__ void ct_visualization(TraceSettings settings,
             mu = act_scale * logf(1.0f + expf(beta * raw)) / beta;
         }
 
-        float alpha = 1.0f - expf(-mu * delta_t);
+        Vec3f rgb;
+        float alpha;
+
+        if (use_tf) {
+            // Transfer function path
+            float range = tf_density_max - tf_density_min;
+            float v = (range > 1e-8f)
+                ? fmaxf(0.0f, fminf((mu - tf_density_min) / range, 1.0f))
+                : 0.0f;
+            float tf_opacity;
+            sample_transfer_function(v, tf_table, rgb, tf_opacity);
+            alpha = 1.0f - expf(-tf_opacity * delta_t);
+        } else {
+            // Original colormap path
+            float v = fminf(mu * den_scale, 1.0f);
+            rgb = colormap(v, cmap, cmap_table);
+            alpha = 1.0f - expf(-mu * delta_t);
+        }
+
         float next_transmittance = transmittance * (1.0f - alpha);
 
         // Depth: find where transmittance crosses the quantile threshold
@@ -275,10 +298,6 @@ __global__ void ct_visualization(TraceSettings settings,
                 depth = t_0;
             }
         }
-
-        // Map density to colormap
-        float v = fminf(mu * den_scale, 1.0f);
-        Vec3f rgb = colormap(v, cmap, cmap_table);
 
         color += transmittance * alpha * rgb;
         transmittance = next_transmittance;
@@ -437,6 +456,7 @@ class CUDADensityPipeline : public Pipeline {
                              const VisualizationSettings &vis_settings,
                              const Camera &camera,
                              CMapTable cmap_table,
+                             TransferFunctionTable tf_table,
                              uint32_t num_points,
                              uint32_t num_tets,
                              const void *points,
@@ -462,6 +482,7 @@ class CUDADensityPipeline : public Pipeline {
             vis_settings,
             camera,
             cmap_table,
+            tf_table,
             reinterpret_cast<const Vec3f *>(points),
             reinterpret_cast<const float *>(attributes),
             reinterpret_cast<const uint32_t *>(point_adjacency),

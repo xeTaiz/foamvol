@@ -37,6 +37,9 @@ struct VisualizationSettings {
     float density_scale;
     float activation_beta;
     float activation_scale;
+    bool use_transfer_function;
+    float tf_density_min;
+    float tf_density_max;
 };
 
 inline VisualizationSettings default_visualization_settings() {
@@ -50,6 +53,9 @@ inline VisualizationSettings default_visualization_settings() {
     settings.density_scale = 1.0f;
     settings.activation_beta = 10.0f;
     settings.activation_scale = 1.0f;
+    settings.use_transfer_function = false;
+    settings.tf_density_min = 0.0f;
+    settings.tf_density_max = 1.0f;
     return settings;
 }
 
@@ -101,6 +107,7 @@ class Pipeline {
                                      const VisualizationSettings &vis_settings,
                                      const Camera &camera,
                                      CMapTable cmap_table,
+                                     TransferFunctionTable tf_table,
                                      uint32_t num_points,
                                      uint32_t num_tets,
                                      const void *points,

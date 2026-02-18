@@ -145,6 +145,11 @@ struct CMapTable {
     const int *sizes;
 };
 
+struct TransferFunctionTable {
+    const float *data;  // GPU pointer to float[size * 4] (RGBA interleaved)
+    int size;           // number of entries (e.g. 256)
+};
+
 template <typename T>
 RADFOAM_HD void swap(T &a, T &b) {
     typename std::decay<T>::type tmp = a;
