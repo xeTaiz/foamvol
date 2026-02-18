@@ -1,10 +1,12 @@
 """Voxelize a trained CTScene into a regular 3D grid.
 
-For each voxel center, finds the nearest Voronoi site and assigns that cell's
-density. This is exact nearest-neighbor interpolation (correct for Voronoi).
+By default, uses supersampling (k^3 uniformly spaced sub-points per voxel)
+to approximate the volume-weighted average density within each voxel.
+Use --supersample 1 to fall back to single center-point lookup.
 
 Usage:
     python voxelize.py --model model.pt --resolution 128 --output volume.npy
+    python voxelize.py --model model.pt --resolution 256 --supersample 4
 """
 
 import argparse
@@ -30,7 +32,8 @@ def gaussian_blur_3d(volume, kernel_size=3, sigma=1.0):
     return blurred.squeeze(0).squeeze(0)
 
 
-def voxelize(model_path, resolution, output_path, extent=None, blur_sigma=0.0):
+def voxelize(model_path, resolution, output_path, extent=None, blur_sigma=0.0,
+             supersample=3):
     device = torch.device("cuda")
 
     scene_data = torch.load(model_path)
@@ -56,21 +59,44 @@ def voxelize(model_path, resolution, output_path, extent=None, blur_sigma=0.0):
         grid_min = torch.tensor([-extent, -extent, -extent], device=device)
         grid_max = torch.tensor([extent, extent, extent], device=device)
 
-    # Generate grid query points
+    # Generate voxel center coordinates
     coords = torch.linspace(0, 1, resolution, device=device)
     gx, gy, gz = torch.meshgrid(coords, coords, coords, indexing="ij")
-    grid_points = torch.stack([gx, gy, gz], dim=-1).reshape(-1, 3)
-    grid_points = grid_min + grid_points * (grid_max - grid_min)
+    voxel_centers = torch.stack([gx, gy, gz], dim=-1).reshape(-1, 3)
+    voxel_centers = grid_min + voxel_centers * (grid_max - grid_min)
 
-    # Query nearest neighbors in batches
-    batch_size = 1_000_000
-    volume = torch.zeros(grid_points.shape[0], device=device)
+    k = supersample
+    num_voxels = voxel_centers.shape[0]
+    volume = torch.zeros(num_voxels, device=device)
 
-    for start in range(0, grid_points.shape[0], batch_size):
-        end = min(start + batch_size, grid_points.shape[0])
-        batch_queries = grid_points[start:end]
-        nn_indices = radfoam.nn(points, aabb_tree, batch_queries).long()
-        volume[start:end] = density[nn_indices].squeeze(-1)
+    if k <= 1:
+        # Single center-point lookup (original behavior)
+        batch_size = 4_000_000
+        for start in range(0, num_voxels, batch_size):
+            end = min(start + batch_size, num_voxels)
+            nn_indices = radfoam.nn(points, aabb_tree, voxel_centers[start:end]).long()
+            volume[start:end] = density[nn_indices].squeeze(-1)
+    else:
+        # Supersample: k^3 uniformly spaced sub-points per voxel
+        voxel_size = (grid_max - grid_min) / resolution  # (3,)
+        sub_coords = torch.linspace(-0.5 + 0.5 / k, 0.5 - 0.5 / k, k, device=device)
+        ox, oy, oz = torch.meshgrid(sub_coords, sub_coords, sub_coords, indexing="ij")
+        offsets = torch.stack([ox, oy, oz], dim=-1).reshape(-1, 3)  # (k^3, 3)
+        offsets = offsets * voxel_size  # scale to world units
+
+        samples_per_voxel = k ** 3
+        batch_size = max(1, 4_000_000 // samples_per_voxel)
+        print(f"Supersampling: {k}^3 = {samples_per_voxel} samples/voxel, "
+              f"{batch_size} voxels/batch")
+
+        for start in range(0, num_voxels, batch_size):
+            end = min(start + batch_size, num_voxels)
+            centers = voxel_centers[start:end]  # (B, 3)
+            sub_points = centers.unsqueeze(1) + offsets.unsqueeze(0)  # (B, k^3, 3)
+            sub_points = sub_points.reshape(-1, 3)  # (B*k^3, 3)
+            nn_indices = radfoam.nn(points, aabb_tree, sub_points).long()
+            sub_densities = density[nn_indices].squeeze(-1)  # (B*k^3,)
+            volume[start:end] = sub_densities.reshape(-1, samples_per_voxel).mean(dim=1)
 
     volume = volume.reshape(resolution, resolution, resolution)
     if blur_sigma > 0:
@@ -103,17 +129,19 @@ def voxelize(model_path, resolution, output_path, extent=None, blur_sigma=0.0):
 def main():
     parser = argparse.ArgumentParser(description="Voxelize a CT reconstruction")
     parser.add_argument("--model", type=str, required=True, help="Path to model.pt")
-    parser.add_argument("--resolution", type=int, default=512, help="Grid resolution per axis")
+    parser.add_argument("--resolution", type=int, default=256, help="Grid resolution per axis")
     parser.add_argument("--output", type=str, default=None, help="Output file path (.npy), defaults to volume.npy next to model")
     parser.add_argument("--extent", type=float, default=1.0, help="Half-extent of the grid (auto if not set)")
     parser.add_argument("--blur_sigma", type=float, default=0.0, help="Gaussian blur sigma (0 = disabled)")
+    parser.add_argument("--supersample", type=int, default=3, help="Sub-samples per axis per voxel (k^3 total, 1 = center-only)")
     args = parser.parse_args()
 
     output = args.output
     if output is None:
         output = os.path.join(os.path.dirname(args.model), "volume.npy")
 
-    voxelize(args.model, args.resolution, output, args.extent, args.blur_sigma)
+    voxelize(args.model, args.resolution, output, args.extent, args.blur_sigma,
+             args.supersample)
 
 
 if __name__ == "__main__":
