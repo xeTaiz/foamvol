@@ -12,10 +12,6 @@ def main():
         "--camera_distance", type=float, default=60.0,
         help="Initial camera distance from origin",
     )
-    parser.add_argument(
-        "--up", type=str, default="Y", choices=["X", "Y", "Z"],
-        help="Which axis is up (default: Y)",
-    )
     args = parser.parse_args()
 
     device = torch.device("cuda")
