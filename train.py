@@ -304,6 +304,9 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     num_points = model.primal_points.shape[0]
                     writer.add_scalar("train/num_points", num_points, i)
 
+                    if hasattr(model, '_triangulation_retries'):
+                        writer.add_scalar("diagnostics/triangulation_retries", model._triangulation_retries, i)
+
                     test_metrics = eval_views(
                         test_data_handler,
                         test_ray_batch_fetcher,

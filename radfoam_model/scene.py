@@ -109,12 +109,11 @@ class CTScene(torch.nn.Module):
             raise RuntimeError("NaN in points")
 
         needs_permute = False
-        perturbation = 1e-6
         del_points = self.primal_points
         failures = 0
         while rebuild:
-            if failures > 25:
-                raise RuntimeError("aborted triangulation after 25 attempts")
+            if failures > 10:
+                raise RuntimeError("aborted triangulation after 10 attempts")
             try:
                 needs_permute = self.triangulation.rebuild(
                     del_points, incremental=incremental
@@ -122,16 +121,20 @@ class CTScene(torch.nn.Module):
                 break
             except radfoam.TriangulationFailedError as e:
                 print("caught: ", e)
-                perturbation *= 2
                 failures += 1
                 incremental = False
+                # Adaptive perturbation: scale relative to point cloud extent
+                extent = self.primal_points.abs().max().item()
+                perturbation = extent * 1e-5 * (3.0 ** failures)
                 with torch.no_grad():
                     del_points = (
                         self.primal_points
                         + perturbation * torch.randn_like(self.primal_points)
                     )
 
-        if failures > 5:
+        self._triangulation_retries = failures
+
+        if failures > 3:
             with torch.no_grad():
                 self.primal_points.copy_(del_points)
 
@@ -395,7 +398,13 @@ class CTScene(torch.nn.Module):
 
             # --- Contrast-based sampling (new strategy) ---
             if num_contrast_points > 0:
-                contrast_weight = max_contrast * cell_radius.squeeze()
+                # Distance to the max-contrast neighbor
+                max_contrast_dist = (points - points[max_contrast_neighbor]).norm(dim=-1)
+                # Weight by contrast, cell size, AND neighbor distance —
+                # deprioritize edges that are too short to warrant a new point
+                contrast_weight = max_contrast * cell_radius.squeeze() * max_contrast_dist
+                # Hard floor: zero out pairs closer than 1e-3
+                contrast_weight[max_contrast_dist < 1e-3] = 0.0
                 # Fallback: if all contrasts are zero, redirect budget to gradient strategy
                 if contrast_weight.sum() < 1e-10:
                     if num_gradient_points > 0:
@@ -419,6 +428,19 @@ class CTScene(torch.nn.Module):
 
             sampled_inds = torch.cat(sampled_inds_list, dim=0)
             sampled_points = torch.cat(sampled_points_list, dim=0)
+
+            ################### Filter near-duplicates ###################
+            nn_inds = radfoam.nn(points, self.aabb_tree, sampled_points).long()
+            nn_dists = (sampled_points - points[nn_inds]).norm(dim=-1)
+            # Minimum separation: 2% of the source point's cell radius
+            min_sep = 0.02 * cell_radius[sampled_inds].squeeze()
+            keep_mask = nn_dists > min_sep
+
+            if not keep_mask.all():
+                n_filtered = (~keep_mask).sum().item()
+                print(f"Filtered {n_filtered}/{sampled_points.shape[0]} new points (too close to existing)")
+                sampled_points = sampled_points[keep_mask]
+                sampled_inds = sampled_inds[keep_mask]
 
             new_params = {
                 "primal_points": sampled_points,
