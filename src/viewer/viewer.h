@@ -14,6 +14,7 @@ struct ViewerOptions {
     Vec3f camera_pos;
     Vec3f camera_forward;
     Vec3f camera_up;
+    Vec3f orbit_target;
 };
 
 inline ViewerOptions default_viewer_options() {
@@ -24,6 +25,7 @@ inline ViewerOptions default_viewer_options() {
     options.camera_pos = Vec3f(2.5f, 2.5f, 2.5f);
     options.camera_forward = Vec3f(-1.0f, -1.0f, -1.0f).normalized();
     options.camera_up = Vec3f(0.0f, 0.0f, 1.0f);
+    options.orbit_target = Vec3f(0.0f, 0.0f, 0.0f);
     return options;
 }
 

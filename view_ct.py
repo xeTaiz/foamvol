@@ -12,6 +12,10 @@ def main():
         "--camera_distance", type=float, default=60.0,
         help="Initial camera distance from origin",
     )
+    parser.add_argument(
+        "--up", type=str, default="Y", choices=["X", "Y", "Z"],
+        help="Which axis is up (default: Y)",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -32,12 +36,15 @@ def main():
     def callback(viewer):
         viewer.update_scene(xyz, density, adjacency, adjacency_offsets, aabb_tree)
 
+    orbit_target = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
+
     radfoam.run_with_viewer(
         pipeline,
         callback,
         camera_pos=camera_pos,
         camera_forward=camera_forward,
         camera_up=camera_up,
+        orbit_target=orbit_target,
     )
 
 
