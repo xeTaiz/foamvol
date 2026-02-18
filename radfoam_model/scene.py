@@ -39,7 +39,11 @@ class CTScene(torch.nn.Module):
         pt_per_axis = int(round(self.num_init_points ** (1.0 / 3.0)))
         ax = torch.linspace(-s, s, pt_per_axis, device=self.device)
         mg = torch.stack(torch.meshgrid([ax,ax,ax]), dim=-1).reshape(-1, 3)
-        self.triangulation = radfoam.Triangulation(mg)
+        print(mg.shape, mg.min(), mg.max())
+        if mg.size(0) < self.num_init_points:
+            mg = torch.cat([mg, torch.rand(self.num_init_points - mg.size(0), 3, device=self.device) * 2 * s - s], dim=0)
+        print(mg.shape, mg.min(), mg.max())
+        self.triangulation = radfoam.Triangulation(mg.float().contiguous())
         perm = self.triangulation.permutation().to(torch.long)
         primal_points = mg[perm]
 
@@ -55,6 +59,7 @@ class CTScene(torch.nn.Module):
         primal_points = (
             torch.rand(self.num_init_points, 3, device=self.device) * 2 * s - s
         )
+        print(primal_points.shape, primal_points.dtype, primal_points.min(), primal_points.max())
         self.triangulation = radfoam.Triangulation(primal_points)
         perm = self.triangulation.permutation().to(torch.long)
         primal_points = primal_points[perm]
