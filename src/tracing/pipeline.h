@@ -40,6 +40,7 @@ struct VisualizationSettings {
     bool use_transfer_function;
     float tf_density_min;
     float tf_density_max;
+    float tf_opacity_scale;
 };
 
 inline VisualizationSettings default_visualization_settings() {
@@ -56,6 +57,7 @@ inline VisualizationSettings default_visualization_settings() {
     settings.use_transfer_function = false;
     settings.tf_density_min = 0.0f;
     settings.tf_density_max = 1.0f;
+    settings.tf_opacity_scale = 100.0f;
     return settings;
 }
 
