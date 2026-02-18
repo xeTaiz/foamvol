@@ -468,6 +468,91 @@ const float turbo_data[] = {
     0.00638, 0.53295, 0.03169, 0.00705, 0.51989, 0.02756, 0.00780, 0.50664,
     0.02354, 0.00863, 0.49321, 0.01963, 0.00955, 0.47960, 0.01583, 0.01055};
 
+static constexpr int TF_TEXTURE_SIZE = 256;
+
+struct TFControlPoint {
+    float density;   // [0,1] normalized position on x-axis
+    float opacity;   // [0,1] y-axis
+    float color[3];  // RGB
+};
+
+struct TransferFunctionState {
+    std::vector<TFControlPoint> control_points;
+    float baked_texture[TF_TEXTURE_SIZE * 4]; // CPU-side RGBA
+    CUdeviceptr gpu_texture = 0;
+    bool dirty = true;
+    int selected_point = -1;
+    int dragging_point = -1;
+
+    TransferFunctionState() {
+        // Default: black/transparent at 0, white/opaque at 1
+        control_points.push_back({0.0f, 0.0f, {0.0f, 0.0f, 0.0f}});
+        control_points.push_back({1.0f, 1.0f, {1.0f, 1.0f, 1.0f}});
+    }
+
+    void init_gpu() {
+        cuda_check(cuMemAlloc_v2(&gpu_texture, TF_TEXTURE_SIZE * 4 * sizeof(float)));
+        bake_and_upload();
+    }
+
+    void cleanup_gpu() {
+        if (gpu_texture) {
+            cuMemFree_v2(gpu_texture);
+            gpu_texture = 0;
+        }
+    }
+
+    void sort_points() {
+        std::sort(control_points.begin(), control_points.end(),
+                  [](const TFControlPoint &a, const TFControlPoint &b) {
+                      return a.density < b.density;
+                  });
+    }
+
+    void bake_and_upload() {
+        // Piecewise-linear interpolation from sorted control points
+        sort_points();
+        int n = (int)control_points.size();
+        for (int i = 0; i < TF_TEXTURE_SIZE; ++i) {
+            float x = (float)i / (float)(TF_TEXTURE_SIZE - 1);
+
+            // Find surrounding control points
+            int lo = 0, hi = n - 1;
+            for (int j = 0; j < n - 1; ++j) {
+                if (control_points[j + 1].density >= x) {
+                    lo = j;
+                    hi = j + 1;
+                    break;
+                }
+                lo = j + 1;
+                hi = j + 1;
+            }
+
+            float t = 0.0f;
+            float range = control_points[hi].density - control_points[lo].density;
+            if (range > 1e-8f) {
+                t = (x - control_points[lo].density) / range;
+            }
+            t = std::max(0.0f, std::min(1.0f, t));
+
+            baked_texture[i * 4 + 0] = control_points[lo].color[0] * (1 - t) + control_points[hi].color[0] * t;
+            baked_texture[i * 4 + 1] = control_points[lo].color[1] * (1 - t) + control_points[hi].color[1] * t;
+            baked_texture[i * 4 + 2] = control_points[lo].color[2] * (1 - t) + control_points[hi].color[2] * t;
+            baked_texture[i * 4 + 3] = control_points[lo].opacity * (1 - t) + control_points[hi].opacity * t;
+        }
+
+        if (gpu_texture) {
+            cuda_check(cuMemcpyHtoD_v2(gpu_texture, baked_texture,
+                                        TF_TEXTURE_SIZE * 4 * sizeof(float)));
+        }
+        dirty = false;
+    }
+
+    radfoam::TransferFunctionTable get_table() const {
+        return {reinterpret_cast<const float *>(gpu_texture), TF_TEXTURE_SIZE};
+    }
+};
+
 radfoam::CMapTable upload_cmap_data() {
     radfoam::CMapTable cmap_table;
     float *data[NUM_CMAPS];
@@ -529,6 +614,7 @@ struct ViewerPrivate : public Viewer {
     CUdevice gl_device;
     CUgraphicsResource resource;
     CMapTable cmap_table;
+    TransferFunctionState tf_state;
 
     uint32_t num_points;
     uint32_t num_point_adjacency;
@@ -594,6 +680,7 @@ struct ViewerPrivate : public Viewer {
         }
 
         cmap_table = upload_cmap_data();
+        tf_state.init_gpu();
 
         num_points = 0;
         num_point_adjacency = 0;
@@ -668,6 +755,7 @@ struct ViewerPrivate : public Viewer {
     }
 
     ~ViewerPrivate() {
+        tf_state.cleanup_gpu();
         if (is_cuda_gl_interop_supported) {
             cuda_check(cuGraphicsUnregisterResource(resource));
         }
@@ -952,19 +1040,10 @@ struct ViewerPrivate : public Viewer {
             }
 
             if (vis_settings.mode == VisualizationMode::VolumeDensity) {
-                const char *color_maps[] = {
-                    "Gray", "Viridis", "Inferno", "Turbo"};
-                ImGui::Combo("Color map",
-                             reinterpret_cast<int *>(&vis_settings.color_map),
-                             color_maps,
-                             IM_ARRAYSIZE(color_maps));
-                ImGui::SliderFloat("Density scale",
-                                   &vis_settings.density_scale,
-                                   0.01f,
-                                   100.0f,
-                                   "%.3f",
-                                   ImGuiSliderFlags_Logarithmic |
-                                       ImGuiSliderFlags_NoRoundToFormat);
+                ImGui::Checkbox("Use Transfer Function",
+                                &vis_settings.use_transfer_function);
+
+                // Activation controls (always visible)
                 ImGui::SliderFloat("Activation scale",
                                    &vis_settings.activation_scale,
                                    0.01f,
@@ -979,6 +1058,211 @@ struct ViewerPrivate : public Viewer {
                                    "%.2f",
                                    ImGuiSliderFlags_Logarithmic |
                                        ImGuiSliderFlags_NoRoundToFormat);
+
+                if (vis_settings.use_transfer_function) {
+                    // Transfer function editor
+                    ImGui::SeparatorText("Transfer Function");
+
+                    ImGui::SliderFloat("TF Density Min",
+                                       &vis_settings.tf_density_min,
+                                       0.0f, 10.0f, "%.3f");
+                    ImGui::SliderFloat("TF Density Max",
+                                       &vis_settings.tf_density_max,
+                                       0.0f, 10.0f, "%.3f");
+
+                    // Canvas for TF editor
+                    const float canvas_w = 300.0f;
+                    const float canvas_h = 150.0f;
+                    ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
+                    ImVec2 canvas_end = ImVec2(canvas_pos.x + canvas_w,
+                                               canvas_pos.y + canvas_h);
+
+                    ImDrawList *draw_list = ImGui::GetWindowDrawList();
+
+                    // Dark background
+                    draw_list->AddRectFilled(canvas_pos, canvas_end,
+                                             IM_COL32(30, 30, 30, 255));
+                    draw_list->AddRect(canvas_pos, canvas_end,
+                                       IM_COL32(100, 100, 100, 255));
+
+                    // Grid lines
+                    for (int g = 1; g < 4; ++g) {
+                        float gx = canvas_pos.x + canvas_w * g / 4.0f;
+                        float gy = canvas_pos.y + canvas_h * g / 4.0f;
+                        draw_list->AddLine(ImVec2(gx, canvas_pos.y),
+                                           ImVec2(gx, canvas_end.y),
+                                           IM_COL32(60, 60, 60, 255));
+                        draw_list->AddLine(ImVec2(canvas_pos.x, gy),
+                                           ImVec2(canvas_end.x, gy),
+                                           IM_COL32(60, 60, 60, 255));
+                    }
+
+                    // Draw filled opacity curve from baked texture
+                    for (int s = 0; s < TF_TEXTURE_SIZE - 1; ++s) {
+                        float x0 = canvas_pos.x + canvas_w * s / (float)(TF_TEXTURE_SIZE - 1);
+                        float x1 = canvas_pos.x + canvas_w * (s + 1) / (float)(TF_TEXTURE_SIZE - 1);
+                        float a0 = tf_state.baked_texture[s * 4 + 3];
+                        float a1 = tf_state.baked_texture[(s + 1) * 4 + 3];
+                        float y0 = canvas_end.y - a0 * canvas_h;
+                        float y1 = canvas_end.y - a1 * canvas_h;
+
+                        // Color from the baked texture
+                        int r = (int)(tf_state.baked_texture[s * 4 + 0] * 255);
+                        int g_c = (int)(tf_state.baked_texture[s * 4 + 1] * 255);
+                        int b = (int)(tf_state.baked_texture[s * 4 + 2] * 255);
+
+                        // Filled quad from bottom to opacity curve
+                        draw_list->AddQuadFilled(
+                            ImVec2(x0, canvas_end.y), ImVec2(x1, canvas_end.y),
+                            ImVec2(x1, y1), ImVec2(x0, y0),
+                            IM_COL32(r, g_c, b, 80));
+
+                        // Opacity curve line
+                        draw_list->AddLine(ImVec2(x0, y0), ImVec2(x1, y1),
+                                           IM_COL32(r, g_c, b, 255), 1.5f);
+                    }
+
+                    // Draw control points
+                    const float point_radius = 6.0f;
+                    for (int p = 0; p < (int)tf_state.control_points.size(); ++p) {
+                        auto &cp = tf_state.control_points[p];
+                        float px = canvas_pos.x + cp.density * canvas_w;
+                        float py = canvas_end.y - cp.opacity * canvas_h;
+                        ImU32 fill_col = IM_COL32(
+                            (int)(cp.color[0] * 255),
+                            (int)(cp.color[1] * 255),
+                            (int)(cp.color[2] * 255), 255);
+                        ImU32 outline_col = (p == tf_state.selected_point)
+                            ? IM_COL32(255, 255, 0, 255)
+                            : IM_COL32(200, 200, 200, 255);
+                        draw_list->AddCircleFilled(ImVec2(px, py), point_radius, fill_col);
+                        draw_list->AddCircle(ImVec2(px, py), point_radius, outline_col, 0, 2.0f);
+                    }
+
+                    // Invisible button for mouse interaction
+                    ImGui::InvisibleButton("tf_canvas",
+                                           ImVec2(canvas_w, canvas_h));
+                    bool canvas_hovered = ImGui::IsItemHovered();
+                    bool canvas_active = ImGui::IsItemActive();
+
+                    if (canvas_hovered || canvas_active) {
+                        ImVec2 mouse = ImGui::GetIO().MousePos;
+                        float mx = (mouse.x - canvas_pos.x) / canvas_w;
+                        float my = 1.0f - (mouse.y - canvas_pos.y) / canvas_h;
+                        mx = std::max(0.0f, std::min(1.0f, mx));
+                        my = std::max(0.0f, std::min(1.0f, my));
+
+                        // Find closest point
+                        int closest = -1;
+                        float closest_dist = point_radius + 4.0f;
+                        for (int p = 0; p < (int)tf_state.control_points.size(); ++p) {
+                            auto &cp = tf_state.control_points[p];
+                            float px = canvas_pos.x + cp.density * canvas_w;
+                            float py = canvas_end.y - cp.opacity * canvas_h;
+                            float dist = sqrtf((mouse.x - px) * (mouse.x - px) +
+                                               (mouse.y - py) * (mouse.y - py));
+                            if (dist < closest_dist) {
+                                closest_dist = dist;
+                                closest = p;
+                            }
+                        }
+
+                        // Left click: select or add point
+                        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && canvas_hovered) {
+                            if (closest >= 0) {
+                                tf_state.selected_point = closest;
+                                tf_state.dragging_point = closest;
+                            } else {
+                                // Add new point
+                                TFControlPoint np;
+                                np.density = mx;
+                                np.opacity = my;
+                                np.color[0] = 1.0f;
+                                np.color[1] = 1.0f;
+                                np.color[2] = 1.0f;
+                                tf_state.control_points.push_back(np);
+                                tf_state.selected_point = (int)tf_state.control_points.size() - 1;
+                                tf_state.dragging_point = tf_state.selected_point;
+                                tf_state.dirty = true;
+                            }
+                        }
+
+                        // Left drag: move selected point
+                        if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) &&
+                            tf_state.dragging_point >= 0 &&
+                            tf_state.dragging_point < (int)tf_state.control_points.size()) {
+                            auto &cp = tf_state.control_points[tf_state.dragging_point];
+                            cp.density = mx;
+                            cp.opacity = my;
+                            tf_state.dirty = true;
+                        }
+
+                        // Right click: delete point (if > 2 remain)
+                        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right) && canvas_hovered) {
+                            if (closest >= 0 && tf_state.control_points.size() > 2) {
+                                tf_state.control_points.erase(
+                                    tf_state.control_points.begin() + closest);
+                                if (tf_state.selected_point >= (int)tf_state.control_points.size())
+                                    tf_state.selected_point = (int)tf_state.control_points.size() - 1;
+                                if (tf_state.dragging_point >= (int)tf_state.control_points.size())
+                                    tf_state.dragging_point = -1;
+                                tf_state.dirty = true;
+                            }
+                        }
+                    }
+
+                    // Release drag on mouse up, sort points
+                    if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+                        tf_state.dragging_point >= 0) {
+                        // Find where the dragged point ends up after sorting
+                        float dragged_density = -1.0f;
+                        if (tf_state.dragging_point < (int)tf_state.control_points.size()) {
+                            dragged_density = tf_state.control_points[tf_state.dragging_point].density;
+                        }
+                        tf_state.sort_points();
+                        // Update selected_point to match the dragged point's new index
+                        if (dragged_density >= 0.0f) {
+                            for (int p = 0; p < (int)tf_state.control_points.size(); ++p) {
+                                if (tf_state.control_points[p].density == dragged_density) {
+                                    tf_state.selected_point = p;
+                                    break;
+                                }
+                            }
+                        }
+                        tf_state.dragging_point = -1;
+                        tf_state.dirty = true;
+                    }
+
+                    // Controls for selected point
+                    if (tf_state.selected_point >= 0 &&
+                        tf_state.selected_point < (int)tf_state.control_points.size()) {
+                        auto &cp = tf_state.control_points[tf_state.selected_point];
+                        if (ImGui::ColorEdit3("Point Color", cp.color))
+                            tf_state.dirty = true;
+                        if (ImGui::SliderFloat("Point Opacity", &cp.opacity, 0.0f, 1.0f))
+                            tf_state.dirty = true;
+                    }
+
+                    // Rebake if dirty
+                    if (tf_state.dirty) {
+                        tf_state.bake_and_upload();
+                    }
+                } else {
+                    // Original colormap controls
+                    const char *color_maps[] = {
+                        "Gray", "Viridis", "Inferno", "Turbo"};
+                    ImGui::Combo("Color map",
+                                 reinterpret_cast<int *>(&vis_settings.color_map),
+                                 color_maps,
+                                 IM_ARRAYSIZE(color_maps));
+                    ImGui::SliderFloat("Density scale",
+                                       &vis_settings.density_scale,
+                                       0.01f,
+                                       100.0f,
+                                       "%.3f",
+                                       ImGuiSliderFlags_Logarithmic |
+                                           ImGuiSliderFlags_NoRoundToFormat);
+                }
                 ImGui::ColorEdit3(
                     "Background color",
                     reinterpret_cast<float *>(&vis_settings.bg_color));
@@ -1018,6 +1302,7 @@ struct ViewerPrivate : public Viewer {
                     vis_settings,
                     camera,
                     cmap_table,
+                    tf_state.get_table(),
                     num_points,
                     num_point_adjacency,
                     points_buffer.begin(),

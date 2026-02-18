@@ -114,6 +114,25 @@ inline RADFOAM_HD uint32_t make_rgba8(float r, float g, float b, float a) {
     return (ai << 24) | (bi << 16) | (gi << 8) | ri;
 }
 
+inline __device__ void sample_transfer_function(
+    float v, const TransferFunctionTable &tf_table,
+    Vec3f &rgb_out, float &alpha_out)
+{
+    int len = tf_table.size;
+    const float *data = tf_table.data;
+    v = fmaxf(0.0f, fminf(v, 1.0f));
+    int i0 = static_cast<int>(v * (len - 1));
+    int i1 = i0 + 1;
+    float t = v * (len - 1) - i0;
+    i0 = max(0, min(i0, len - 1));
+    i1 = max(0, min(i1, len - 1));
+    rgb_out = Vec3f(
+        data[i0*4+0]*(1-t) + data[i1*4+0]*t,
+        data[i0*4+1]*(1-t) + data[i1*4+1]*t,
+        data[i0*4+2]*(1-t) + data[i1*4+2]*t);
+    alpha_out = data[i0*4+3]*(1-t) + data[i1*4+3]*t;
+}
+
 inline __device__ Vec3f colormap(float v,
                                  ColorMap map,
                                  const CMapTable &cmap_table) {
