@@ -1,5 +1,7 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <iostream>
 #include <mutex>
@@ -545,6 +547,13 @@ struct ViewerPrivate : public Viewer {
     std::mutex scene_mutex;
     std::condition_variable scene_cv;
 
+    // Orbit/trackball camera state
+    Vec3f orbit_target;
+    float orbit_radius;
+    float orbit_yaw;
+    float orbit_pitch;
+    Vec3f orbit_base_forward; // yaw=0 reference direction (perpendicular to up)
+
     std::atomic_bool closed;
     std::atomic_bool paused;
     std::atomic_bool should_step;
@@ -574,6 +583,7 @@ struct ViewerPrivate : public Viewer {
         glfwSetWindowUserPointer(window, this);
         glfwSetFramebufferSizeCallback(window, &ViewerPrivate::handle_resize);
         glfwSetKeyCallback(window, &ViewerPrivate::handle_key);
+        glfwSetScrollCallback(window, &ViewerPrivate::handle_scroll);
 
         if (!gl3w_initialized) {
             if (!gl3wInit()) {
@@ -631,6 +641,41 @@ struct ViewerPrivate : public Viewer {
                          0.7f,
                          width,
                          height);
+
+        // Initialize orbit/trackball state
+        orbit_target = options.orbit_target;
+        Vec3f offset = options.camera_pos - orbit_target;
+        orbit_radius = offset.norm();
+        if (orbit_radius < 1e-6f) orbit_radius = 1.0f;
+
+        Vec3f up = options.camera_up.normalized();
+        Vec3f horizontal = offset - offset.dot(up) * up;
+        float horiz_len = horizontal.norm();
+
+        if (horiz_len > 1e-6f) {
+            orbit_base_forward = horizontal / horiz_len;
+            orbit_yaw = 0.0f;
+        } else {
+            // Camera directly above/below target — pick arbitrary base
+            orbit_base_forward = Vec3f(1, 0, 0);
+            if (fabsf(up.dot(orbit_base_forward)) > 0.9f)
+                orbit_base_forward = Vec3f(0, 1, 0);
+            orbit_base_forward = (orbit_base_forward - orbit_base_forward.dot(up) * up).normalized();
+            orbit_yaw = 0.0f;
+        }
+        orbit_pitch = asinf(std::clamp(offset.dot(up) / orbit_radius, -1.0f, 1.0f));
+
+        // Rebuild camera from orbit state so it faces the target
+        {
+            Eigen::AngleAxisf yaw_rot(orbit_yaw, up);
+            Vec3f dir = yaw_rot * orbit_base_forward;
+            Vec3f right = dir.cross(up).normalized();
+            Eigen::AngleAxisf pitch_rot(orbit_pitch, right);
+            dir = pitch_rot * dir;
+            Vec3f pos = orbit_target + orbit_radius * dir;
+            camera = look_at(pos, orbit_target, up, camera.fov, camera.width, camera.height, camera.model);
+        }
+
         program = create_program();
         texture = allocate_texture(width, height);
         if (is_cuda_gl_interop_supported) {
@@ -689,33 +734,7 @@ struct ViewerPrivate : public Viewer {
         while (!glfwWindowShouldClose(window)) {
             glfwPollEvents();
 
-            if (!io.WantCaptureKeyboard) {
-                Vec3f position_delta(0, 0, 0);
-                if (glfwGetKey(window, GLFW_KEY_W)) {
-                    position_delta += *camera.forward;
-                }
-                if (glfwGetKey(window, GLFW_KEY_S)) {
-                    position_delta -= *camera.forward;
-                }
-                if (glfwGetKey(window, GLFW_KEY_A)) {
-                    position_delta -= *camera.right;
-                }
-                if (glfwGetKey(window, GLFW_KEY_D)) {
-                    position_delta += *camera.right;
-                }
-                if (!io.WantCaptureMouse) {
-                    if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT)) {
-                        position_delta += *camera.up;
-                    }
-                    if (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL)) {
-                        position_delta -= *camera.up;
-                    }
-                }
-                float speed = 2.0f * delta_t;
-                Vec3f new_pos = *camera.position + speed * position_delta;
-                camera.position = new_pos;
-            }
-
+            // Mouse input — orbit and pan
             if (!io.WantCaptureMouse) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
                 double last_x = mouse_x;
@@ -725,10 +744,51 @@ struct ViewerPrivate : public Viewer {
                 double delta_x = mouse_x - last_x;
                 double delta_y = mouse_y - last_y;
 
+                // Left drag: orbit rotation
                 if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT)) {
-                    camera.rotate(options.camera_up, -0.001 * delta_x);
-                    camera.rotate(*camera.right, -0.001 * delta_y);
+                    orbit_yaw   -= 0.005f * (float)delta_x;
+                    orbit_pitch += 0.005f * (float)delta_y;
+                    orbit_pitch = std::clamp(orbit_pitch, -1.5f, 1.5f);
                 }
+
+                // Right/middle drag: pan (shift orbit target)
+                if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) ||
+                    glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_MIDDLE)) {
+                    float pan_speed = 0.002f * orbit_radius;
+                    orbit_target -= pan_speed * (float)delta_x * *camera.right;
+                    orbit_target += pan_speed * (float)delta_y * *camera.up;
+                }
+            }
+
+            // WASD: pan the orbit target
+            if (!io.WantCaptureKeyboard) {
+                Vec3f pan_delta(0, 0, 0);
+                if (glfwGetKey(window, GLFW_KEY_W))
+                    pan_delta += *camera.forward;
+                if (glfwGetKey(window, GLFW_KEY_S))
+                    pan_delta -= *camera.forward;
+                if (glfwGetKey(window, GLFW_KEY_A))
+                    pan_delta -= *camera.right;
+                if (glfwGetKey(window, GLFW_KEY_D))
+                    pan_delta += *camera.right;
+                if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT))
+                    pan_delta += options.camera_up;
+                if (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL))
+                    pan_delta -= options.camera_up;
+                float speed = 0.5f * orbit_radius * delta_t;
+                orbit_target += speed * pan_delta;
+            }
+
+            // Rebuild camera from orbit state
+            {
+                Vec3f up = options.camera_up.normalized();
+                Eigen::AngleAxisf yaw_rot(orbit_yaw, up);
+                Vec3f dir = yaw_rot * orbit_base_forward;
+                Vec3f right = dir.cross(up).normalized();
+                Eigen::AngleAxisf pitch_rot(orbit_pitch, right);
+                dir = pitch_rot * dir;
+                Vec3f pos = orbit_target + orbit_radius * dir;
+                camera = look_at(pos, orbit_target, up, camera.fov, camera.width, camera.height, camera.model);
             }
 
             ImGui_ImplOpenGL3_NewFrame();
@@ -1157,6 +1217,15 @@ struct ViewerPrivate : public Viewer {
                 self->paused = !self->paused;
             }
         }
+    }
+
+    static void handle_scroll(GLFWwindow *window, double xoffset, double yoffset) {
+        ViewerPrivate *self =
+            static_cast<ViewerPrivate *>(glfwGetWindowUserPointer(window));
+        ImGuiIO &io = ImGui::GetIO();
+        if (io.WantCaptureMouse) return;
+        self->orbit_radius *= expf(-0.1f * (float)yoffset);
+        self->orbit_radius = std::max(self->orbit_radius, 0.01f);
     }
 };
 

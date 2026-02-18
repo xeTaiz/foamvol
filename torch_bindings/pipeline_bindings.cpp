@@ -359,7 +359,8 @@ void run_with_viewer(std::shared_ptr<Pipeline> pipeline,
                      std::optional<int> total_iterations,
                      std::optional<torch::Tensor> camera_pos,
                      std::optional<torch::Tensor> camera_forward,
-                     std::optional<torch::Tensor> camera_up) {
+                     std::optional<torch::Tensor> camera_up,
+                     std::optional<torch::Tensor> orbit_target) {
     py::gil_scoped_release release;
 
     ViewerOptions options = default_viewer_options();
@@ -381,6 +382,11 @@ void run_with_viewer(std::shared_ptr<Pipeline> pipeline,
         torch::Tensor camera_up_cpu =
             camera_up->contiguous().cpu().to(torch::kFloat);
         options.camera_up = radfoam::Vec3f(camera_up_cpu.data_ptr<float>());
+    }
+    if (orbit_target.has_value()) {
+        torch::Tensor orbit_target_cpu =
+            orbit_target->contiguous().cpu().to(torch::kFloat);
+        options.orbit_target = radfoam::Vec3f(orbit_target_cpu.data_ptr<float>());
     }
 
     set_default_stream();
@@ -432,7 +438,8 @@ void init_pipeline_bindings(py::module &module) {
                py::arg("total_iterations") = py::none(),
                py::arg("camera_pos") = py::none(),
                py::arg("camera_forward") = py::none(),
-               py::arg("camera_up") = py::none());
+               py::arg("camera_up") = py::none(),
+               py::arg("orbit_target") = py::none());
 }
 
 } // namespace radfoam_bindings
