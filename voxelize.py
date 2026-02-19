@@ -18,6 +18,92 @@ import radfoam
 import torch.nn.functional as F
 
 
+def compute_cell_gradients(centers, values, adj_indices, adj_offsets, device):
+    """Fit a per-cell linear gradient via weighted least squares on Voronoi neighbors.
+
+    Args:
+        centers: (N, 3) cell centers
+        values: (N,) scalar values per cell
+        adj_indices: (E,) flattened CSR neighbor indices
+        adj_offsets: (N+1,) CSR row offsets
+        device: torch device
+
+    Returns:
+        (N, 3) gradient vector per cell
+    """
+    N = centers.shape[0]
+
+    # Compute neighbor counts and cap at max_k
+    max_k = 30
+    counts = adj_offsets[1:] - adj_offsets[:-1]  # (N,)
+    K = min(int(counts.max().item()), max_k)
+
+    # Build padded (N, K) neighbor index tensor with validity mask
+    padded_idx = torch.zeros(N, K, dtype=torch.long, device=device)
+    mask = torch.zeros(N, K, dtype=torch.bool, device=device)
+
+    cell_ids = torch.arange(N, device=device)
+    base_offsets = adj_offsets[:-1]  # (N,) start offset per cell
+    for k in range(K):
+        has_k = counts > k
+        idx = cell_ids[has_k]
+        padded_idx[idx, k] = adj_indices[base_offsets[idx] + k]
+        mask[idx, k] = True
+
+    # dc: (N, K, 3) displacement vectors from cell center to neighbors
+    neighbor_centers = centers[padded_idx]  # (N, K, 3)
+    dc = neighbor_centers - centers[:, None, :]  # (N, K, 3)
+
+    # dv: (N, K) value differences
+    neighbor_vals = values[padded_idx]  # (N, K)
+    dv = neighbor_vals - values[:, None]  # (N, K)
+
+    # Inverse-distance weights, masked
+    dist = dc.norm(dim=-1)  # (N, K)
+    eps = 1e-8
+    w = torch.zeros_like(dist)
+    w[mask] = 1.0 / (dist[mask] + eps)
+
+    # Zero out invalid entries
+    dc[~mask] = 0.0
+    dv[~mask] = 0.0
+
+    # Weighted least squares: solve A @ grad = rhs per cell
+    # A = D^T W D  (3x3), rhs = D^T W dv (3,)
+    w_dc = dc * w.unsqueeze(-1)  # (N, K, 3) weighted displacements
+    A = torch.einsum("nki,nkj->nij", w_dc, dc)  # (N, 3, 3)
+    rhs = torch.einsum("nki,nk->ni", w_dc, dv)  # (N, 3)
+
+    # Regularize for boundary/low-neighbor cells
+    A += 1e-6 * torch.eye(3, device=device).unsqueeze(0)
+
+    # Solve batched 3x3 systems
+    gradients = torch.linalg.solve(A, rhs)  # (N, 3)
+
+    return gradients
+
+
+def sample_interpolated(query_points, nn_indices, centers, values, gradients):
+    """Evaluate the piecewise-linear field: f(x) = a[idx] + grad[idx] . (x - center[idx]).
+
+    Args:
+        query_points: (M, 3) sample positions
+        nn_indices: (M,) nearest cell index per query point
+        centers: (N, 3) cell centers
+        values: (N,) scalar values per cell
+        gradients: (N, 3) gradient per cell
+
+    Returns:
+        (M,) interpolated values, clamped to min=0
+    """
+    a = values[nn_indices]  # (M,)
+    c = centers[nn_indices]  # (M, 3)
+    g = gradients[nn_indices]  # (M, 3)
+    dx = query_points - c  # (M, 3)
+    result = a + (g * dx).sum(dim=-1)  # (M,)
+    return result.clamp(min=0.0)
+
+
 def gaussian_blur_3d(volume, kernel_size=3, sigma=1.0):
     """Apply 3D Gaussian blur to a volume tensor (X, Y, Z) on GPU."""
     pad = kernel_size // 2
@@ -33,7 +119,7 @@ def gaussian_blur_3d(volume, kernel_size=3, sigma=1.0):
 
 
 def voxelize(model_path, resolution, output_path, extent=None, blur_sigma=0.0,
-             supersample=3):
+             supersample=3, interpolate=True):
     device = torch.device("cuda")
 
     scene_data = torch.load(model_path)
@@ -43,6 +129,22 @@ def voxelize(model_path, resolution, output_path, extent=None, blur_sigma=0.0,
 
     # Apply the same activation as CTScene.get_primal_density()
     density = activation_scale * F.softplus(density_raw, beta=10)
+
+    # Compute per-cell gradients for linear interpolation
+    density_flat = density.squeeze(-1)  # (N,)
+    gradients = None
+    if interpolate:
+        if "adjacency" in scene_data and "adjacency_offsets" in scene_data:
+            adj_indices = scene_data["adjacency"].to(device).long()
+            adj_offsets = scene_data["adjacency_offsets"].to(device).long()
+            print("Computing per-cell gradients for linear interpolation...")
+            gradients = compute_cell_gradients(points, density_flat, adj_indices, adj_offsets, device)
+            print(f"  gradient norms: min={gradients.norm(dim=-1).min():.4f}, "
+                  f"max={gradients.norm(dim=-1).max():.4f}, "
+                  f"mean={gradients.norm(dim=-1).mean():.4f}")
+        else:
+            print("Warning: adjacency data not found in checkpoint, falling back to constant lookup")
+            interpolate = False
 
     # Build AABB tree for nearest-neighbor queries
     aabb_tree = radfoam.build_aabb_tree(points)
@@ -70,12 +172,16 @@ def voxelize(model_path, resolution, output_path, extent=None, blur_sigma=0.0,
     volume = torch.zeros(num_voxels, device=device)
 
     if k <= 1:
-        # Single center-point lookup (original behavior)
+        # Single center-point lookup
         batch_size = 4_000_000
         for start in range(0, num_voxels, batch_size):
             end = min(start + batch_size, num_voxels)
-            nn_indices = radfoam.nn(points, aabb_tree, voxel_centers[start:end]).long()
-            volume[start:end] = density[nn_indices].squeeze(-1)
+            query = voxel_centers[start:end]
+            nn_indices = radfoam.nn(points, aabb_tree, query).long()
+            if interpolate and gradients is not None:
+                volume[start:end] = sample_interpolated(query, nn_indices, points, density_flat, gradients)
+            else:
+                volume[start:end] = density[nn_indices].squeeze(-1)
     else:
         # Supersample: k^3 uniformly spaced sub-points per voxel
         voxel_size = (grid_max - grid_min) / resolution  # (3,)
@@ -95,7 +201,10 @@ def voxelize(model_path, resolution, output_path, extent=None, blur_sigma=0.0,
             sub_points = centers.unsqueeze(1) + offsets.unsqueeze(0)  # (B, k^3, 3)
             sub_points = sub_points.reshape(-1, 3)  # (B*k^3, 3)
             nn_indices = radfoam.nn(points, aabb_tree, sub_points).long()
-            sub_densities = density[nn_indices].squeeze(-1)  # (B*k^3,)
+            if interpolate and gradients is not None:
+                sub_densities = sample_interpolated(sub_points, nn_indices, points, density_flat, gradients)
+            else:
+                sub_densities = density[nn_indices].squeeze(-1)  # (B*k^3,)
             volume[start:end] = sub_densities.reshape(-1, samples_per_voxel).mean(dim=1)
 
     volume = volume.reshape(resolution, resolution, resolution)
@@ -134,6 +243,8 @@ def main():
     parser.add_argument("--extent", type=float, default=1.0, help="Half-extent of the grid (auto if not set)")
     parser.add_argument("--blur_sigma", type=float, default=0.0, help="Gaussian blur sigma (0 = disabled)")
     parser.add_argument("--supersample", type=int, default=3, help="Sub-samples per axis per voxel (k^3 total, 1 = center-only)")
+    parser.add_argument("--interpolate", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use per-cell linear interpolation (default: True, use --no-interpolate to disable)")
     args = parser.parse_args()
 
     output = args.output
@@ -141,7 +252,7 @@ def main():
         output = os.path.join(os.path.dirname(args.model), "volume.npy")
 
     voxelize(args.model, args.resolution, output, args.extent, args.blur_sigma,
-             args.supersample)
+             args.supersample, args.interpolate)
 
 
 if __name__ == "__main__":
