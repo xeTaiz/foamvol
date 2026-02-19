@@ -73,6 +73,9 @@ class OptimizationParams(ParamGroup):
         self.density_lr_init = 1e-1
         self.density_lr_final = 1e-2
         self.freeze_points = 18_000
+        self.tv_weight = 0.0
+        self.tv_start = 0
+        self.tv_epsilon = 1e-3
         super().__init__(parser, "Setting Optimization parameters")
 
 

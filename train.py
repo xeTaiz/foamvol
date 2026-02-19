@@ -285,6 +285,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                 loss = loss_fn(proj_output, proj_batch)
 
+                if optimizer_args.tv_weight > 0 and i >= optimizer_args.tv_start:
+                    tv_loss = model.tv_regularization(epsilon=optimizer_args.tv_epsilon)
+                    loss = loss + optimizer_args.tv_weight * tv_loss
+
                 model.optimizer.zero_grad(set_to_none=True)
 
                 # Hide latency of data loading behind the backward pass
@@ -301,6 +305,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                 if i % 100 == 99 and not pipeline_args.debug:
                     writer.add_scalar("train/loss", loss.item(), i)
+                    if optimizer_args.tv_weight > 0 and i >= optimizer_args.tv_start:
+                        writer.add_scalar("train/tv_loss", tv_loss.item(), i)
                     num_points = model.primal_points.shape[0]
                     writer.add_scalar("train/num_points", num_points, i)
 
