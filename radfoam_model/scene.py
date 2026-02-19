@@ -152,6 +152,23 @@ class CTScene(torch.nn.Module):
     def get_primal_density(self):
         return self.activation_scale * F.softplus(self.density, beta=10)
 
+    def tv_regularization(self, epsilon=1e-3):
+        """Charbonnier (smooth L1) TV loss over Voronoi neighbor edges."""
+        density = self.get_primal_density().squeeze()  # (N,)
+        offsets = self.point_adjacency_offsets.long()
+        adj = self.point_adjacency.long()
+        N = density.shape[0]
+
+        counts = offsets[1:] - offsets[:-1]
+        source = torch.repeat_interleave(
+            torch.arange(N, device=density.device), counts
+        )
+
+        diff = density[source] - density[adj]
+        edge_loss = torch.sqrt(diff ** 2 + epsilon ** 2) - epsilon
+
+        return edge_loss.mean()
+
     def get_trace_data(self):
         points = self.primal_points
         density = self.get_primal_density()
