@@ -152,7 +152,7 @@ class CTScene(torch.nn.Module):
     def get_primal_density(self):
         return self.activation_scale * F.softplus(self.density, beta=10)
 
-    def tv_regularization(self, epsilon=1e-3):
+    def tv_regularization(self, epsilon=1e-3, area_weighted=False):
         """Charbonnier (smooth L1) TV loss over Voronoi neighbor edges."""
         density = self.get_primal_density().squeeze()  # (N,)
         offsets = self.point_adjacency_offsets.long()
@@ -166,6 +166,18 @@ class CTScene(torch.nn.Module):
 
         diff = density[source] - density[adj]
         edge_loss = torch.sqrt(diff ** 2 + epsilon ** 2) - epsilon
+
+        if area_weighted:
+            with torch.no_grad():
+                _, cell_radius = radfoam.farthest_neighbor(
+                    self.primal_points,
+                    self.point_adjacency,
+                    self.point_adjacency_offsets,
+                )
+                cr = cell_radius.squeeze()
+                w = cr[source] * cr[adj]
+                w = w / w.sum()
+            return (w * edge_loss).sum()
 
         return edge_loss.mean()
 

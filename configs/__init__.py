@@ -76,6 +76,7 @@ class OptimizationParams(ParamGroup):
         self.tv_weight = 0.0
         self.tv_start = 0
         self.tv_epsilon = 1e-3
+        self.tv_area_weighted = False
         super().__init__(parser, "Setting Optimization parameters")
 
 

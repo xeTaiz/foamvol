@@ -286,7 +286,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 loss = loss_fn(proj_output, proj_batch)
 
                 if optimizer_args.tv_weight > 0 and i >= optimizer_args.tv_start:
-                    tv_loss = model.tv_regularization(epsilon=optimizer_args.tv_epsilon)
+                    tv_loss = model.tv_regularization(
+                        epsilon=optimizer_args.tv_epsilon,
+                        area_weighted=optimizer_args.tv_area_weighted,
+                    )
                     loss = loss + optimizer_args.tv_weight * tv_loss
 
                 model.optimizer.zero_grad(set_to_none=True)
