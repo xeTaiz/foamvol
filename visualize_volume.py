@@ -20,7 +20,7 @@ def coord_to_index(coord, resolution):
     return int((coord + 1) / 2 * (resolution - 1))
 
 
-def visualize(volume_path, vmax=1.0):
+def visualize(volume_path, vmax=1.0, writer_fn=None):
     vol = np.load(volume_path)
     res = vol.shape[0]
     if vmax is None:
@@ -51,6 +51,8 @@ def visualize(volume_path, vmax=1.0):
 
     out_path = os.path.join(os.path.dirname(volume_path), "vis.jpg")
     fig.savefig(out_path, dpi=300)
+    if writer_fn is not None:
+        writer_fn(fig)
     plt.close(fig)
     print(f"Saved {out_path}")
 

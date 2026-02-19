@@ -2,6 +2,7 @@ import os
 import uuid
 import yaml
 import gc
+from functools import partial
 import numpy as np
 import configargparse
 import tqdm
@@ -403,8 +404,6 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         del data_iterator
 
     train_loop(viewer=None)
-    if not pipeline_args.debug:
-        writer.close()
 
     test_metrics = eval_views(
         test_data_handler,
@@ -429,7 +428,9 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         model_path = f"{out_dir}/model.pt"
         volume_path = f"{out_dir}/volume.npy"
         voxelize(model_path, resolution=512, output_path=volume_path, extent=1.0)
-        visualize(volume_path)
+        log_fig = partial(writer.add_figure, "volume/slices", global_step=pipeline_args.iterations)
+        visualize(volume_path, writer_fn=log_fig)
+        writer.close()
 
 
 def main():
