@@ -10,10 +10,6 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -76,100 +72,12 @@ def compute_ssim(pred, gt, window_size=11):
 
 def log_diagnostics(model, writer, step):
     with torch.no_grad():
-        points = model.primal_points.detach()
         _, cell_radius = radfoam.farthest_neighbor(
-            points,
+            model.primal_points,
             model.point_adjacency,
             model.point_adjacency_offsets,
         )
-        density = model.get_primal_density().squeeze()
-
-        # --- Scalar statistics ---
-        inside_mask = (points.abs() <= 1.0).all(dim=-1)
-        n_inside = inside_mask.sum().item()
-        n_total = points.shape[0]
-        writer.add_scalar("diagnostics/points_inside", n_inside, step)
-        writer.add_scalar("diagnostics/points_outside", n_total - n_inside, step)
-        writer.add_scalar("diagnostics/frac_inside", n_inside / n_total, step)
-
-        writer.add_scalar("diagnostics/cell_radius_mean", cell_radius.mean().item(), step)
-        writer.add_scalar("diagnostics/cell_radius_median", cell_radius.median().item(), step)
-        writer.add_scalar("diagnostics/cell_radius_min", cell_radius.min().item(), step)
-        writer.add_scalar("diagnostics/cell_radius_max", cell_radius.max().item(), step)
-
-        writer.add_scalar("diagnostics/density_mean", density.mean().item(), step)
-        writer.add_scalar("diagnostics/density_max", density.max().item(), step)
-
-        # --- Histograms ---
         writer.add_histogram("diagnostics/cell_radius", cell_radius, step)
-        writer.add_histogram("diagnostics/density", density, step)
-        writer.add_histogram("diagnostics/pos_x", points[:, 0], step)
-        writer.add_histogram("diagnostics/pos_y", points[:, 1], step)
-        writer.add_histogram("diagnostics/pos_z", points[:, 2], step)
-
-        # --- 2x2 figure ---
-        pts_cpu = points.cpu().numpy()
-        cr_cpu = cell_radius.cpu().numpy()
-        n_total_pts = pts_cpu.shape[0]
-
-        # Subsample for speed
-        max_pts = 5000
-        if n_total_pts > max_pts:
-            idx = np.random.choice(n_total_pts, max_pts, replace=False)
-            pts_sub = pts_cpu[idx]
-            cr_sub = cr_cpu[idx]
-        else:
-            pts_sub = pts_cpu
-            cr_sub = cr_cpu
-
-        fig, axes = plt.subplots(2, 2, figsize=(10, 10))
-
-        # Top-left: XY scatter colored by cell radius
-        ax = axes[0, 0]
-        sc = ax.scatter(pts_sub[:, 0], pts_sub[:, 1], c=cr_sub, s=1, alpha=0.3,
-                        cmap="coolwarm", rasterized=True)
-        ax.plot([-1, 1, 1, -1, -1], [-1, -1, 1, 1, -1], "k-", linewidth=1)
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-        ax.set_title("XY (color=cell radius)")
-        ax.set_aspect("equal")
-        fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-
-        # Top-right: XZ scatter colored by cell radius
-        ax = axes[0, 1]
-        sc = ax.scatter(pts_sub[:, 0], pts_sub[:, 2], c=cr_sub, s=1, alpha=0.3,
-                        cmap="coolwarm", rasterized=True)
-        ax.plot([-1, 1, 1, -1, -1], [-1, -1, 1, 1, -1], "k-", linewidth=1)
-        ax.set_xlabel("X")
-        ax.set_ylabel("Z")
-        ax.set_title("XZ (color=cell radius)")
-        ax.set_aspect("equal")
-        fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-
-        # Bottom-left: Radial density profile
-        ax = axes[1, 0]
-        dist = np.linalg.norm(pts_cpu, axis=1)
-        bins = np.linspace(0, dist.max(), 50)
-        counts, edges = np.histogram(dist, bins=bins)
-        frac = counts / n_total_pts
-        centers = 0.5 * (edges[:-1] + edges[1:])
-        ax.bar(centers, frac, width=np.diff(edges), edgecolor="none", alpha=0.7)
-        ax.set_xlabel("Distance from origin")
-        ax.set_ylabel("Fraction of cells")
-        ax.set_title("Radial cell density")
-
-        # Bottom-right: Cell radius vs distance from origin
-        ax = axes[1, 1]
-        dist_sub = np.linalg.norm(pts_sub, axis=1)
-        ax.scatter(dist_sub, cr_sub, s=1, alpha=0.3, rasterized=True)
-        ax.set_xlabel("Distance from origin")
-        ax.set_ylabel("Cell radius")
-        ax.set_title("Cell radius vs distance")
-
-        fig.suptitle(f"Cell diagnostics — step {step} — {n_total} points", fontsize=13)
-        fig.tight_layout()
-        writer.add_figure("diagnostics/cell_overview", fig, step)
-        plt.close(fig)
 
 
 def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
@@ -241,7 +149,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
     def eval_views(data_handler, ray_batch_fetcher, proj_batch_fetcher):
         rays = data_handler.rays
-        points, _, _, _ = model.get_trace_data()
+        points, _, _, _, _ = model.get_trace_data()
         start_points = model.get_starting_point(
             rays[:, 0, 0].cuda(), points, model.aabb_tree
         )
@@ -293,12 +201,32 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     )
                     loss = loss + optimizer_args.tv_weight * tv_loss
 
+                if (
+                    optimizer_args.gradient_l2_weight > 0
+                    and hasattr(model, "density_grad")
+                    and model.density_grad is not None
+                ):
+                    grad_l2 = (model.density_grad ** 2).sum()
+                    loss = loss + optimizer_args.gradient_l2_weight * grad_l2
+
                 model.optimizer.zero_grad(set_to_none=True)
 
                 # Hide latency of data loading behind the backward pass
                 event = torch.cuda.Event()
                 event.record()
                 loss.backward()
+
+                if (
+                    hasattr(model, "_gradient_clip")
+                    and model._gradient_clip > 0
+                    and hasattr(model, "density_grad")
+                    and model.density_grad is not None
+                    and model.density_grad.grad is not None
+                ):
+                    torch.nn.utils.clip_grad_norm_(
+                        [model.density_grad], model._gradient_clip
+                    )
+
                 event.synchronize()
                 ray_batch, proj_batch = next(data_iterator)
 
@@ -341,6 +269,12 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     writer.add_scalar(
                         "lr/density_lr", model.den_scheduler_args(i), i
                     )
+                    if model.grad_scheduler_args is not None:
+                        writer.add_scalar(
+                            "lr/gradient_lr",
+                            model.grad_scheduler_args(i - model._gradient_start),
+                            i,
+                        )
 
                 if i % 1000 == 999 and not pipeline_args.debug:
                     log_diagnostics(model, writer, i)
@@ -391,6 +325,12 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     next_densification_after = max(
                         next_densification_after, 100
                     )
+
+                if (
+                    optimizer_args.gradient_start >= 0
+                    and i == optimizer_args.gradient_start
+                ):
+                    model.initialize_gradients(optimizer_args)
 
                 if i == optimizer_args.freeze_points:
                     model.update_triangulation(incremental=False)
