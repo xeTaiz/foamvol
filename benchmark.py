@@ -38,7 +38,7 @@ def benchmark(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
     model.load_pt(f"{checkpoint}/model.pt")
 
-    points, attributes, point_adjacency, point_adjacency_offsets = (
+    points, attributes, point_adjacency, point_adjacency_offsets, _ = (
         model.get_trace_data()
     )
     self_point_inds = torch.zeros_like(point_adjacency.long())

@@ -59,8 +59,10 @@ def compute_cell_gradients(centers, values, adj_indices, adj_offsets, device):
     dv = neighbor_vals - values[:, None]  # (N, K)
 
     # Inverse-distance weights, masked
+    # Use a meaningful floor to avoid blowup from near-duplicate points
     dist = dc.norm(dim=-1)  # (N, K)
-    eps = 1e-8
+    median_dist = dist[mask].median()
+    eps = 1e-2 * median_dist  # floor at 1% of median neighbor distance
     w = torch.zeros_like(dist)
     w[mask] = 1.0 / (dist[mask] + eps)
 
@@ -80,6 +82,15 @@ def compute_cell_gradients(centers, values, adj_indices, adj_offsets, device):
     # Solve batched 3x3 systems
     gradients = torch.linalg.solve(A, rhs)  # (N, 3)
 
+    # Clamp extreme gradients from near-duplicate points
+    grad_norms = gradients.norm(dim=-1, keepdim=True)
+    value_range = values.max() - values.min()
+    max_grad = value_range / median_dist
+    clamped = grad_norms > max_grad
+    if clamped.any():
+        gradients = torch.where(clamped, gradients * max_grad / grad_norms.clamp(min=1e-8), gradients)
+        print(f"  clamped {clamped.sum().item()} gradient vectors (max_grad={max_grad:.1f})")
+
     return gradients
 
 
@@ -96,12 +107,12 @@ def sample_interpolated(query_points, nn_indices, centers, values, gradients):
     Returns:
         (M,) interpolated values, clamped to min=0
     """
-    a = values[nn_indices]  # (M,)
+    a = values[nn_indices]  # (M,) raw density
     c = centers[nn_indices]  # (M, 3)
     g = gradients[nn_indices]  # (M, 3)
     dx = query_points - c  # (M, 3)
     result = a + (g * dx).sum(dim=-1)  # (M,)
-    return result.clamp(min=0.0)
+    return F.softplus(result, beta=10)  # activate after linear correction
 
 
 def gaussian_blur_3d(volume, kernel_size=3, sigma=1.0):
@@ -125,16 +136,19 @@ def voxelize(model_path, resolution, output_path, extent=None, blur_sigma=0.0,
     scene_data = torch.load(model_path)
     points = scene_data["xyz"].to(device)
     density_raw = scene_data["density"].to(device)
-    activation_scale = 1.0
 
-    # Apply the same activation as CTScene.get_primal_density()
-    density = activation_scale * F.softplus(density_raw, beta=10)
-
-    # Compute per-cell gradients for linear interpolation
-    density_flat = density.squeeze(-1)  # (N,)
+    # Work in raw density space — softplus applied at sample time
+    density_flat = density_raw.squeeze(-1)  # (N,) raw values
     gradients = None
     if interpolate:
-        if "adjacency" in scene_data and "adjacency_offsets" in scene_data:
+        if "density_grad" in scene_data:
+            # Use learned per-cell gradients (operate in raw density space)
+            gradients = scene_data["density_grad"].to(device)
+            print("Using learned density gradients from checkpoint")
+            print(f"  gradient norms: min={gradients.norm(dim=-1).min():.4f}, "
+                  f"max={gradients.norm(dim=-1).max():.4f}, "
+                  f"mean={gradients.norm(dim=-1).mean():.4f}")
+        elif "adjacency" in scene_data and "adjacency_offsets" in scene_data:
             adj_indices = scene_data["adjacency"].to(device).long()
             adj_offsets = scene_data["adjacency_offsets"].to(device).long()
             print("Computing per-cell gradients for linear interpolation...")
@@ -181,7 +195,7 @@ def voxelize(model_path, resolution, output_path, extent=None, blur_sigma=0.0,
             if interpolate and gradients is not None:
                 volume[start:end] = sample_interpolated(query, nn_indices, points, density_flat, gradients)
             else:
-                volume[start:end] = density[nn_indices].squeeze(-1)
+                volume[start:end] = F.softplus(density_raw[nn_indices].squeeze(-1), beta=10)
     else:
         # Supersample: k^3 uniformly spaced sub-points per voxel
         voxel_size = (grid_max - grid_min) / resolution  # (3,)
@@ -204,7 +218,7 @@ def voxelize(model_path, resolution, output_path, extent=None, blur_sigma=0.0,
             if interpolate and gradients is not None:
                 sub_densities = sample_interpolated(sub_points, nn_indices, points, density_flat, gradients)
             else:
-                sub_densities = density[nn_indices].squeeze(-1)  # (B*k^3,)
+                sub_densities = F.softplus(density_raw[nn_indices].squeeze(-1), beta=10)
             volume[start:end] = sub_densities.reshape(-1, samples_per_voxel).mean(dim=1)
 
     volume = volume.reshape(resolution, resolution, resolution)

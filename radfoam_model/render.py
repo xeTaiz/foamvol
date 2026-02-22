@@ -19,6 +19,7 @@ class TraceRays(torch.autograd.Function):
         rays,
         start_point,
         return_contribution,
+        _density_grad=None,
     ):
         ctx.rays = rays
         ctx.start_point = start_point
@@ -27,6 +28,9 @@ class TraceRays(torch.autograd.Function):
         ctx.density = _density
         ctx.point_adjacency = _point_adjacency
         ctx.point_adjacency_offsets = _point_adjacency_offsets
+        ctx.has_density_grad = _density_grad is not None
+        if ctx.has_density_grad:
+            ctx.density_grad = _density_grad
 
         results = pipeline.trace_forward(
             _points,
@@ -36,6 +40,7 @@ class TraceRays(torch.autograd.Function):
             rays,
             start_point,
             return_contribution=return_contribution,
+            density_grad=_density_grad,
         )
 
         errbox = ErrorBox()
@@ -67,6 +72,8 @@ class TraceRays(torch.autograd.Function):
         _density = ctx.density
         _point_adjacency = ctx.point_adjacency
         _point_adjacency_offsets = ctx.point_adjacency_offsets
+        has_density_grad = ctx.has_density_grad
+        _density_grad = ctx.density_grad if has_density_grad else None
 
         results = pipeline.trace_backward(
             _points,
@@ -77,13 +84,17 @@ class TraceRays(torch.autograd.Function):
             start_point,
             grad_projection,
             ctx.errbox.ray_error,
+            density_grad=_density_grad,
         )
         points_grad = results["points_grad"]
         attr_grad = results["attr_grad"]
+        density_grad_grad = results.get("density_grad_grad", None)
         ctx.errbox.point_error = results.get("point_error", None)
 
         points_grad[~points_grad.isfinite()] = 0
         attr_grad[~attr_grad.isfinite()] = 0
+        if density_grad_grad is not None:
+            density_grad_grad[~density_grad_grad.isfinite()] = 0
 
         del (
             ctx.rays,
@@ -93,7 +104,11 @@ class TraceRays(torch.autograd.Function):
             ctx.density,
             ctx.point_adjacency,
             ctx.point_adjacency_offsets,
+            ctx.has_density_grad,
         )
+        if has_density_grad:
+            del ctx.density_grad
+
         return (
             None,  # pipeline
             points_grad,  # _points
@@ -103,4 +118,5 @@ class TraceRays(torch.autograd.Function):
             None,  # rays
             None,  # start_point
             None,  # return_contribution
+            density_grad_grad,  # _density_grad
         )
