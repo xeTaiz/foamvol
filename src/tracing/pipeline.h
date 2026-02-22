@@ -78,6 +78,7 @@ class Pipeline {
                                uint32_t num_points,
                                const Vec3f *points,
                                const float *density,
+                               const Vec3f *density_grad,
                                uint32_t point_adjacency_size,
                                const uint32_t *point_adjacency,
                                const uint32_t *point_adjacency_offsets,
@@ -92,6 +93,7 @@ class Pipeline {
                                 uint32_t num_points,
                                 const Vec3f *points,
                                 const float *density,
+                                const Vec3f *density_grad,
                                 uint32_t point_adjacency_size,
                                 const uint32_t *point_adjacency,
                                 const uint32_t *point_adjacency_offsets,
@@ -101,7 +103,8 @@ class Pipeline {
                                 const float *ray_projection_grad,
                                 const float *ray_error,
                                 Vec3f *points_grad,
-                                float *density_grad,
+                                float *density_scalar_grad,
+                                Vec3f *density_grad_grad,
                                 float *point_error) = 0;
 
     // Stub for viewer compatibility — CT pipeline does not implement this

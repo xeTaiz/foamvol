@@ -14,6 +14,7 @@ template <int block_size>
 __global__ void ct_forward(TraceSettings settings,
                            const Vec3f *__restrict__ points,
                            const float *__restrict__ density,
+                           const Vec3f *__restrict__ density_grad,
                            const uint32_t *__restrict__ point_adjacency,
                            const uint32_t *__restrict__ point_adjacency_offsets,
                            const Vec4h *__restrict__ adjacent_diff,
@@ -33,13 +34,28 @@ __global__ void ct_forward(TraceSettings settings,
 
     float projection = 0.0f;
 
+    constexpr float sp_beta = 10.0f;
+
     auto functor = [&](uint32_t point_idx,
                        float t_0,
                        float t_1,
                        const Vec3f &current_point,
                        const Vec3f &next_point) {
-        float mu = density[point_idx];
+        float raw = density[point_idx];
         float delta_t = fmaxf(t_1 - t_0, 0.0f);
+        float raw_lin;
+        if (density_grad) {
+            float t_mid = (t_0 + t_1) * 0.5f;
+            Vec3f x_mid = ray.origin + t_mid * ray.direction;
+            Vec3f b = density_grad[point_idx];
+            raw_lin = raw + b.dot(x_mid - current_point);
+        } else {
+            raw_lin = raw;
+        }
+
+        // softplus activation (beta=10, matches Python get_primal_density)
+        float mu = (sp_beta * raw_lin > 20.0f) ? raw_lin
+                   : logf(1.0f + expf(sp_beta * raw_lin)) / sp_beta;
 
         projection += mu * delta_t;
 
@@ -71,6 +87,7 @@ template <int block_size>
 __global__ void ct_backward(TraceSettings settings,
                             const Vec3f *__restrict__ points,
                             const float *__restrict__ density,
+                            const Vec3f *__restrict__ density_grad_in,
                             const uint32_t *__restrict__ point_adjacency,
                             const uint32_t *__restrict__ point_adjacency_offsets,
                             const Vec4h *__restrict__ adjacent_diff,
@@ -80,7 +97,8 @@ __global__ void ct_backward(TraceSettings settings,
                             const float *__restrict__ ray_projection_grad,
                             const float *__restrict__ ray_error,
                             Vec3f *__restrict__ points_grad,
-                            float *__restrict__ density_grad,
+                            float *__restrict__ density_scalar_grad,
+                            Vec3f *__restrict__ density_grad_grad,
                             float *__restrict__ point_error) {
 
     uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -104,22 +122,50 @@ __global__ void ct_backward(TraceSettings settings,
     Vec3f current_point_grad = Vec3f::Zero();
     Vec3f next_point_grad = Vec3f::Zero();
 
+    bool grad_active = (density_grad_in != nullptr);
+    constexpr float sp_beta = 10.0f;
+
     auto functor = [&](uint32_t point_idx,
                        float t_0,
                        float t_1,
                        const Vec3f &current_point,
                        const Vec3f &next_point) {
-        float mu = density[point_idx];
+        float raw = density[point_idx];
         float delta_t = fmaxf(t_1 - t_0, 0.0f);
+        float raw_lin;
+        Vec3f x_mid_offset;
 
         if (point_error) {
             float weight = delta_t;
             atomicAdd(point_error + point_idx, weight * error);
         }
 
-        // dL/dmu_i = dL/dprojection * delta_t
-        float dL_dmu = dL_dprojection * delta_t;
-        atomicAdd(density_grad + point_idx, dL_dmu);
+        if (grad_active) {
+            float t_mid = (t_0 + t_1) * 0.5f;
+            Vec3f x_mid = ray.origin + t_mid * ray.direction;
+            Vec3f b = density_grad_in[point_idx];
+            x_mid_offset = x_mid - current_point;
+            raw_lin = raw + b.dot(x_mid_offset);
+        } else {
+            raw_lin = raw;
+        }
+
+        // softplus forward
+        float mu = (sp_beta * raw_lin > 20.0f) ? raw_lin
+                   : logf(1.0f + expf(sp_beta * raw_lin)) / sp_beta;
+
+        // softplus derivative: sigmoid(beta * x) — always > 0
+        float d_softplus = 1.0f / (1.0f + expf(-sp_beta * raw_lin));
+
+        // dL/d(raw_i)
+        atomicAdd(density_scalar_grad + point_idx,
+                  dL_dprojection * delta_t * d_softplus);
+
+        // dL/d(b_i) — only when gradients active
+        if (grad_active && density_grad_grad) {
+            Vec3f dL_db = dL_dprojection * delta_t * d_softplus * x_mid_offset;
+            atomic_add_vec(density_grad_grad + point_idx, dL_db);
+        }
 
         // dL/d(delta_t) = dL/dprojection * mu
         float dL_ddelta_t = dL_dprojection * mu;
@@ -369,6 +415,7 @@ class CUDADensityPipeline : public Pipeline {
                        uint32_t num_points,
                        const Vec3f *points,
                        const float *density,
+                       const Vec3f *density_grad,
                        uint32_t point_adjacency_size,
                        const uint32_t *point_adjacency,
                        const uint32_t *point_adjacency_offsets,
@@ -396,6 +443,7 @@ class CUDADensityPipeline : public Pipeline {
             settings,
             points,
             density,
+            density_grad,
             point_adjacency,
             point_adjacency_offsets,
             adjacent_diff.begin(),
@@ -411,6 +459,7 @@ class CUDADensityPipeline : public Pipeline {
                         uint32_t num_points,
                         const Vec3f *points,
                         const float *density,
+                        const Vec3f *density_grad,
                         uint32_t point_adjacency_size,
                         const uint32_t *point_adjacency,
                         const uint32_t *point_adjacency_offsets,
@@ -420,7 +469,8 @@ class CUDADensityPipeline : public Pipeline {
                         const float *ray_projection_grad,
                         const float *ray_error,
                         Vec3f *points_grad,
-                        float *density_grad,
+                        float *density_scalar_grad,
+                        Vec3f *density_grad_grad,
                         float *point_error) override {
 
         CUDAArray<Vec4h> adjacent_diff(point_adjacency_size + 32);
@@ -440,6 +490,7 @@ class CUDADensityPipeline : public Pipeline {
             settings,
             points,
             density,
+            density_grad,
             point_adjacency,
             point_adjacency_offsets,
             adjacent_diff.begin(),
@@ -449,7 +500,8 @@ class CUDADensityPipeline : public Pipeline {
             ray_projection_grad,
             ray_error,
             points_grad,
-            density_grad,
+            density_scalar_grad,
+            density_grad_grad,
             point_error);
     }
 

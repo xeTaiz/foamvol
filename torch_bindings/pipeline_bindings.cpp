@@ -112,7 +112,8 @@ py::object trace_forward(Pipeline &self,
                          torch::Tensor rays_in,
                          torch::Tensor start_point_in,
                          py::object max_intersections,
-                         bool return_contribution) {
+                         bool return_contribution,
+                         std::optional<torch::Tensor> density_grad_in) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -150,6 +151,12 @@ py::object trace_forward(Pipeline &self,
     }
     if (start_point.device().type() != at::kCUDA) {
         throw std::runtime_error("start_point must be on CUDA device");
+    }
+
+    bool has_density_grad = density_grad_in.has_value();
+    torch::Tensor density_grad;
+    if (has_density_grad) {
+        density_grad = density_grad_in.value().contiguous();
     }
 
     TraceSettings settings = default_trace_settings();
@@ -190,6 +197,9 @@ py::object trace_forward(Pipeline &self,
         num_points,
         reinterpret_cast<const radfoam::Vec3f *>(points.data_ptr()),
         reinterpret_cast<const float *>(attributes.data_ptr()),
+        has_density_grad
+            ? reinterpret_cast<const radfoam::Vec3f *>(density_grad.data_ptr())
+            : nullptr,
         point_adjacency_size,
         reinterpret_cast<const uint32_t *>(point_adjacency.data_ptr()),
         reinterpret_cast<const uint32_t *>(point_adjacency_offsets.data_ptr()),
@@ -222,7 +232,8 @@ py::object trace_backward(Pipeline &self,
                           torch::Tensor start_point_in,
                           torch::Tensor grad_in,
                           std::optional<torch::Tensor> ray_error_in,
-                          py::object max_intersections) {
+                          py::object max_intersections,
+                          std::optional<torch::Tensor> density_grad_in) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -238,6 +249,12 @@ py::object trace_backward(Pipeline &self,
                         point_adjacency_offsets_in);
 
     bool return_error = ray_error_in.has_value();
+    bool has_density_grad = density_grad_in.has_value();
+
+    torch::Tensor density_grad;
+    if (has_density_grad) {
+        density_grad = density_grad_in.value().contiguous();
+    }
 
     uint32_t num_points = points.size(0);
     uint32_t point_adjacency_size = point_adjacency.size(0);
@@ -318,6 +335,13 @@ py::object trace_backward(Pipeline &self,
     torch::Tensor points_grad = torch::zeros(
         points_grad_shape, torch::dtype(rays.dtype()).device(rays.device()));
 
+    torch::Tensor density_grad_grad;
+    if (has_density_grad) {
+        density_grad_grad = torch::zeros(
+            {(int64_t)num_points, 3},
+            torch::dtype(torch::kFloat32).device(rays.device()));
+    }
+
     set_default_stream();
 
     self.trace_backward(
@@ -325,6 +349,9 @@ py::object trace_backward(Pipeline &self,
         num_points,
         reinterpret_cast<const radfoam::Vec3f *>(points.data_ptr()),
         reinterpret_cast<const float *>(attributes.data_ptr()),
+        has_density_grad
+            ? reinterpret_cast<const radfoam::Vec3f *>(density_grad.data_ptr())
+            : nullptr,
         point_adjacency_size,
         reinterpret_cast<const uint32_t *>(point_adjacency.data_ptr()),
         reinterpret_cast<const uint32_t *>(point_adjacency_offsets.data_ptr()),
@@ -336,6 +363,9 @@ py::object trace_backward(Pipeline &self,
                      : nullptr,
         reinterpret_cast<radfoam::Vec3f *>(points_grad.data_ptr()),
         reinterpret_cast<float *>(attr_grad.data_ptr()),
+        has_density_grad
+            ? reinterpret_cast<radfoam::Vec3f *>(density_grad_grad.data_ptr())
+            : nullptr,
         return_error ? reinterpret_cast<float *>(point_error.data_ptr())
                      : nullptr);
 
@@ -343,6 +373,9 @@ py::object trace_backward(Pipeline &self,
 
     output_dict["points_grad"] = points_grad;
     output_dict["attr_grad"] = attr_grad;
+    if (has_density_grad) {
+        output_dict["density_grad_grad"] = density_grad_grad;
+    }
     if (return_error) {
         output_dict["point_error"] = point_error;
     }
@@ -405,7 +438,8 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("rays"),
              py::arg("start_point"),
              py::arg("max_intersections") = py::none(),
-             py::arg("return_contribution") = false)
+             py::arg("return_contribution") = false,
+             py::arg("density_grad") = py::none())
         .def("trace_backward",
              trace_backward,
              py::arg("points"),
@@ -416,7 +450,8 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("start_point"),
              py::arg("grad_in"),
              py::arg("ray_error") = py::none(),
-             py::arg("max_intersections") = py::none());
+             py::arg("max_intersections") = py::none(),
+             py::arg("density_grad") = py::none());
 
     module.def("create_ct_pipeline", create_ct_pipeline_binding);
 

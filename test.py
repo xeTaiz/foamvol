@@ -46,7 +46,7 @@ def test(args, pipeline_args, model_args, optimizer_args, dataset_args):
         test_data_handler, ray_batch_fetcher, rgb_batch_fetcher
     ):
         rays = test_data_handler.rays
-        points, _, _, _ = model.get_trace_data()
+        points, _, _, _, _ = model.get_trace_data()
         start_points = model.get_starting_point(
             rays[:, 0, 0].cuda(), points, model.aabb_tree
         )

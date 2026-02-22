@@ -36,9 +36,12 @@ class CTScene(torch.nn.Module):
 
     def regular_initialize(self):
         s = self.init_scale
-        pt_per_axis = int(round(self.num_init_points ** (1.0 / 3.0)))
+        pt_per_axis = int(self.num_init_points ** (1.0 / 3.0))
         ax = torch.linspace(-s, s, pt_per_axis, device=self.device)
         mg = torch.stack(torch.meshgrid([ax,ax,ax]), dim=-1).reshape(-1, 3)
+        # Jitter to avoid coplanar/collinear degeneracies in triangulation
+        spacing = 2 * s / pt_per_axis
+        mg = mg + spacing * 1e-3 * torch.randn_like(mg)
         print(mg.shape, mg.min(), mg.max())
         if mg.size(0) < self.num_init_points:
             mg = torch.cat([mg, torch.rand(self.num_init_points - mg.size(0), 3, device=self.device) * 2 * s - s], dim=0)
@@ -103,6 +106,8 @@ class CTScene(torch.nn.Module):
 
         self.primal_points = optimizable_tensors["primal_points"]
         self.density = optimizable_tensors["density"]
+        if "density_grad" in optimizable_tensors:
+            self.density_grad = optimizable_tensors["density_grad"]
 
     def update_triangulation(self, rebuild=True, incremental=False):
         if not self.primal_points.isfinite().all():
@@ -183,11 +188,12 @@ class CTScene(torch.nn.Module):
 
     def get_trace_data(self):
         points = self.primal_points
-        density = self.get_primal_density()
+        density = self.density  # raw — kernel applies softplus
         point_adjacency = self.point_adjacency
         point_adjacency_offsets = self.point_adjacency_offsets
+        density_grad = getattr(self, "density_grad", None)
 
-        return points, density, point_adjacency, point_adjacency_offsets
+        return points, density, point_adjacency, point_adjacency_offsets, density_grad
 
     def get_starting_point(self, rays, points, aabb_tree):
         with torch.no_grad():
@@ -207,7 +213,7 @@ class CTScene(torch.nn.Module):
         start_point=None,
         return_contribution=False,
     ):
-        points, density, point_adjacency, point_adjacency_offsets = (
+        points, density, point_adjacency, point_adjacency_offsets, density_grad = (
             self.get_trace_data()
         )
 
@@ -224,9 +230,12 @@ class CTScene(torch.nn.Module):
             rays,
             start_point,
             return_contribution,
+            density_grad,
         )
 
     def declare_optimizer(self, args, warmup, max_iterations):
+        self._optimizer_args = args
+        self._max_iterations = max_iterations
         params = [
             {
                 "params": self.primal_points,
@@ -252,15 +261,52 @@ class CTScene(torch.nn.Module):
             warmup_steps=warmup,
             max_steps=max_iterations,
         )
+        self.grad_scheduler_args = None
+
+    def initialize_gradients(self, args):
+        N = self.primal_points.shape[0]
+        self.density_grad = nn.Parameter(
+            torch.zeros(N, 3, device=self.device, dtype=torch.float32)
+        )
+        self.optimizer.add_param_group({
+            "params": self.density_grad,
+            "lr": args.gradient_lr_init,
+            "name": "density_grad",
+        })
+        self.grad_scheduler_args = get_cosine_lr_func(
+            lr_init=args.gradient_lr_init,
+            lr_final=args.gradient_lr_final,
+            warmup_steps=args.gradient_warmup,
+            max_steps=self._max_iterations - args.gradient_start,
+        )
+        self._gradient_start = args.gradient_start
+        self._gradient_freeze_points_until = args.gradient_start + args.gradient_freeze_points
+        self._gradient_clip = args.gradient_clip
+        print(f"Initialized density_grad: {N} x 3 "
+              f"(warmup={args.gradient_warmup}, freeze_points={args.gradient_freeze_points}, "
+              f"clip={args.gradient_clip})")
 
     def update_learning_rate(self, iteration):
+        # Freeze positions while density gradients stabilize
+        freeze_for_grad = (
+            hasattr(self, "_gradient_freeze_points_until")
+            and iteration < self._gradient_freeze_points_until
+        )
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "primal_points":
-                lr = self.xyz_scheduler_args(iteration)
-                param_group["lr"] = lr
+                if freeze_for_grad:
+                    param_group["lr"] = 0.0
+                else:
+                    param_group["lr"] = self.xyz_scheduler_args(iteration)
             elif param_group["name"] == "density":
                 lr = self.den_scheduler_args(iteration)
                 param_group["lr"] = lr
+            elif param_group["name"] == "density_grad":
+                if self.grad_scheduler_args is not None:
+                    lr = self.grad_scheduler_args(
+                        iteration - self._gradient_start
+                    )
+                    param_group["lr"] = lr
 
     def prune_optimizer(self, mask):
         optimizable_tensors = {}
@@ -289,6 +335,8 @@ class CTScene(torch.nn.Module):
         optimizable_tensors = self.prune_optimizer(valid_points_mask)
         self.primal_points = optimizable_tensors["primal_points"]
         self.density = optimizable_tensors["density"]
+        if "density_grad" in optimizable_tensors:
+            self.density_grad = optimizable_tensors["density_grad"]
 
     def cat_tensors_to_optimizer(self, new_params):
         optimizable_tensors = {}
@@ -339,6 +387,8 @@ class CTScene(torch.nn.Module):
         optimizable_tensors = self.cat_tensors_to_optimizer(new_params)
         self.primal_points = optimizable_tensors["primal_points"]
         self.density = optimizable_tensors["density"]
+        if "density_grad" in optimizable_tensors:
+            self.density_grad = optimizable_tensors["density_grad"]
 
     def prune_and_densify(
         self, point_error, point_contribution, upsample_factor=1.2, contrast_fraction=0.5
@@ -348,7 +398,7 @@ class CTScene(torch.nn.Module):
             num_new_points = int((upsample_factor - 1) * num_curr_points)
 
             primal_error_accum = point_error.clip(min=0).squeeze()
-            points, _, point_adjacency, point_adjacency_offsets = (
+            points, _, point_adjacency, point_adjacency_offsets, _ = (
                 self.get_trace_data()
             )
             ################### Farthest neighbor ###################
@@ -461,8 +511,8 @@ class CTScene(torch.nn.Module):
             ################### Filter near-duplicates ###################
             nn_inds = radfoam.nn(points, self.aabb_tree, sampled_points).long()
             nn_dists = (sampled_points - points[nn_inds]).norm(dim=-1)
-            # Minimum separation: 2% of the source point's cell radius
-            min_sep = 0.02 * cell_radius[sampled_inds].squeeze()
+            # Minimum separation: 5% of the source point's cell radius
+            min_sep = 0.05 * cell_radius[sampled_inds].squeeze()
             keep_mask = nn_dists > min_sep
 
             if not keep_mask.all():
@@ -475,6 +525,8 @@ class CTScene(torch.nn.Module):
                 "primal_points": sampled_points,
                 "density": self.density[sampled_inds],
             }
+            if hasattr(self, "density_grad") and self.density_grad is not None:
+                new_params["density_grad"] = self.density_grad[sampled_inds]
 
             prune_mask = torch.cat(
                 (
@@ -493,7 +545,7 @@ class CTScene(torch.nn.Module):
     def collect_error_map(self, data_handler, downsample=2):
         rays, projections = data_handler.rays, data_handler.projections
 
-        points, _, _, _ = self.get_trace_data()
+        points, _, _, _, _ = self.get_trace_data()
         start_points = self.get_starting_point(
             rays[:, 0, 0].cuda(), points, self.aabb_tree
         )
@@ -544,17 +596,22 @@ class CTScene(torch.nn.Module):
         adjacency = self.point_adjacency.cpu().numpy()
         adjacency_offsets = self.point_adjacency_offsets.cpu().numpy()
 
+        has_grad = hasattr(self, "density_grad") and self.density_grad is not None
+        if has_grad:
+            dg = self.density_grad.detach().float().cpu().numpy()
+
         vertex_data = []
         for i in tqdm.trange(points.shape[0]):
-            vertex_data.append(
-                (
-                    points[i, 0],
-                    points[i, 1],
-                    points[i, 2],
-                    density[i, 0],
-                    adjacency_offsets[i + 1],
-                )
+            row = (
+                points[i, 0],
+                points[i, 1],
+                points[i, 2],
+                density[i, 0],
+                adjacency_offsets[i + 1],
             )
+            if has_grad:
+                row = row + (dg[i, 0], dg[i, 1], dg[i, 2])
+            vertex_data.append(row)
 
         dtype = [
             ("x", np.float32),
@@ -563,6 +620,12 @@ class CTScene(torch.nn.Module):
             ("density", np.float32),
             ("adjacency_offset", np.uint32),
         ]
+        if has_grad:
+            dtype += [
+                ("grad_x", np.float32),
+                ("grad_y", np.float32),
+                ("grad_z", np.float32),
+            ]
 
         vertex_data = np.array(vertex_data, dtype=dtype)
         vertex_element = PlyElement.describe(vertex_data, "vertex")
@@ -584,6 +647,8 @@ class CTScene(torch.nn.Module):
             "adjacency": adjacency.long(),
             "adjacency_offsets": adjacency_offsets.long(),
         }
+        if hasattr(self, "density_grad") and self.density_grad is not None:
+            scene_data["density_grad"] = self.density_grad.detach().float().cpu()
         torch.save(scene_data, pt_path)
 
     def load_pt(self, pt_path):
@@ -591,6 +656,11 @@ class CTScene(torch.nn.Module):
 
         self.primal_points = nn.Parameter(scene_data["xyz"].to(self.device))
         self.density = nn.Parameter(scene_data["density"].to(self.device))
+
+        if "density_grad" in scene_data:
+            self.density_grad = nn.Parameter(
+                scene_data["density_grad"].to(self.device)
+            )
 
         self.point_adjacency = scene_data["adjacency"].to(self.device).to(
             torch.uint32)
