@@ -1,0 +1,39 @@
+# Pipeline
+iterations: 20000
+densify_from: 2000
+densify_until: 11000
+densify_factor: 1.15
+contrast_fraction: 0.5
+loss_type: l2
+debug: False
+viewer: False
+
+# Model
+init_points: 16000
+final_points: 256000
+activation_scale: 1.0
+init_scale: 1.0
+init_type: random
+device: cuda
+
+# Optimization
+points_lr_init: 2e-4
+points_lr_final: 5e-6
+density_lr_init: 1e-1
+density_lr_final: 1e-2
+freeze_points: 18000
+tv_weight: 1e-4
+tv_start: 8000
+tv_epsilon: 1e-3
+tv_area_weighted: True
+gradient_start: 11000
+gradient_lr_init: 1e-4
+gradient_lr_final: 1e-6
+gradient_l2_weight: 1e-3
+gradient_warmup: 50
+gradient_clip: 0.01
+gradient_freeze_points: 1000
+
+# Dataset
+dataset: r2_gaussian
+data_path: /mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone
