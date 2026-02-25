@@ -26,36 +26,33 @@ import yaml
 
 GRAD_CONFIGS = {
     "G0": {"gradient_start": -1},
-    "G-5L0": {
+    "G-5S5": {
         "gradient_start": 11000,
         "gradient_lr_init": 1e-5,
         "gradient_lr_final": 1e-7,
-        "gradient_l2_weight": 0,
+        "gradient_max_slope": 2.0,
     },
-    "G-4L-3": {
-        "gradient_start": 11000,
-        "gradient_lr_init": 1e-4,
-        "gradient_lr_final": 1e-6,
-        "gradient_l2_weight": 1e-3,
-    },
-    "G-5L-4": {
-        "gradient_start": 11000,
-        "gradient_lr_init": 1e-5,
-        "gradient_lr_final": 1e-7,
-        "gradient_l2_weight": 1e-4,
-    },
+    # "G-4S5": {
+    #     "gradient_start": 11000,
+    #     "gradient_lr_init": 1e-4,
+    #     "gradient_lr_final": 1e-6,
+    #     "gradient_max_slope": 5.0,
+    # },
+    # "G-3S5": {
+    #     "gradient_start": 11000,
+    #     "gradient_lr_init": 1e-3,
+    #     "gradient_lr_final": 1e-5,
+    #     "gradient_max_slope": 5.0,
+    # },
 }
 
 TV_CONFIGS = {
-    "T0": {"tv_weight": 0},
+    "T-0": {"tv_weight": 0, "tv_start": -1},
     "T-4a": {"tv_weight": 1e-4, "tv_start": 8000, "tv_area_weighted": True},
     "T-5a": {"tv_weight": 1e-5, "tv_start": 8000, "tv_area_weighted": True},
-    "T-4": {"tv_weight": 1e-4, "tv_start": 8000, "tv_area_weighted": False},
-    "T-5": {"tv_weight": 1e-5, "tv_start": 8000, "tv_area_weighted": False},
 }
 
 CONTRAST_CONFIGS = {
-    "C00": {"contrast_fraction": 0.0},
     "C25": {"contrast_fraction": 0.25},
     "C50": {"contrast_fraction": 0.5},
     "C75": {"contrast_fraction": 0.75},
@@ -89,7 +86,7 @@ BASELINE = {
     "freeze_points": 18000,
     "tv_epsilon": 1e-3,
     "gradient_warmup": 50,
-    "gradient_clip": 0.01,
+    "gradient_max_slope": 5.0,
     "gradient_freeze_points": 1000,
     "dataset": "r2_gaussian",
     "data_path": "/mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
@@ -97,7 +94,7 @@ BASELINE = {
     "viewer": False,
 }
 
-SWEEP_NAM = "sweep2"
+SWEEP_NAM = "sweep3"
 SWEEP_DIR = f"output/{SWEEP_NAM}"
 
 

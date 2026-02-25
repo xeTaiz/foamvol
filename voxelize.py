@@ -18,6 +18,7 @@ import radfoam
 import torch.nn.functional as F
 
 
+# Remove this?!
 def compute_cell_gradients(centers, values, adj_indices, adj_offsets, device):
     """Fit a per-cell linear gradient via weighted least squares on Voronoi neighbors.
 
@@ -94,25 +95,39 @@ def compute_cell_gradients(centers, values, adj_indices, adj_offsets, device):
     return gradients
 
 
-def sample_interpolated(query_points, nn_indices, centers, values, gradients):
-    """Evaluate the piecewise-linear field: f(x) = a[idx] + grad[idx] . (x - center[idx]).
+def sample_interpolated(query_points, nn_indices, centers, values, gradients, max_slope):
+    """Evaluate the piecewise-linear field in activated (post-softplus) space.
+
+    For learned gradients (tanh-bounded):
+        mu_base = softplus(raw, beta=10)
+        slope = max_slope * tanh(g_param)
+        result = clamp(mu_base + slope . dx, min=0)
+
+    For computed gradients (already in activated space):
+        result = clamp(mu_base + grad . dx, min=0)
 
     Args:
         query_points: (M, 3) sample positions
         nn_indices: (M,) nearest cell index per query point
         centers: (N, 3) cell centers
-        values: (N,) scalar values per cell
-        gradients: (N, 3) gradient per cell
+        values: (N,) scalar values per cell (raw density)
+        gradients: (N, 3) gradient per cell (learned g_param or computed)
+        max_slope: float, gradient_max_slope for learned gradients (None for computed)
 
     Returns:
         (M,) interpolated values, clamped to min=0
     """
     a = values[nn_indices]  # (M,) raw density
+    mu_base = F.softplus(a, beta=10)  # activate
     c = centers[nn_indices]  # (M, 3)
     g = gradients[nn_indices]  # (M, 3)
     dx = query_points - c  # (M, 3)
-    result = a + (g * dx).sum(dim=-1)  # (M,)
-    return F.softplus(result, beta=10)  # activate after linear correction
+    if max_slope is not None:
+        slope = max_slope * torch.tanh(g)
+    else:
+        slope = g
+    result = mu_base + (slope * dx).sum(dim=-1)
+    return result.clamp(min=0)
 
 
 def gaussian_blur_3d(volume, kernel_size=3, sigma=1.0):
@@ -140,24 +155,18 @@ def voxelize(model_path, resolution, output_path, extent=None, blur_sigma=0.0,
     # Work in raw density space — softplus applied at sample time
     density_flat = density_raw.squeeze(-1)  # (N,) raw values
     gradients = None
+    grad_max_slope = None  # None means computed gradients (no tanh)
     if interpolate:
         if "density_grad" in scene_data:
-            # Use learned per-cell gradients (operate in raw density space)
+            # Use learned per-cell gradients (tanh-bounded in activated space)
             gradients = scene_data["density_grad"].to(device)
-            print("Using learned density gradients from checkpoint")
-            print(f"  gradient norms: min={gradients.norm(dim=-1).min():.4f}, "
-                  f"max={gradients.norm(dim=-1).max():.4f}, "
-                  f"mean={gradients.norm(dim=-1).mean():.4f}")
-        elif "adjacency" in scene_data and "adjacency_offsets" in scene_data:
-            adj_indices = scene_data["adjacency"].to(device).long()
-            adj_offsets = scene_data["adjacency_offsets"].to(device).long()
-            print("Computing per-cell gradients for linear interpolation...")
-            gradients = compute_cell_gradients(points, density_flat, adj_indices, adj_offsets, device)
+            grad_max_slope = scene_data.get("gradient_max_slope", 5.0)
+            print(f"Using learned density gradients from checkpoint (max_slope={grad_max_slope})")
             print(f"  gradient norms: min={gradients.norm(dim=-1).min():.4f}, "
                   f"max={gradients.norm(dim=-1).max():.4f}, "
                   f"mean={gradients.norm(dim=-1).mean():.4f}")
         else:
-            print("Warning: adjacency data not found in checkpoint, falling back to constant lookup")
+            print("No learned density gradients in checkpoint, using constant density per cell")
             interpolate = False
 
     # Build AABB tree for nearest-neighbor queries
@@ -193,7 +202,7 @@ def voxelize(model_path, resolution, output_path, extent=None, blur_sigma=0.0,
             query = voxel_centers[start:end]
             nn_indices = radfoam.nn(points, aabb_tree, query).long()
             if interpolate and gradients is not None:
-                volume[start:end] = sample_interpolated(query, nn_indices, points, density_flat, gradients)
+                volume[start:end] = sample_interpolated(query, nn_indices, points, density_flat, gradients, grad_max_slope)
             else:
                 volume[start:end] = F.softplus(density_raw[nn_indices].squeeze(-1), beta=10)
     else:
@@ -216,7 +225,7 @@ def voxelize(model_path, resolution, output_path, extent=None, blur_sigma=0.0,
             sub_points = sub_points.reshape(-1, 3)  # (B*k^3, 3)
             nn_indices = radfoam.nn(points, aabb_tree, sub_points).long()
             if interpolate and gradients is not None:
-                sub_densities = sample_interpolated(sub_points, nn_indices, points, density_flat, gradients)
+                sub_densities = sample_interpolated(sub_points, nn_indices, points, density_flat, gradients, grad_max_slope)
             else:
                 sub_densities = F.softplus(density_raw[nn_indices].squeeze(-1), beta=10)
             volume[start:end] = sub_densities.reshape(-1, samples_per_voxel).mean(dim=1)

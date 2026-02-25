@@ -149,7 +149,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
     def eval_views(data_handler, ray_batch_fetcher, proj_batch_fetcher):
         rays = data_handler.rays
-        points, _, _, _, _ = model.get_trace_data()
+        points, _, _, _, _, _ = model.get_trace_data()
         start_points = model.get_starting_point(
             rays[:, 0, 0].cuda(), points, model.aabb_tree
         )
@@ -195,19 +195,17 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 loss = loss_fn(proj_output, proj_batch)
 
                 if optimizer_args.tv_weight > 0 and i >= optimizer_args.tv_start:
-                    tv_loss = model.tv_regularization(
-                        epsilon=optimizer_args.tv_epsilon,
-                        area_weighted=optimizer_args.tv_area_weighted,
-                    )
+                    if optimizer_args.tv_border:
+                        tv_loss = model.tv_border_regularization(
+                            epsilon=optimizer_args.tv_epsilon,
+                            area_weighted=optimizer_args.tv_area_weighted,
+                        )
+                    else:
+                        tv_loss = model.tv_regularization(
+                            epsilon=optimizer_args.tv_epsilon,
+                            area_weighted=optimizer_args.tv_area_weighted,
+                        )
                     loss = loss + optimizer_args.tv_weight * tv_loss
-
-                if (
-                    optimizer_args.gradient_l2_weight > 0
-                    and hasattr(model, "density_grad")
-                    and model.density_grad is not None
-                ):
-                    grad_l2 = (model.density_grad ** 2).sum()
-                    loss = loss + optimizer_args.gradient_l2_weight * grad_l2
 
                 model.optimizer.zero_grad(set_to_none=True)
 
@@ -215,17 +213,6 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 event = torch.cuda.Event()
                 event.record()
                 loss.backward()
-
-                if (
-                    hasattr(model, "_gradient_clip")
-                    and model._gradient_clip > 0
-                    and hasattr(model, "density_grad")
-                    and model.density_grad is not None
-                    and model.density_grad.grad is not None
-                ):
-                    torch.nn.utils.clip_grad_norm_(
-                        [model.density_grad], model._gradient_clip
-                    )
 
                 event.synchronize()
                 ray_batch, proj_batch = next(data_iterator)
@@ -367,7 +354,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
         model_path = f"{out_dir}/model.pt"
         volume_path = f"{out_dir}/volume.npy"
-        voxelize(model_path, resolution=512, output_path=volume_path, extent=1.0)
+        voxelize(model_path, resolution=256, output_path=volume_path, extent=1.0)
         log_fig = partial(writer.add_figure, "volume/slices", global_step=pipeline_args.iterations)
         visualize(volume_path, writer_fn=log_fig)
         writer.close()
