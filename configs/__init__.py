@@ -77,12 +77,12 @@ class OptimizationParams(ParamGroup):
         self.tv_start = 0
         self.tv_epsilon = 1e-3
         self.tv_area_weighted = False
+        self.tv_border = False
         self.gradient_start = -1
         self.gradient_lr_init = 1e-2
         self.gradient_lr_final = 1e-3
-        self.gradient_l2_weight = 0.0
         self.gradient_warmup = 500
-        self.gradient_clip = 1.0
+        self.gradient_max_slope = 5.0
         self.gradient_freeze_points = 500
         super().__init__(parser, "Setting Optimization parameters")
 
