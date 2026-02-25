@@ -557,8 +557,8 @@ class CTScene(torch.nn.Module):
                     t = r_b / (r_a + r_b + 1e-12)  # closer to A when A is larger
                     edge_vec = p_b - p_a
                     edge_len = edge_vec.norm(dim=-1, keepdim=True)
-                    # Small jitter: 2% of edge length, perpendicular + along edge
-                    jitter = 0.02 * edge_len * torch.randn_like(p_a)
+                    # Jitter: 10% of edge length to avoid co-spherical degeneracies
+                    jitter = 0.10 * edge_len * torch.randn_like(p_a)
                     new_points = p_a + t.unsqueeze(-1) * edge_vec + jitter
                     avg_density = 0.5 * (
                         self.density[src[edge_inds]] + self.density[tgt[edge_inds]]
