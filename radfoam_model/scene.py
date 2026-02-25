@@ -436,7 +436,8 @@ class CTScene(torch.nn.Module):
             self.density_grad = optimizable_tensors["density_grad"]
 
     def prune_and_densify(
-        self, point_error, point_contribution, upsample_factor=1.2, contrast_fraction=0.5
+        self, point_error, point_contribution, upsample_factor=1.2,
+        contrast_fraction=0.5, contrast_power=0.5,
     ):
         with torch.no_grad():
             num_curr_points = self.primal_points.shape[0]
@@ -459,23 +460,24 @@ class CTScene(torch.nn.Module):
             offsets = point_adjacency_offsets.long()
             adj = point_adjacency.long()
 
-            # Build source index for each edge
             counts = offsets[1:] - offsets[:-1]
             source = torch.repeat_interleave(
                 torch.arange(num_curr_points, device=points.device), counts
             )
 
-            # Per-edge contrast
-            edge_contrast = (activated[source] - activated[adj]).abs()
+            # Deduplicate: keep only edges where source < target
+            edge_mask = source < adj
+            src = source[edge_mask]
+            tgt = adj[edge_mask]
 
-            # Per-point max contrast
-            max_contrast = torch.zeros(num_curr_points, device=points.device)
-            max_contrast.scatter_reduce_(0, source, edge_contrast, reduce="amax", include_self=False)
+            # Per-edge properties
+            edge_contrast = (activated[src] - activated[tgt]).abs()
+            edge_vec = points[src] - points[tgt]
+            edge_length = edge_vec.norm(dim=-1)
 
-            # Per-point argmax neighbor (which neighbor achieves the max contrast)
-            max_contrast_neighbor = torch.zeros(num_curr_points, dtype=torch.long, device=points.device)
-            is_max = edge_contrast == max_contrast[source]
-            max_contrast_neighbor[source[is_max]] = adj[is_max]
+            # Sampling weight
+            contrast_weight = edge_contrast.pow(contrast_power) * edge_length
+            contrast_weight[edge_length < 1e-3] = 0.0
 
             ######################## Pruning ########################
             self_mask = point_contribution > 1e-2
@@ -509,6 +511,9 @@ class CTScene(torch.nn.Module):
 
             sampled_points_list = []
             sampled_inds_list = []
+            sampled_density_list = []
+            sampled_density_grad_list = []
+            has_density_grad = hasattr(self, "density_grad") and self.density_grad is not None
 
             # --- Gradient-based sampling (existing strategy, reduced budget) ---
             if num_gradient_points > 0:
@@ -519,18 +524,15 @@ class CTScene(torch.nn.Module):
                 )
                 sampled_points_list.append((points + perturbation)[grad_inds])
                 sampled_inds_list.append(grad_inds)
+                sampled_density_list.append(self.density[grad_inds])
+                if has_density_grad:
+                    sampled_density_grad_list.append(self.density_grad[grad_inds])
 
-            # --- Contrast-based sampling (new strategy) ---
+            # --- Contrast-based sampling (edge-based strategy) ---
             if num_contrast_points > 0:
-                # Distance to the max-contrast neighbor
-                max_contrast_dist = (points - points[max_contrast_neighbor]).norm(dim=-1)
-                # Weight by contrast, cell size, AND neighbor distance —
-                # deprioritize edges that are too short to warrant a new point
-                contrast_weight = max_contrast * cell_radius.squeeze() * max_contrast_dist
-                # Hard floor: zero out pairs closer than 1e-3
-                contrast_weight[max_contrast_dist < 1e-3] = 0.0
-                # Fallback: if all contrasts are zero, redirect budget to gradient strategy
-                if contrast_weight.sum() < 1e-10:
+                num_viable = (contrast_weight > 0).sum().item()
+                if num_viable == 0:
+                    # Fallback: redirect budget to gradient strategy
                     if num_gradient_points > 0:
                         extra_inds = torch.multinomial(
                             primal_error_accum * cell_radius,
@@ -539,19 +541,41 @@ class CTScene(torch.nn.Module):
                         )
                         sampled_points_list.append((points + perturbation)[extra_inds])
                         sampled_inds_list.append(extra_inds)
+                        sampled_density_list.append(self.density[extra_inds])
+                        if has_density_grad:
+                            sampled_density_grad_list.append(self.density_grad[extra_inds])
                 else:
-                    contrast_inds = torch.multinomial(
-                        contrast_weight,
-                        num_contrast_points,
-                        replacement=False,
+                    n_sample = min(num_contrast_points, num_viable)
+                    edge_inds = torch.multinomial(
+                        contrast_weight, n_sample, replacement=False,
                     )
-                    # Place at midpoint between point and its max-contrast neighbor
-                    midpoints = 0.5 * (points[contrast_inds] + points[max_contrast_neighbor[contrast_inds]])
-                    sampled_points_list.append(midpoints)
-                    sampled_inds_list.append(contrast_inds)
+                    # Radius-ratio placement: bias towards the larger cell
+                    p_a = points[src[edge_inds]]
+                    p_b = points[tgt[edge_inds]]
+                    r_a = cell_radius[src[edge_inds]].squeeze(-1)
+                    r_b = cell_radius[tgt[edge_inds]].squeeze(-1)
+                    t = r_b / (r_a + r_b + 1e-12)  # closer to A when A is larger
+                    edge_vec = p_b - p_a
+                    edge_len = edge_vec.norm(dim=-1, keepdim=True)
+                    # Small jitter: 2% of edge length, perpendicular + along edge
+                    jitter = 0.02 * edge_len * torch.randn_like(p_a)
+                    new_points = p_a + t.unsqueeze(-1) * edge_vec + jitter
+                    avg_density = 0.5 * (
+                        self.density[src[edge_inds]] + self.density[tgt[edge_inds]]
+                    )
+                    sampled_points_list.append(new_points)
+                    sampled_inds_list.append(src[edge_inds])
+                    sampled_density_list.append(avg_density)
+                    if has_density_grad:
+                        sampled_density_grad_list.append(
+                            torch.zeros(n_sample, 3, device=self.device)
+                        )
 
             sampled_inds = torch.cat(sampled_inds_list, dim=0)
             sampled_points = torch.cat(sampled_points_list, dim=0)
+            sampled_density = torch.cat(sampled_density_list, dim=0)
+            if has_density_grad:
+                sampled_dg = torch.cat(sampled_density_grad_list, dim=0)
 
             ################### Filter near-duplicates ###################
             nn_inds = radfoam.nn(points, self.aabb_tree, sampled_points).long()
@@ -565,13 +589,16 @@ class CTScene(torch.nn.Module):
                 print(f"Filtered {n_filtered}/{sampled_points.shape[0]} new points (too close to existing)")
                 sampled_points = sampled_points[keep_mask]
                 sampled_inds = sampled_inds[keep_mask]
+                sampled_density = sampled_density[keep_mask]
+                if has_density_grad:
+                    sampled_dg = sampled_dg[keep_mask]
 
             new_params = {
                 "primal_points": sampled_points,
-                "density": self.density[sampled_inds],
+                "density": sampled_density,
             }
-            if hasattr(self, "density_grad") and self.density_grad is not None:
-                new_params["density_grad"] = self.density_grad[sampled_inds]
+            if has_density_grad:
+                new_params["density_grad"] = sampled_dg
 
             prune_mask = torch.cat(
                 (
