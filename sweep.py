@@ -26,12 +26,12 @@ import yaml
 
 GRAD_CONFIGS = {
     "G0": {"gradient_start": -1},
-    "G-5S5": {
-        "gradient_start": 11000,
-        "gradient_lr_init": 1e-5,
-        "gradient_lr_final": 1e-7,
-        "gradient_max_slope": 2.0,
-    },
+    #"G-5S5": {
+    #    "gradient_start": 11000,
+    #    "gradient_lr_init": 1e-5,
+    #    "gradient_lr_final": 1e-7,
+    #    "gradient_max_slope": 2.0,
+    #},
     # "G-4S5": {
     #     "gradient_start": 11000,
     #     "gradient_lr_init": 1e-4,
@@ -53,10 +53,10 @@ TV_CONFIGS = {
 }
 
 CONTRAST_CONFIGS = {
-    "C25": {"contrast_fraction": 0.25},
-    "C50": {"contrast_fraction": 0.50},
-    "C75": {"contrast_fraction": 0.75},
-    "C90": {"contrast_fraction": 0.90},
+    "C25p05": {"contrast_fraction": 0.25, "contrast_power": 0.5},
+    "C50p05": {"contrast_fraction": 0.50, "contrast_power": 0.5},
+    "C75p05": {"contrast_fraction": 0.75, "contrast_power": 0.5},
+    "C90p05": {"contrast_fraction": 0.90, "contrast_power": 0.5},
     "C25p01": {"contrast_fraction": 0.25, "contrast_power": 0.1},
     "C50p01": {"contrast_fraction": 0.50, "contrast_power": 0.1},
     "C75p01": {"contrast_fraction": 0.75, "contrast_power": 0.1},
@@ -64,7 +64,7 @@ CONTRAST_CONFIGS = {
 }
 
 POINTS_CONFIGS = {
-    "P64": {"init_points": 4000, "final_points": 64000},
+    "P64": {"init_points": 8000, "final_points": 64000},
     "P128": {"init_points": 8000, "final_points": 128000},
     "P256": {"init_points": 16000, "final_points": 256000},
     "P512": {"init_points": 32000, "final_points": 512000},
@@ -99,7 +99,7 @@ BASELINE = {
     "viewer": False,
 }
 
-SWEEP_NAM = "sweep4"
+SWEEP_NAM = "sweep5"
 SWEEP_DIR = f"output/{SWEEP_NAM}"
 
 
