@@ -6,7 +6,7 @@ einops==0.8.1
 glfw==2.6.5
 pycolmap==3.11.1
 opencv-python==4.11.0.86
-pillow==11.0.0
+pillow==12.1.1
 plyfile==1.0.3
 pybind11[global]==2.13.6
 pyyaml==6.0.2
