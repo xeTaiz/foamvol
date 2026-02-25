@@ -164,9 +164,9 @@ def sample_idw(field, coordinates):
         centers = points[pad_idx]  # (B, max_k+1, 3)
         dist_sq = ((query.unsqueeze(1) - centers) ** 2).sum(dim=-1)  # (B, max_k+1)
 
-        # IDW weights: 1/dist^2
+        # IDW weights: 1/dist^4 (sharper weighting toward nearest cell)
         eps = 1e-16
-        inv_dist = 1.0 / (dist_sq + eps)
+        inv_dist = 1.0 / (dist_sq + eps) ** 2
         inv_dist[~valid] = 0.0
         weights = inv_dist / inv_dist.sum(dim=1, keepdim=True)  # (B, max_k+1)
 
@@ -233,21 +233,141 @@ def compute_cell_density_slice(points, axis, coord, resolution, extent,
         ones = torch.ones(slab.shape[0], device=device)
         grid.index_put_((ix, iy), ones, accumulate=True)
 
+    # Gaussian blur for smoother heatmap
+    sigma = 0.75
+    ks = 5
+    coords = torch.arange(ks, dtype=torch.float32, device=device) - ks // 2
+    gauss = torch.exp(-coords ** 2 / (2 * sigma ** 2))
+    gauss = gauss / gauss.sum()
+    kernel = (gauss[:, None] * gauss[None, :]).unsqueeze(0).unsqueeze(0)
+    grid = F.conv2d(grid.unsqueeze(0).unsqueeze(0), kernel, padding=ks // 2).squeeze()
+
     return grid.cpu().numpy()
 
 
+def load_gt_volume(data_path, dataset_type):
+    """Load or generate a ground-truth 3D density volume.
+
+    Args:
+        data_path: path to the dataset directory
+        dataset_type: 'r2_gaussian' or 'ct_synthetic'
+
+    Returns:
+        (G,G,G) numpy array, or None if GT not available.
+        Bbox is assumed [-1,1]^3.
+    """
+    if dataset_type == "r2_gaussian":
+        import os
+        vol_path = os.path.join(data_path, "vol_gt.npy")
+        if os.path.exists(vol_path):
+            return np.load(vol_path)
+        return None
+    elif dataset_type == "ct_synthetic":
+        G = 256
+        lin = np.linspace(-1, 1, G)
+        x, y, z = np.meshgrid(lin, lin, lin, indexing="ij")
+        vol = np.zeros((G, G, G), dtype=np.float32)
+        vol[x ** 2 + y ** 2 + z ** 2 <= 1.0] = 1.0
+        return vol
+    return None
+
+
+def sample_gt_slice(gt_volume, axis, coord, resolution, extent):
+    """Extract a 2D slice from a GT volume at a world-space coordinate.
+
+    Args:
+        gt_volume: (G,G,G) numpy array in [-extent, extent]^3
+        axis: 0, 1, or 2
+        coord: world-space position along axis
+        resolution: output resolution
+        extent: half-extent of the volume
+
+    Returns:
+        (resolution, resolution) numpy array, or None if gt_volume is None.
+    """
+    if gt_volume is None:
+        return None
+    G = gt_volume.shape[0]
+    # Map world coord to voxel index
+    idx = int((coord + extent) / (2 * extent) * (G - 1) + 0.5)
+    idx = max(0, min(G - 1, idx))
+
+    if axis == 0:
+        raw_slice = gt_volume[idx, :, :]
+    elif axis == 1:
+        raw_slice = gt_volume[:, idx, :]
+    else:
+        raw_slice = gt_volume[:, :, idx]
+
+    # Resize to target resolution if needed
+    if raw_slice.shape[0] != resolution or raw_slice.shape[1] != resolution:
+        t = torch.from_numpy(raw_slice).unsqueeze(0).unsqueeze(0).float()
+        t = F.interpolate(t, size=(resolution, resolution), mode="bilinear",
+                          align_corners=False)
+        return t.squeeze().numpy()
+    return raw_slice.copy()
+
+
+def compute_slice_psnr(pred, gt):
+    """PSNR between two (res, res) numpy arrays."""
+    mse = np.mean((pred - gt) ** 2)
+    if mse == 0:
+        return float("inf")
+    data_range = gt.max() - gt.min()
+    if data_range == 0:
+        return float("inf")
+    return 10.0 * np.log10(data_range ** 2 / mse)
+
+
+def compute_slice_ssim(pred, gt, window_size=11):
+    """SSIM between two (res, res) numpy arrays (single-channel)."""
+    data_range = gt.max() - gt.min()
+    if data_range == 0:
+        return 1.0
+    # Use torch conv2d for windowed SSIM
+    pred_t = torch.from_numpy(pred).float().unsqueeze(0).unsqueeze(0)
+    gt_t = torch.from_numpy(gt).float().unsqueeze(0).unsqueeze(0)
+
+    sigma = 1.5
+    coords = torch.arange(window_size, dtype=torch.float32) - window_size // 2
+    gauss = torch.exp(-coords ** 2 / (2 * sigma ** 2))
+    gauss = gauss / gauss.sum()
+    kernel = (gauss[:, None] * gauss[None, :]).unsqueeze(0).unsqueeze(0)
+
+    pad = window_size // 2
+    mu1 = F.conv2d(pred_t, kernel, padding=pad)
+    mu2 = F.conv2d(gt_t, kernel, padding=pad)
+
+    sigma1_sq = F.conv2d(pred_t ** 2, kernel, padding=pad) - mu1 ** 2
+    sigma2_sq = F.conv2d(gt_t ** 2, kernel, padding=pad) - mu2 ** 2
+    sigma12 = F.conv2d(pred_t * gt_t, kernel, padding=pad) - mu1 * mu2
+
+    C1 = (0.01 * data_range) ** 2
+    C2 = (0.03 * data_range) ** 2
+
+    ssim_map = ((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) / (
+        (mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2)
+    )
+    return ssim_map.mean().item()
+
+
 def visualize_slices(density_slices, idw_slices, cell_density_slices,
-                     vmax=1.0, writer_fn=None, out_path=None, title=None):
-    """Plot density, IDW-interpolated, and cell-density slices in a 3x9 figure.
+                     gt_slices=None, vmax=1.0, writer_fn=None,
+                     out_path=None, title=None):
+    """Plot density slices. 3x9 without GT, 6x9 with GT comparison.
 
     Args:
         density_slices: list of 9 (res, res) arrays (3 axes x 3 coords)
         idw_slices: list of 9 matching arrays (natural neighbor IDW)
         cell_density_slices: list of 9 matching arrays
+        gt_slices: optional list of 9 (res, res) GT arrays (or Nones)
         vmax: density colorbar max
         writer_fn: optional callable(fig) for TensorBoard
         out_path: optional file path for saving
         title: optional figure title
+
+    Returns:
+        dict of average metrics if GT available, else None.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -256,38 +376,98 @@ def visualize_slices(density_slices, idw_slices, cell_density_slices,
     axes_labels = ["X", "Y", "Z"]
     coords = [-0.2, 0.0, 0.2]
 
-    fig, axs = plt.subplots(3, 9, figsize=(27, 9))
+    has_gt = (gt_slices is not None
+              and any(g is not None for g in gt_slices))
+    nrows = 6 if has_gt else 3
+    fig, axs = plt.subplots(nrows, 9, figsize=(27, nrows * 3))
+
+    # Collect per-slice metrics
+    raw_psnrs, raw_ssims = [], []
+    idw_psnrs, idw_ssims = [], []
+    blend_psnrs, blend_ssims = [], []
 
     for row in range(3):
         for col in range(3):
             idx = row * 3 + col
-            # Raw density (left 3 cols)
+            gt = gt_slices[idx] if has_gt else None
+
+            # --- Row 0-2: Raw density (left 3 cols) ---
             ax = axs[row, col]
             ax.imshow(density_slices[idx].T, origin="lower", cmap="gray",
                       vmin=0, vmax=vmax)
-            ax.set_title(f"{axes_labels[row]}={coords[col]:.1f}")
+            lbl = f"{axes_labels[row]}={coords[col]:.1f}"
+            if gt is not None:
+                p = compute_slice_psnr(density_slices[idx], gt)
+                s = compute_slice_ssim(density_slices[idx], gt)
+                raw_psnrs.append(p)
+                raw_ssims.append(s)
+                lbl += f" P={p:.1f} S={s:.2f}"
+            ax.set_title(lbl, fontsize=8)
             ax.axis("off")
 
-            # IDW interpolated (middle 3 cols)
+            # --- Row 0-2: IDW interpolated (middle 3 cols) ---
             ax = axs[row, col + 3]
             ax.imshow(idw_slices[idx].T, origin="lower", cmap="gray",
                       vmin=0, vmax=vmax)
-            ax.set_title(f"IDW {axes_labels[row]}={coords[col]:.1f}")
+            lbl = f"IDW {axes_labels[row]}={coords[col]:.1f}"
+            if gt is not None:
+                p = compute_slice_psnr(idw_slices[idx], gt)
+                s = compute_slice_ssim(idw_slices[idx], gt)
+                idw_psnrs.append(p)
+                idw_ssims.append(s)
+                lbl += f" P={p:.1f} S={s:.2f}"
+            ax.set_title(lbl, fontsize=8)
             ax.axis("off")
 
-            # Cell density overlaid on density (right 3 cols)
+            # --- Row 0-2: Cell density overlay (right 3 cols) ---
             ax = axs[row, col + 6]
             cd = cell_density_slices[idx]
             cd_res = cd.shape[0]
-            # Downsample density to match cell density resolution
             ds_t = torch.from_numpy(density_slices[idx]).unsqueeze(0).unsqueeze(0)
             ds = F.avg_pool2d(ds_t, kernel_size=ds_t.shape[-1] // cd_res).squeeze().numpy()
             ax.imshow(ds.T, origin="lower", cmap="gray",
                       vmin=0, vmax=vmax)
             ax.imshow(cd.T, origin="lower",
                       cmap="hot", alpha=0.5)
-            ax.set_title(f"cells {axes_labels[row]}={coords[col]:.1f}")
+            ax.set_title(f"cells {axes_labels[row]}={coords[col]:.1f}",
+                         fontsize=8)
             ax.axis("off")
+
+            if has_gt:
+                # --- Row 3-5: GT slices (left 3 cols) ---
+                ax = axs[row + 3, col]
+                if gt is not None:
+                    ax.imshow(gt.T, origin="lower", cmap="gray",
+                              vmin=0, vmax=vmax)
+                ax.set_title(f"GT {axes_labels[row]}={coords[col]:.1f}",
+                             fontsize=8)
+                ax.axis("off")
+
+                # --- Row 3-5: Blended 50/50 (middle 3 cols) ---
+                ax = axs[row + 3, col + 3]
+                blend = 0.5 * density_slices[idx] + 0.5 * idw_slices[idx]
+                ax.imshow(blend.T, origin="lower", cmap="gray",
+                          vmin=0, vmax=vmax)
+                lbl = f"blend {axes_labels[row]}={coords[col]:.1f}"
+                if gt is not None:
+                    p = compute_slice_psnr(blend, gt)
+                    s = compute_slice_ssim(blend, gt)
+                    blend_psnrs.append(p)
+                    blend_ssims.append(s)
+                    lbl += f" P={p:.1f} S={s:.2f}"
+                ax.set_title(lbl, fontsize=8)
+                ax.axis("off")
+
+                # --- Row 3-5: Difference GT - raw (right 3 cols) ---
+                ax = axs[row + 3, col + 6]
+                if gt is not None:
+                    diff = gt - density_slices[idx]
+                    abs_max = max(np.abs(diff).max(), 1e-6)
+                    ax.imshow(diff.T, origin="lower", cmap="bwr",
+                              vmin=-abs_max, vmax=abs_max)
+                ax.set_title(f"diff {axes_labels[row]}={coords[col]:.1f}",
+                             fontsize=8)
+                ax.axis("off")
 
     if title:
         fig.suptitle(title, fontsize=14)
@@ -299,3 +479,14 @@ def visualize_slices(density_slices, idw_slices, cell_density_slices,
     if writer_fn is not None:
         writer_fn(fig)
     plt.close(fig)
+
+    if has_gt and raw_psnrs:
+        return {
+            "raw_psnr": np.mean(raw_psnrs),
+            "raw_ssim": np.mean(raw_ssims),
+            "idw_psnr": np.mean(idw_psnrs),
+            "idw_ssim": np.mean(idw_ssims),
+            "blend_psnr": np.mean(blend_psnrs),
+            "blend_ssim": np.mean(blend_ssims),
+        }
+    return None
