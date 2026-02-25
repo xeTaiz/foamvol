@@ -10,6 +10,7 @@ namespace radfoam {
 struct TraceSettings {
     float weight_threshold;
     uint32_t max_intersections;
+    float gradient_max_slope = 5.0f;
 };
 
 inline TraceSettings default_trace_settings() {

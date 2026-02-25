@@ -20,6 +20,7 @@ class TraceRays(torch.autograd.Function):
         start_point,
         return_contribution,
         _density_grad=None,
+        _gradient_max_slope=5.0,
     ):
         ctx.rays = rays
         ctx.start_point = start_point
@@ -29,6 +30,7 @@ class TraceRays(torch.autograd.Function):
         ctx.point_adjacency = _point_adjacency
         ctx.point_adjacency_offsets = _point_adjacency_offsets
         ctx.has_density_grad = _density_grad is not None
+        ctx.gradient_max_slope = _gradient_max_slope
         if ctx.has_density_grad:
             ctx.density_grad = _density_grad
 
@@ -41,6 +43,7 @@ class TraceRays(torch.autograd.Function):
             start_point,
             return_contribution=return_contribution,
             density_grad=_density_grad,
+            gradient_max_slope=_gradient_max_slope,
         )
 
         errbox = ErrorBox()
@@ -74,6 +77,7 @@ class TraceRays(torch.autograd.Function):
         _point_adjacency_offsets = ctx.point_adjacency_offsets
         has_density_grad = ctx.has_density_grad
         _density_grad = ctx.density_grad if has_density_grad else None
+        gradient_max_slope = ctx.gradient_max_slope
 
         results = pipeline.trace_backward(
             _points,
@@ -85,6 +89,7 @@ class TraceRays(torch.autograd.Function):
             grad_projection,
             ctx.errbox.ray_error,
             density_grad=_density_grad,
+            gradient_max_slope=gradient_max_slope,
         )
         points_grad = results["points_grad"]
         attr_grad = results["attr_grad"]
@@ -105,6 +110,7 @@ class TraceRays(torch.autograd.Function):
             ctx.point_adjacency,
             ctx.point_adjacency_offsets,
             ctx.has_density_grad,
+            ctx.gradient_max_slope,
         )
         if has_density_grad:
             del ctx.density_grad
@@ -119,4 +125,5 @@ class TraceRays(torch.autograd.Function):
             None,  # start_point
             None,  # return_contribution
             density_grad_grad,  # _density_grad
+            None,  # _gradient_max_slope
         )

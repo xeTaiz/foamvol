@@ -29,9 +29,8 @@ tv_area_weighted: True
 gradient_start: 11000
 gradient_lr_init: 1e-4
 gradient_lr_final: 1e-6
-gradient_l2_weight: 1e-3
 gradient_warmup: 50
-gradient_clip: 0.01
+gradient_max_slope: 5.0
 gradient_freeze_points: 1000
 
 # Dataset

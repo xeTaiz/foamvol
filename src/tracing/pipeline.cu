@@ -36,6 +36,8 @@ __global__ void ct_forward(TraceSettings settings,
 
     constexpr float sp_beta = 10.0f;
 
+    float max_slope = settings.gradient_max_slope;
+
     auto functor = [&](uint32_t point_idx,
                        float t_0,
                        float t_1,
@@ -43,19 +45,21 @@ __global__ void ct_forward(TraceSettings settings,
                        const Vec3f &next_point) {
         float raw = density[point_idx];
         float delta_t = fmaxf(t_1 - t_0, 0.0f);
-        float raw_lin;
+
+        // softplus activation on raw scalar density
+        float mu_base = (sp_beta * raw > 20.0f) ? raw
+                        : logf(1.0f + expf(sp_beta * raw)) / sp_beta;
+
+        float mu;
         if (density_grad) {
             float t_mid = (t_0 + t_1) * 0.5f;
             Vec3f x_mid = ray.origin + t_mid * ray.direction;
-            Vec3f b = density_grad[point_idx];
-            raw_lin = raw + b.dot(x_mid - current_point);
+            Vec3f g = density_grad[point_idx];
+            Vec3f slope = max_slope * Vec3f(tanhf(g[0]), tanhf(g[1]), tanhf(g[2]));
+            mu = fmaxf(0.0f, mu_base + slope.dot(x_mid - current_point));
         } else {
-            raw_lin = raw;
+            mu = mu_base;
         }
-
-        // softplus activation (beta=10, matches Python get_primal_density)
-        float mu = (sp_beta * raw_lin > 20.0f) ? raw_lin
-                   : logf(1.0f + expf(sp_beta * raw_lin)) / sp_beta;
 
         projection += mu * delta_t;
 
@@ -124,6 +128,7 @@ __global__ void ct_backward(TraceSettings settings,
 
     bool grad_active = (density_grad_in != nullptr);
     constexpr float sp_beta = 10.0f;
+    float max_slope = settings.gradient_max_slope;
 
     auto functor = [&](uint32_t point_idx,
                        float t_0,
@@ -132,7 +137,6 @@ __global__ void ct_backward(TraceSettings settings,
                        const Vec3f &next_point) {
         float raw = density[point_idx];
         float delta_t = fmaxf(t_1 - t_0, 0.0f);
-        float raw_lin;
         Vec3f x_mid_offset;
 
         if (point_error) {
@@ -140,31 +144,38 @@ __global__ void ct_backward(TraceSettings settings,
             atomicAdd(point_error + point_idx, weight * error);
         }
 
+        // softplus activation on raw scalar density
+        float mu_base = (sp_beta * raw > 20.0f) ? raw
+                        : logf(1.0f + expf(sp_beta * raw)) / sp_beta;
+
+        float mu;
         if (grad_active) {
             float t_mid = (t_0 + t_1) * 0.5f;
             Vec3f x_mid = ray.origin + t_mid * ray.direction;
-            Vec3f b = density_grad_in[point_idx];
             x_mid_offset = x_mid - current_point;
-            raw_lin = raw + b.dot(x_mid_offset);
+            Vec3f g = density_grad_in[point_idx];
+            Vec3f slope = max_slope * Vec3f(tanhf(g[0]), tanhf(g[1]), tanhf(g[2]));
+            mu = fmaxf(0.0f, mu_base + slope.dot(x_mid_offset));
         } else {
-            raw_lin = raw;
+            mu = mu_base;
         }
 
-        // softplus forward
-        float mu = (sp_beta * raw_lin > 20.0f) ? raw_lin
-                   : logf(1.0f + expf(sp_beta * raw_lin)) / sp_beta;
+        // indicator for ReLU clamp
+        float indicator = (mu > 0.0f) ? 1.0f : 0.0f;
+        float dL_dmu = dL_dprojection * delta_t * indicator;
 
-        // softplus derivative: sigmoid(beta * x) — always > 0
-        float d_softplus = 1.0f / (1.0f + expf(-sp_beta * raw_lin));
+        // dL/d(raw) through softplus
+        float d_softplus = 1.0f / (1.0f + expf(-sp_beta * raw));
+        atomicAdd(density_scalar_grad + point_idx, dL_dmu * d_softplus);
 
-        // dL/d(raw_i)
-        atomicAdd(density_scalar_grad + point_idx,
-                  dL_dprojection * delta_t * d_softplus);
-
-        // dL/d(b_i) — only when gradients active
+        // dL/d(g_param) — only when gradients active
         if (grad_active && density_grad_grad) {
-            Vec3f dL_db = dL_dprojection * delta_t * d_softplus * x_mid_offset;
-            atomic_add_vec(density_grad_grad + point_idx, dL_db);
+            Vec3f g = density_grad_in[point_idx];
+            Vec3f sech2(1.0f - tanhf(g[0]) * tanhf(g[0]),
+                        1.0f - tanhf(g[1]) * tanhf(g[1]),
+                        1.0f - tanhf(g[2]) * tanhf(g[2]));
+            Vec3f dL_dg = dL_dmu * max_slope * sech2.cwiseProduct(x_mid_offset);
+            atomic_add_vec(density_grad_grad + point_idx, dL_dg);
         }
 
         // dL/d(delta_t) = dL/dprojection * mu
