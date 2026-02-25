@@ -113,7 +113,8 @@ py::object trace_forward(Pipeline &self,
                          torch::Tensor start_point_in,
                          py::object max_intersections,
                          bool return_contribution,
-                         std::optional<torch::Tensor> density_grad_in) {
+                         std::optional<torch::Tensor> density_grad_in,
+                         float gradient_max_slope) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -163,6 +164,7 @@ py::object trace_forward(Pipeline &self,
     if (!max_intersections.is_none()) {
         settings.max_intersections = max_intersections.cast<uint32_t>();
     }
+    settings.gradient_max_slope = gradient_max_slope;
 
     std::vector<int64_t> output_shape;
     for (int i = 0; i < rays.dim() - 1; i++) {
@@ -233,7 +235,8 @@ py::object trace_backward(Pipeline &self,
                           torch::Tensor grad_in,
                           std::optional<torch::Tensor> ray_error_in,
                           py::object max_intersections,
-                          std::optional<torch::Tensor> density_grad_in) {
+                          std::optional<torch::Tensor> density_grad_in,
+                          float gradient_max_slope) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -321,6 +324,7 @@ py::object trace_backward(Pipeline &self,
     if (!max_intersections.is_none()) {
         settings.max_intersections = max_intersections.cast<uint32_t>();
     }
+    settings.gradient_max_slope = gradient_max_slope;
 
     int64_t num_attr = attributes.size(0);
 
@@ -439,7 +443,8 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("start_point"),
              py::arg("max_intersections") = py::none(),
              py::arg("return_contribution") = false,
-             py::arg("density_grad") = py::none())
+             py::arg("density_grad") = py::none(),
+             py::arg("gradient_max_slope") = 5.0f)
         .def("trace_backward",
              trace_backward,
              py::arg("points"),
@@ -451,7 +456,8 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("grad_in"),
              py::arg("ray_error") = py::none(),
              py::arg("max_intersections") = py::none(),
-             py::arg("density_grad") = py::none());
+             py::arg("density_grad") = py::none(),
+             py::arg("gradient_max_slope") = 5.0f);
 
     module.def("create_ct_pipeline", create_ct_pipeline_binding);
 

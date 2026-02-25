@@ -186,14 +186,58 @@ class CTScene(torch.nn.Module):
 
         return edge_loss.mean()
 
+    def tv_border_regularization(self, epsilon=1e-3, area_weighted=False):
+        """Charbonnier TV on density evaluated at Voronoi cell borders."""
+        mu_base = self.get_primal_density().squeeze()  # (N,) activated density
+        offsets = self.point_adjacency_offsets.long()
+        adj = self.point_adjacency.long()
+        N = mu_base.shape[0]
+        points = self.primal_points
+
+        counts = offsets[1:] - offsets[:-1]
+        source = torch.repeat_interleave(
+            torch.arange(N, device=mu_base.device), counts
+        )
+
+        # Displacement from source center to midpoint: 0.5 * (p_j - p_i)
+        dx = 0.5 * (points[adj] - points[source])  # (E, 3)
+
+        has_grad = hasattr(self, "density_grad") and self.density_grad is not None
+        if has_grad:
+            max_slope = getattr(self, "_gradient_max_slope", 5.0)
+            slope_i = max_slope * torch.tanh(self.density_grad[source])  # (E, 3)
+            slope_j = max_slope * torch.tanh(self.density_grad[adj])     # (E, 3)
+            mu_i = (mu_base[source] + (slope_i * dx).sum(dim=-1)).clamp(min=0)
+            mu_j = (mu_base[adj] + (slope_j * (-dx)).sum(dim=-1)).clamp(min=0)
+        else:
+            # No gradient active — falls back to center values
+            mu_i = mu_base[source]
+            mu_j = mu_base[adj]
+
+        diff = mu_i - mu_j
+        edge_loss = torch.sqrt(diff ** 2 + epsilon ** 2) - epsilon
+
+        if area_weighted:
+            with torch.no_grad():
+                _, cell_radius = radfoam.farthest_neighbor(
+                    points, self.point_adjacency, self.point_adjacency_offsets,
+                )
+                cr = cell_radius.squeeze()
+                w = cr[source] * cr[adj]
+                w = w / w.sum()
+            return (w * edge_loss).sum()
+
+        return edge_loss.mean()
+
     def get_trace_data(self):
         points = self.primal_points
         density = self.density  # raw — kernel applies softplus
         point_adjacency = self.point_adjacency
         point_adjacency_offsets = self.point_adjacency_offsets
         density_grad = getattr(self, "density_grad", None)
+        gradient_max_slope = getattr(self, "_gradient_max_slope", 5.0)
 
-        return points, density, point_adjacency, point_adjacency_offsets, density_grad
+        return points, density, point_adjacency, point_adjacency_offsets, density_grad, gradient_max_slope
 
     def get_starting_point(self, rays, points, aabb_tree):
         with torch.no_grad():
@@ -213,7 +257,7 @@ class CTScene(torch.nn.Module):
         start_point=None,
         return_contribution=False,
     ):
-        points, density, point_adjacency, point_adjacency_offsets, density_grad = (
+        points, density, point_adjacency, point_adjacency_offsets, density_grad, gradient_max_slope = (
             self.get_trace_data()
         )
 
@@ -231,6 +275,7 @@ class CTScene(torch.nn.Module):
             start_point,
             return_contribution,
             density_grad,
+            gradient_max_slope,
         )
 
     def declare_optimizer(self, args, warmup, max_iterations):
@@ -281,10 +326,10 @@ class CTScene(torch.nn.Module):
         )
         self._gradient_start = args.gradient_start
         self._gradient_freeze_points_until = args.gradient_start + args.gradient_freeze_points
-        self._gradient_clip = args.gradient_clip
+        self._gradient_max_slope = args.gradient_max_slope
         print(f"Initialized density_grad: {N} x 3 "
               f"(warmup={args.gradient_warmup}, freeze_points={args.gradient_freeze_points}, "
-              f"clip={args.gradient_clip})")
+              f"max_slope={args.gradient_max_slope})")
 
     def update_learning_rate(self, iteration):
         # Freeze positions while density gradients stabilize
@@ -398,7 +443,7 @@ class CTScene(torch.nn.Module):
             num_new_points = int((upsample_factor - 1) * num_curr_points)
 
             primal_error_accum = point_error.clip(min=0).squeeze()
-            points, _, point_adjacency, point_adjacency_offsets, _ = (
+            points, _, point_adjacency, point_adjacency_offsets, _, _ = (
                 self.get_trace_data()
             )
             ################### Farthest neighbor ###################
@@ -545,7 +590,7 @@ class CTScene(torch.nn.Module):
     def collect_error_map(self, data_handler, downsample=2):
         rays, projections = data_handler.rays, data_handler.projections
 
-        points, _, _, _, _ = self.get_trace_data()
+        points, _, _, _, _, _ = self.get_trace_data()
         start_points = self.get_starting_point(
             rays[:, 0, 0].cuda(), points, self.aabb_tree
         )
@@ -649,6 +694,7 @@ class CTScene(torch.nn.Module):
         }
         if hasattr(self, "density_grad") and self.density_grad is not None:
             scene_data["density_grad"] = self.density_grad.detach().float().cpu()
+            scene_data["gradient_max_slope"] = getattr(self, "_gradient_max_slope", 5.0)
         torch.save(scene_data, pt_path)
 
     def load_pt(self, pt_path):
@@ -661,6 +707,7 @@ class CTScene(torch.nn.Module):
             self.density_grad = nn.Parameter(
                 scene_data["density_grad"].to(self.device)
             )
+            self._gradient_max_slope = scene_data.get("gradient_max_slope", 5.0)
 
         self.point_adjacency = scene_data["adjacency"].to(self.device).to(
             torch.uint32)
