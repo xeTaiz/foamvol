@@ -4,9 +4,11 @@ densify_from: 2000
 densify_until: 11000
 densify_factor: 1.15
 contrast_fraction: 0.5
+contrast_power: 0.5
 loss_type: l2
 debug: False
 viewer: False
+save_volume: False
 
 # Model
 init_points: 16000
