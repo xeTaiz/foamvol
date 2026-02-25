@@ -20,6 +20,9 @@ from configs import *
 from radfoam_model.scene import CTScene
 from voxelize import voxelize
 from visualize_volume import visualize
+from vis_foam import (load_density_field, field_from_model, query_density,
+                      sample_idw, make_slice_coords,
+                      compute_cell_density_slice, visualize_slices)
 import radfoam
 
 
@@ -265,6 +268,23 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                 if i % 1000 == 999 and not pipeline_args.debug:
                     log_diagnostics(model, writer, i)
+                    with torch.no_grad():
+                        field = field_from_model(model)
+                        axes = [0, 1, 2]
+                        slice_coords = [-0.2, 0.0, 0.2]
+                        d_slices = []
+                        idw_slices = []
+                        cd_slices = []
+                        for a in axes:
+                            for c in slice_coords:
+                                sc = make_slice_coords(a, c, resolution=256, extent=1.0)
+                                d_slices.append(query_density(field, sc))
+                                idw_slices.append(sample_idw(field, sc))
+                                cd_slices.append(
+                                    compute_cell_density_slice(field["points"], a, c, 64, 1.0)
+                                )
+                        log_fig = partial(writer.add_figure, "volume/slices", global_step=i)
+                        visualize_slices(d_slices, idw_slices, cd_slices, writer_fn=log_fig)
 
                 if iters_since_update >= triangulation_update_period:
                     model.update_triangulation(incremental=True)
@@ -290,6 +310,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         point_contribution,
                         pipeline_args.densify_factor,
                         pipeline_args.contrast_fraction,
+                        pipeline_args.contrast_power,
                     )
 
                     model.update_triangulation(incremental=False)
@@ -312,6 +333,9 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     next_densification_after = max(
                         next_densification_after, 100
                     )
+
+                if i == pipeline_args.densify_until:
+                    model.update_triangulation(incremental=False)
 
                 if (
                     optimizer_args.gradient_start >= 0
@@ -353,10 +377,32 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
             f.write(f"Train SSIM: {train_metrics['ssim']:.6f}\n")
 
         model_path = f"{out_dir}/model.pt"
-        volume_path = f"{out_dir}/volume.npy"
-        voxelize(model_path, resolution=256, output_path=volume_path, extent=1.0)
+
+        # Direct slice evaluation (no full volume needed)
+        field = load_density_field(model_path)
+        axes = [0, 1, 2]
+        coords = [-0.2, 0.0, 0.2]
+        density_slices = []
+        idw_slices = []
+        cell_density_slices = []
+        for a in axes:
+            for c in coords:
+                sc = make_slice_coords(a, c, resolution=256, extent=1.0)
+                density_slices.append(query_density(field, sc))
+                idw_slices.append(sample_idw(field, sc))
+                cell_density_slices.append(
+                    compute_cell_density_slice(field["points"], a, c, 64, 1.0)
+                )
+
         log_fig = partial(writer.add_figure, "volume/slices", global_step=pipeline_args.iterations)
-        visualize(volume_path, writer_fn=log_fig)
+        visualize_slices(density_slices, idw_slices, cell_density_slices,
+                         writer_fn=log_fig, out_path=f"{out_dir}/vis.jpg")
+
+        # Optionally save full volume
+        if pipeline_args.save_volume:
+            volume_path = f"{out_dir}/volume.npy"
+            voxelize(model_path, resolution=256, output_path=volume_path, extent=1.0)
+
         writer.close()
 
 
