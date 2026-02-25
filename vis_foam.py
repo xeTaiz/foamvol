@@ -277,9 +277,14 @@ def visualize_slices(density_slices, idw_slices, cell_density_slices,
 
             # Cell density overlaid on density (right 3 cols)
             ax = axs[row, col + 6]
-            ax.imshow(density_slices[idx].T, origin="lower", cmap="gray",
+            cd = cell_density_slices[idx]
+            cd_res = cd.shape[0]
+            # Downsample density to match cell density resolution
+            ds_t = torch.from_numpy(density_slices[idx]).unsqueeze(0).unsqueeze(0)
+            ds = F.avg_pool2d(ds_t, kernel_size=ds_t.shape[-1] // cd_res).squeeze().numpy()
+            ax.imshow(ds.T, origin="lower", cmap="gray",
                       vmin=0, vmax=vmax)
-            ax.imshow(cell_density_slices[idx].T, origin="lower",
+            ax.imshow(cd.T, origin="lower",
                       cmap="hot", alpha=0.5)
             ax.set_title(f"cells {axes_labels[row]}={coords[col]:.1f}")
             ax.axis("off")
