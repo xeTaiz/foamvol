@@ -48,15 +48,19 @@ GRAD_CONFIGS = {
 
 TV_CONFIGS = {
     "T-0": {"tv_weight": 0, "tv_start": -1},
-    "T-4a": {"tv_weight": 1e-4, "tv_start": 8000, "tv_area_weighted": True},
+    #"T-4a": {"tv_weight": 1e-4, "tv_start": 8000, "tv_area_weighted": True},
     "T-5a": {"tv_weight": 1e-5, "tv_start": 8000, "tv_area_weighted": True},
 }
 
 CONTRAST_CONFIGS = {
     "C25": {"contrast_fraction": 0.25},
-    "C50": {"contrast_fraction": 0.5},
+    "C50": {"contrast_fraction": 0.50},
     "C75": {"contrast_fraction": 0.75},
     "C90": {"contrast_fraction": 0.90},
+    "C25p01": {"contrast_fraction": 0.25, "contrast_power": 0.1},
+    "C50p01": {"contrast_fraction": 0.50, "contrast_power": 0.1},
+    "C75p01": {"contrast_fraction": 0.75, "contrast_power": 0.1},
+    "C90p01": {"contrast_fraction": 0.90, "contrast_power": 0.1},
 }
 
 POINTS_CONFIGS = {
@@ -88,13 +92,14 @@ BASELINE = {
     "gradient_warmup": 50,
     "gradient_max_slope": 5.0,
     "gradient_freeze_points": 1000,
+    "contrast_power": 0.5,
     "dataset": "r2_gaussian",
     "data_path": "/mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
     "debug": False,
     "viewer": False,
 }
 
-SWEEP_NAM = "sweep3"
+SWEEP_NAM = "sweep4"
 SWEEP_DIR = f"output/{SWEEP_NAM}"
 
 
