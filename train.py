@@ -22,7 +22,8 @@ from voxelize import voxelize
 from visualize_volume import visualize
 from vis_foam import (load_density_field, field_from_model, query_density,
                       sample_idw, make_slice_coords,
-                      compute_cell_density_slice, visualize_slices)
+                      compute_cell_density_slice, visualize_slices,
+                      load_gt_volume, sample_gt_slice)
 import radfoam
 
 
@@ -150,6 +151,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         max_iterations=pipeline_args.iterations,
     )
 
+    gt_volume = load_gt_volume(dataset_args.data_path, dataset_args.dataset)
+    if gt_volume is not None:
+        print(f"Loaded GT volume: shape={gt_volume.shape}")
+
     def eval_views(data_handler, ray_batch_fetcher, proj_batch_fetcher):
         rays = data_handler.rays
         points, _, _, _, _, _ = model.get_trace_data()
@@ -275,6 +280,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         d_slices = []
                         idw_slices = []
                         cd_slices = []
+                        gt_slices = []
                         for a in axes:
                             for c in slice_coords:
                                 sc = make_slice_coords(a, c, resolution=256, extent=1.0)
@@ -283,8 +289,16 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                                 cd_slices.append(
                                     compute_cell_density_slice(field["points"], a, c, 64, 1.0)
                                 )
+                                gt_slices.append(sample_gt_slice(gt_volume, a, c, 256, 1.0))
                         log_fig = partial(writer.add_figure, "volume/slices", global_step=i)
-                        visualize_slices(d_slices, idw_slices, cd_slices, writer_fn=log_fig)
+                        metrics = visualize_slices(
+                            d_slices, idw_slices, cd_slices,
+                            gt_slices=gt_slices, writer_fn=log_fig,
+                        )
+                        if metrics is not None:
+                            for key, val in metrics.items():
+                                tag = f"slice_{key.split('_')[1]}/{key.split('_')[0]}"
+                                writer.add_scalar(tag, val, i)
 
                 if iters_since_update >= triangulation_update_period:
                     model.update_triangulation(incremental=True)
@@ -385,6 +399,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         density_slices = []
         idw_slices = []
         cell_density_slices = []
+        gt_slices_final = []
         for a in axes:
             for c in coords:
                 sc = make_slice_coords(a, c, resolution=256, extent=1.0)
@@ -393,10 +408,21 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 cell_density_slices.append(
                     compute_cell_density_slice(field["points"], a, c, 64, 1.0)
                 )
+                gt_slices_final.append(sample_gt_slice(gt_volume, a, c, 256, 1.0))
 
         log_fig = partial(writer.add_figure, "volume/slices", global_step=pipeline_args.iterations)
-        visualize_slices(density_slices, idw_slices, cell_density_slices,
-                         writer_fn=log_fig, out_path=f"{out_dir}/vis.jpg")
+        slice_metrics = visualize_slices(
+            density_slices, idw_slices, cell_density_slices,
+            gt_slices=gt_slices_final, writer_fn=log_fig,
+            out_path=f"{out_dir}/vis.jpg",
+        )
+        if slice_metrics is not None:
+            for key, val in slice_metrics.items():
+                tag = f"slice_{key.split('_')[1]}/{key.split('_')[0]}"
+                writer.add_scalar(tag, val, pipeline_args.iterations)
+            with open(f"{out_dir}/metrics.txt", "a") as f:
+                for key, val in slice_metrics.items():
+                    f.write(f"Slice {key}: {val:.4f}\n")
 
         # Optionally save full volume
         if pipeline_args.save_volume:
