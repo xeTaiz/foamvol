@@ -102,16 +102,22 @@ def query_density(field, coordinates):
     return result.reshape(original_shape).cpu().numpy()
 
 
-def sample_idw(field, coordinates):
+def sample_idw(field, coordinates, sigma=0.01, sigma_v=None):
     """Inverse-distance weighted interpolation over Voronoi neighbors.
 
     For each query point, finds the containing cell, gathers its Voronoi
     neighbors, and returns the IDW-weighted average of their activated
     densities (softplus of raw values).
 
+    When sigma_v is set, applies bilateral weighting: neighbors with
+    dissimilar density to the containing cell are downweighted by
+    exp(-|mu_i - mu_ref| / sigma_v).
+
     Args:
         field: dict from load_density_field() or field_from_model()
         coordinates: numpy or torch array of shape (..., 3)
+        sigma: length scale for exp(-dist/sigma) spatial weighting
+        sigma_v: value-similarity scale for bilateral weighting (None=disabled)
 
     Returns:
         numpy array of shape (...) with interpolated density values
@@ -161,25 +167,31 @@ def sample_idw(field, coordinates):
         pad_idx[:, 1:] = adj[flat_offsets]
         valid[:, 1:] = has_k
 
-        # Compute squared distances from query to each candidate center
+        # Compute distances from query to each candidate center
         centers = points[pad_idx]  # (B, max_k+1, 3)
-        dist_sq = ((query.unsqueeze(1) - centers) ** 2).sum(dim=-1)  # (B, max_k+1)
+        dist = (query.unsqueeze(1) - centers).norm(dim=-1)  # (B, max_k+1)
 
-        # IDW weights: 1/dist^4 (sharper weighting toward nearest cell)
-        eps = 1e-10
-        inv_dist = 1.0 / (dist_sq + eps) ** 2
-        inv_dist[~valid] = 0.0
-        weights = inv_dist / inv_dist.sum(dim=1, keepdim=True)  # (B, max_k+1)
+        # Weights: exp(-dist/sigma)
+        w = torch.exp(-dist / sigma)
+
+        # Bilateral value-similarity weighting
+        vals = activated[pad_idx]  # (B, max_k+1)
+        if sigma_v is not None:
+            ref_val = activated[nn_idx]  # (B,) containing cell's density
+            val_diff = (vals - ref_val.unsqueeze(1)).abs()
+            w = w * torch.exp(-val_diff / sigma_v)
+
+        w[~valid] = 0.0
+        weights = w / w.sum(dim=1, keepdim=True)  # (B, max_k+1)
 
         # Weighted sum of activated densities
-        vals = activated[pad_idx]  # (B, max_k+1)
         vals[~valid] = 0.0
         result[start:end] = (weights * vals).sum(dim=1)
 
     return result.reshape(original_shape).cpu().numpy()
 
 
-def sample_idw_diagnostic(field, coordinates):
+def sample_idw_diagnostic(field, coordinates, sigma=0.001, sigma_v=None):
     """Like sample_idw but returns diagnostic channels.
 
     Runs WITHOUT batching (designed for a single 256x256 slice, ~65k queries).
@@ -187,6 +199,8 @@ def sample_idw_diagnostic(field, coordinates):
     Args:
         field: density field dict from load_density_field() or field_from_model()
         coordinates: (H, W, 3) numpy array — single slice only
+        sigma: spatial distance scale
+        sigma_v: value-similarity scale for bilateral weighting (None=disabled)
 
     Returns:
         dict of (H, W) numpy arrays:
@@ -197,6 +211,7 @@ def sample_idw_diagnostic(field, coordinates):
             min_neighbor_val — lowest activated density among valid neighbors
             neighbor_count  — number of Voronoi neighbors for containing cell
             max_neighbor_dist — largest distance to any valid neighbor
+            value_weight    — mean bilateral value-similarity factor (if sigma_v set)
     """
     H, W = coordinates.shape[:2]
     if isinstance(coordinates, np.ndarray):
@@ -239,18 +254,32 @@ def sample_idw_diagnostic(field, coordinates):
     pad_idx[:, 1:] = adj[flat_offsets]
     valid[:, 1:] = has_k
 
-    # Compute squared distances from query to each candidate center
+    # Compute distances from query to each candidate center
     centers = points[pad_idx]  # (B, max_k+1, 3)
-    dist_sq = ((coords_flat.unsqueeze(1) - centers) ** 2).sum(dim=-1)  # (B, max_k+1)
+    dist = (coords_flat.unsqueeze(1) - centers).norm(dim=-1)  # (B, max_k+1)
 
-    # IDW weights: 1/dist^4
-    eps = 1e-10
-    inv_dist = 1.0 / (dist_sq + eps) ** 2
-    inv_dist[~valid] = 0.0
-    weights = inv_dist / inv_dist.sum(dim=1, keepdim=True)  # (B, max_k+1)
+    # Weights: exp(-dist/sigma)
+    w = torch.exp(-dist / sigma)
 
     # Activated values
     vals = activated[pad_idx]  # (B, max_k+1)
+
+    # Bilateral value-similarity weighting
+    val_weight_map = None
+    if sigma_v is not None:
+        ref_val = activated[nn_idx]  # (B,) containing cell's density
+        val_diff = (vals - ref_val.unsqueeze(1)).abs()
+        vw = torch.exp(-val_diff / sigma_v)
+        w = w * vw
+        # Mean value-similarity factor across valid neighbors
+        vw_valid = vw.clone()
+        vw_valid[~valid] = 0.0
+        n_valid = valid.float().sum(dim=1).clamp(min=1)
+        val_weight_map = vw_valid.sum(dim=1) / n_valid  # (B,)
+
+    w[~valid] = 0.0
+    weights = w / w.sum(dim=1, keepdim=True)  # (B, max_k+1)
+
     vals[~valid] = 0.0
 
     # IDW result
@@ -271,10 +300,10 @@ def sample_idw_diagnostic(field, coordinates):
     # Neighbor count
     neighbor_count = counts.float()  # (B,)
 
-    # Max neighbor dist (sqrt of max dist_sq among valid entries, excluding slot 0)
-    neighbor_dist_sq = dist_sq[:, 1:].clone()  # (B, max_k)
-    neighbor_dist_sq[~neighbor_valid] = 0.0
-    max_neighbor_dist = neighbor_dist_sq.max(dim=1).values.sqrt()  # (B,)
+    # Max neighbor dist (excluding slot 0)
+    neighbor_dist = dist[:, 1:].clone()  # (B, max_k)
+    neighbor_dist[~neighbor_valid] = 0.0
+    max_neighbor_dist = neighbor_dist.max(dim=1).values  # (B,)
 
     # Reshape all to (H, W) numpy
     def to_hw(t):
@@ -282,7 +311,7 @@ def sample_idw_diagnostic(field, coordinates):
 
     diff = nn_density - idw_result
 
-    return {
+    result = {
         "nn_density": to_hw(nn_density),
         "idw_result": to_hw(idw_result),
         "diff": to_hw(diff),
@@ -291,6 +320,9 @@ def sample_idw_diagnostic(field, coordinates):
         "neighbor_count": to_hw(neighbor_count),
         "max_neighbor_dist": to_hw(max_neighbor_dist),
     }
+    if val_weight_map is not None:
+        result["value_weight"] = to_hw(val_weight_map)
+    return result
 
 
 def visualize_idw_diagnostics(diag, diff_threshold=0.05, writer_fn=None,
@@ -320,7 +352,12 @@ def visualize_idw_diagnostics(diag, diff_threshold=0.05, writer_fn=None,
         ("max_neighbor_dist", "Max Neighbor Dist", "inferno", None),
     ]
 
-    fig, axs = plt.subplots(2, 4, figsize=(20, 10))
+    has_value_weight = "value_weight" in diag
+    if has_value_weight:
+        channels.append(("value_weight", "Value Weight (bilateral)", "viridis", None))
+
+    ncols = 4 if not has_value_weight else 5
+    fig, axs = plt.subplots(2, ncols, figsize=(5 * ncols, 10))
     axs_flat = axs.ravel()
 
     for i, (key, label, cmap, mode) in enumerate(channels):
@@ -334,13 +371,17 @@ def visualize_idw_diagnostics(diag, diff_threshold=0.05, writer_fn=None,
         elif key in ("nn_density", "idw_result", "min_neighbor_val"):
             kwargs["vmin"] = 0
             kwargs["vmax"] = max(diag["nn_density"].max(), 1e-6)
+        elif key == "value_weight":
+            kwargs["vmin"] = 0
+            kwargs["vmax"] = 1
         im = ax.imshow(data.T, **kwargs)
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         ax.set_title(label, fontsize=9)
         ax.axis("off")
 
-    # Last panel: hole mask overlay
-    ax = axs_flat[7]
+    # Hole mask overlay in the panel after channels
+    hole_panel_idx = len(channels)
+    ax = axs_flat[hole_panel_idx]
     hole_mask = diag["diff"] > diff_threshold
     n_holes = hole_mask.sum()
     ax.imshow(diag["idw_result"].T, origin="lower", cmap="gray",
@@ -349,6 +390,10 @@ def visualize_idw_diagnostics(diag, diff_threshold=0.05, writer_fn=None,
         ax.imshow(hole_mask.T, origin="lower", cmap="Reds", alpha=0.5)
     ax.set_title(f"Hole Mask (diff>{diff_threshold}, n={n_holes})", fontsize=9)
     ax.axis("off")
+
+    # Hide any unused panels
+    for j in range(hole_panel_idx + 1, len(axs_flat)):
+        axs_flat[j].axis("off")
 
     fig.suptitle("IDW Diagnostic Channels", fontsize=13)
     fig.tight_layout()
@@ -363,22 +408,23 @@ def visualize_idw_diagnostics(diag, diff_threshold=0.05, writer_fn=None,
 
 
 def supersample_slice(sample_fn, field, axis, coord, resolution, extent,
-                      ss=2):
+                      ss=2, **kwargs):
     """Run a slice sampling function at ss× resolution and avg-pool back.
 
     Args:
-        sample_fn: callable(field, coords) -> (H, W) numpy array
+        sample_fn: callable(field, coords, **kwargs) -> (H, W) numpy array
         field: density field dict
         axis, coord, resolution, extent: same args as make_slice_coords
         ss: supersample factor (1 = no supersampling)
+        **kwargs: forwarded to sample_fn (e.g. sigma, sigma_v)
 
     Returns:
         (resolution, resolution) numpy array
     """
     if ss <= 1:
-        return sample_fn(field, make_slice_coords(axis, coord, resolution, extent))
+        return sample_fn(field, make_slice_coords(axis, coord, resolution, extent), **kwargs)
     coords_hi = make_slice_coords(axis, coord, resolution * ss, extent)
-    hi = sample_fn(field, coords_hi)  # (resolution*ss, resolution*ss)
+    hi = sample_fn(field, coords_hi, **kwargs)  # (resolution*ss, resolution*ss)
     t = torch.from_numpy(hi).float().unsqueeze(0).unsqueeze(0)
     return F.avg_pool2d(t, kernel_size=ss).squeeze().numpy()
 

@@ -52,6 +52,8 @@ class PipelineParams(ParamGroup):
         self.debug = False
         self.viewer = False
         self.save_volume = False
+        self.idw_sigma_s = 0.01
+        self.idw_sigma_v = 0.1
         super().__init__(parser, "Setting Pipeline parameters")
 
 
