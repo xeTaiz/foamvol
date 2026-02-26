@@ -125,3 +125,6 @@ class R2GaussianDataset:
         self.all_projections = torch.from_numpy(
             projections[..., np.newaxis]
         ).float()
+        self.beam_type = "cone"
+        # Angular extent of one pixel (radians) for jitter: atan(1/f) ~ 1/f
+        self.pixel_ang_size = (1.0 / fx, 1.0 / fy)
