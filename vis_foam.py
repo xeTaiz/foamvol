@@ -188,7 +188,7 @@ def sample_idw(field, coordinates, sigma=0.01, sigma_v=None):
         vals[~valid] = 0.0
         result[start:end] = (weights * vals).sum(dim=1)
 
-    return result.reshape(original_shape).cpu().numpy()
+    return torch.nan_to_num(result).reshape(original_shape).cpu().numpy()
 
 
 def sample_idw_diagnostic(field, coordinates, sigma=0.001, sigma_v=None):
@@ -283,10 +283,10 @@ def sample_idw_diagnostic(field, coordinates, sigma=0.001, sigma_v=None):
     vals[~valid] = 0.0
 
     # IDW result
-    idw_result = (weights * vals).sum(dim=1)  # (B,)
+    idw_result = torch.nan_to_num((weights * vals).sum(dim=1))  # (B,)
 
     # Cell weight (slot 0)
-    cell_weight = weights[:, 0]  # (B,)
+    cell_weight = torch.nan_to_num(weights[:, 0])  # (B,)
 
     # Min neighbor val: lowest activated density among valid neighbors (slots 1+)
     neighbor_vals = vals[:, 1:].clone()  # (B, max_k)
