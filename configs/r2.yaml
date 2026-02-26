@@ -9,6 +9,8 @@ loss_type: l2
 debug: False
 viewer: False
 save_volume: False
+idw_sigma_s: 0.01
+idw_sigma_v: 0.1
 
 # Model
 init_points: 16000
