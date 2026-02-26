@@ -24,9 +24,9 @@ points_lr_final: 5e-6
 density_lr_init: 1e-1
 density_lr_final: 1e-2
 freeze_points: 18000
-tv_weight: 1e-4
+tv_weight: 1e-5
 tv_start: 8000
-tv_epsilon: 1e-3
+tv_epsilon: 1e-4
 tv_area_weighted: True
 gradient_start: 11000
 gradient_lr_init: 1e-4
