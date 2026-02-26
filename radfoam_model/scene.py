@@ -480,7 +480,7 @@ class CTScene(torch.nn.Module):
             contrast_weight[edge_length < 1e-3] = 0.0
 
             ######################## Pruning ########################
-            prune_mask = torch.logical_or(point_contribution.squeeze() < 1e-2, cell_radius < 1e-3)
+            prune_mask = torch.logical_or(point_contribution.squeeze() < 1e-2, cell_radius < 1e-2)
             n_pruned = prune_mask.sum().item()
             if n_pruned > 0:
                 print(f"Pruning {n_pruned}/{num_curr_points} cells (contribution < 1e-2)")
@@ -602,7 +602,25 @@ class CTScene(torch.nn.Module):
             self.densification_postfix(new_params)
             self.prune_points(prune_mask)
 
-    def collect_error_map(self, data_handler, downsample=2):
+    def prune_only(self, data_handler):
+        """Standalone prune pass: remove cells with negligible contribution or tiny radius."""
+        _, point_contribution = self.collect_error_map(data_handler)
+        with torch.no_grad():
+            points, _, point_adjacency, point_adjacency_offsets, _, _ = self.get_trace_data()
+            _, cell_radius = radfoam.farthest_neighbor(
+                points, point_adjacency, point_adjacency_offsets,
+            )
+            prune_mask = torch.logical_or(
+                point_contribution.squeeze() < 1e-2, cell_radius < 1e-3
+            )
+            n_pruned = prune_mask.sum().item()
+            if n_pruned > 0:
+                print(f"Standalone prune: {n_pruned}/{points.shape[0]} cells")
+                self.prune_points(prune_mask)
+                self.update_triangulation(incremental=False)
+            return n_pruned
+
+    def collect_error_map(self, data_handler):
         rays, projections = data_handler.rays, data_handler.projections
 
         points, _, _, _, _, _ = self.get_trace_data()
@@ -626,10 +644,6 @@ class CTScene(torch.nn.Module):
         for i in range(rays.shape[0]):
             ray_batch = ray_batch_fetcher.next()
             proj_batch = proj_batch_fetcher.next()
-
-            d = torch.randint(0, downsample, (2,))
-            ray_batch = ray_batch[:, d[0] :: downsample, d[1] :: downsample, :]
-            proj_batch = proj_batch[:, d[0] :: downsample, d[1] :: downsample, :]
 
             proj_output, contribution, _, errbox = self.forward(
                 ray_batch, start_points[i], return_contribution=True

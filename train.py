@@ -362,6 +362,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                 if i == pipeline_args.densify_until:
                     model.update_triangulation(incremental=False)
+                    model.prune_only(train_data_handler)
 
                 if (
                     optimizer_args.gradient_start >= 0
@@ -371,6 +372,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                 if i == optimizer_args.freeze_points:
                     model.update_triangulation(incremental=False)
+                    model.prune_only(train_data_handler)
 
                 if viewer is not None and viewer.is_closed():
                     break
