@@ -179,6 +179,189 @@ def sample_idw(field, coordinates):
     return result.reshape(original_shape).cpu().numpy()
 
 
+def sample_idw_diagnostic(field, coordinates):
+    """Like sample_idw but returns diagnostic channels.
+
+    Runs WITHOUT batching (designed for a single 256x256 slice, ~65k queries).
+
+    Args:
+        field: density field dict from load_density_field() or field_from_model()
+        coordinates: (H, W, 3) numpy array — single slice only
+
+    Returns:
+        dict of (H, W) numpy arrays:
+            nn_density      — softplus(density[nn_idx]), containing cell value
+            idw_result      — final IDW weighted average
+            diff            — nn_density - idw_result
+            cell_weight     — weight of the containing cell (slot 0)
+            min_neighbor_val — lowest activated density among valid neighbors
+            neighbor_count  — number of Voronoi neighbors for containing cell
+            max_neighbor_dist — largest distance to any valid neighbor
+    """
+    H, W = coordinates.shape[:2]
+    if isinstance(coordinates, np.ndarray):
+        coordinates = torch.from_numpy(coordinates).float()
+    coords_flat = coordinates.reshape(-1, 3).to(field["device"])
+
+    points = field["points"]
+    density_flat = field["density_flat"]
+    adj = field["adjacency"]
+    adj_off = field["adjacency_offsets"]
+    activated = F.softplus(density_flat, beta=10)  # (N,)
+
+    B = coords_flat.shape[0]
+    global_max_k = int((adj_off[1:] - adj_off[:-1]).max().item())
+
+    # Find containing cell
+    nn_idx = radfoam.nn(points, field["aabb_tree"], coords_flat).long()  # (B,)
+
+    # NN density: containing cell's activated value
+    nn_density = activated[nn_idx]  # (B,)
+
+    # Gather neighbor counts and build padded neighbor tensor
+    counts = adj_off[nn_idx + 1] - adj_off[nn_idx]  # (B,)
+    max_k = global_max_k
+    offsets = adj_off[nn_idx]  # (B,)
+
+    # Padded (B, max_k+1) index tensor: slot 0 = cell itself, 1..max_k = neighbors
+    pad_idx = torch.zeros(B, max_k + 1, dtype=torch.long, device=field["device"])
+    valid = torch.zeros(B, max_k + 1, dtype=torch.bool, device=field["device"])
+
+    # Slot 0: the containing cell
+    pad_idx[:, 0] = nn_idx
+    valid[:, 0] = True
+
+    # Slots 1..max_k: Voronoi neighbors
+    k_range = torch.arange(max_k, device=field["device"])
+    has_k = counts.unsqueeze(1) > k_range.unsqueeze(0)  # (B, max_k)
+    flat_offsets = offsets.unsqueeze(1) + k_range.unsqueeze(0)  # (B, max_k)
+    flat_offsets = flat_offsets.clamp(max=adj.shape[0] - 1)
+    pad_idx[:, 1:] = adj[flat_offsets]
+    valid[:, 1:] = has_k
+
+    # Compute squared distances from query to each candidate center
+    centers = points[pad_idx]  # (B, max_k+1, 3)
+    dist_sq = ((coords_flat.unsqueeze(1) - centers) ** 2).sum(dim=-1)  # (B, max_k+1)
+
+    # IDW weights: 1/dist^4
+    eps = 1e-10
+    inv_dist = 1.0 / (dist_sq + eps) ** 2
+    inv_dist[~valid] = 0.0
+    weights = inv_dist / inv_dist.sum(dim=1, keepdim=True)  # (B, max_k+1)
+
+    # Activated values
+    vals = activated[pad_idx]  # (B, max_k+1)
+    vals[~valid] = 0.0
+
+    # IDW result
+    idw_result = (weights * vals).sum(dim=1)  # (B,)
+
+    # Cell weight (slot 0)
+    cell_weight = weights[:, 0]  # (B,)
+
+    # Min neighbor val: lowest activated density among valid neighbors (slots 1+)
+    neighbor_vals = vals[:, 1:].clone()  # (B, max_k)
+    neighbor_valid = valid[:, 1:]  # (B, max_k)
+    neighbor_vals[~neighbor_valid] = float("inf")
+    min_neighbor_val = neighbor_vals.min(dim=1).values  # (B,)
+    # For cells with zero neighbors, use the cell's own value
+    no_neighbors = ~neighbor_valid.any(dim=1)
+    min_neighbor_val[no_neighbors] = nn_density[no_neighbors]
+
+    # Neighbor count
+    neighbor_count = counts.float()  # (B,)
+
+    # Max neighbor dist (sqrt of max dist_sq among valid entries, excluding slot 0)
+    neighbor_dist_sq = dist_sq[:, 1:].clone()  # (B, max_k)
+    neighbor_dist_sq[~neighbor_valid] = 0.0
+    max_neighbor_dist = neighbor_dist_sq.max(dim=1).values.sqrt()  # (B,)
+
+    # Reshape all to (H, W) numpy
+    def to_hw(t):
+        return t.reshape(H, W).cpu().numpy()
+
+    diff = nn_density - idw_result
+
+    return {
+        "nn_density": to_hw(nn_density),
+        "idw_result": to_hw(idw_result),
+        "diff": to_hw(diff),
+        "cell_weight": to_hw(cell_weight),
+        "min_neighbor_val": to_hw(min_neighbor_val),
+        "neighbor_count": to_hw(neighbor_count),
+        "max_neighbor_dist": to_hw(max_neighbor_dist),
+    }
+
+
+def visualize_idw_diagnostics(diag, diff_threshold=0.05, writer_fn=None,
+                              out_path=None):
+    """Create a multi-panel figure from sample_idw_diagnostic output.
+
+    Args:
+        diag: dict from sample_idw_diagnostic()
+        diff_threshold: pixels with diff > this are highlighted as holes
+        writer_fn: optional callable(fig) for TensorBoard logging
+        out_path: optional file path for saving
+
+    Returns:
+        matplotlib Figure
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    channels = [
+        ("nn_density", "NN Density (containing cell)", "gray", None),
+        ("idw_result", "IDW Result", "gray", None),
+        ("diff", "Diff (NN - IDW)", "bwr", "symmetric"),
+        ("cell_weight", "Cell Weight (slot 0)", "viridis", None),
+        ("min_neighbor_val", "Min Neighbor Val", "gray", None),
+        ("neighbor_count", "Neighbor Count", "plasma", None),
+        ("max_neighbor_dist", "Max Neighbor Dist", "inferno", None),
+    ]
+
+    fig, axs = plt.subplots(2, 4, figsize=(20, 10))
+    axs_flat = axs.ravel()
+
+    for i, (key, label, cmap, mode) in enumerate(channels):
+        ax = axs_flat[i]
+        data = diag[key]
+        kwargs = {"origin": "lower", "cmap": cmap}
+        if mode == "symmetric":
+            abs_max = max(np.abs(data).max(), 1e-6)
+            kwargs["vmin"] = -abs_max
+            kwargs["vmax"] = abs_max
+        elif key in ("nn_density", "idw_result", "min_neighbor_val"):
+            kwargs["vmin"] = 0
+            kwargs["vmax"] = max(diag["nn_density"].max(), 1e-6)
+        im = ax.imshow(data.T, **kwargs)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        ax.set_title(label, fontsize=9)
+        ax.axis("off")
+
+    # Last panel: hole mask overlay
+    ax = axs_flat[7]
+    hole_mask = diag["diff"] > diff_threshold
+    n_holes = hole_mask.sum()
+    ax.imshow(diag["idw_result"].T, origin="lower", cmap="gray",
+              vmin=0, vmax=max(diag["nn_density"].max(), 1e-6))
+    if n_holes > 0:
+        ax.imshow(hole_mask.T, origin="lower", cmap="Reds", alpha=0.5)
+    ax.set_title(f"Hole Mask (diff>{diff_threshold}, n={n_holes})", fontsize=9)
+    ax.axis("off")
+
+    fig.suptitle("IDW Diagnostic Channels", fontsize=13)
+    fig.tight_layout()
+
+    if out_path:
+        fig.savefig(out_path, dpi=200)
+    if writer_fn is not None:
+        writer_fn(fig)
+
+    plt.close(fig)
+    return fig
+
+
 def supersample_slice(sample_fn, field, axis, coord, resolution, extent,
                       ss=2):
     """Run a slice sampling function at ss× resolution and avg-pool back.

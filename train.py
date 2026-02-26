@@ -21,9 +21,10 @@ from radfoam_model.scene import CTScene
 from voxelize import voxelize
 from visualize_volume import visualize
 from vis_foam import (load_density_field, field_from_model, query_density,
-                      sample_idw, supersample_slice, make_slice_coords,
-                      compute_cell_density_slice, visualize_slices,
-                      load_gt_volume, sample_gt_slice)
+                      sample_idw, sample_idw_diagnostic,
+                      visualize_idw_diagnostics, supersample_slice,
+                      make_slice_coords, compute_cell_density_slice,
+                      visualize_slices, load_gt_volume, sample_gt_slice)
 import radfoam
 
 
@@ -301,6 +302,16 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                                 tag = f"slice_{key.split('_')[1]}/{key.split('_')[0]}"
                                 writer.add_scalar(tag, val, i)
 
+                        # IDW diagnostic for a single Z=0 slice
+                        diag_coords = make_slice_coords(axis=2, coord=0.0, resolution=256, extent=1.0)
+                        diag = sample_idw_diagnostic(field, diag_coords)
+                        diag_writer = partial(writer.add_figure, f"idw_diagnostics/{experiment_name}", global_step=i)
+                        visualize_idw_diagnostics(diag, writer_fn=diag_writer)
+                        n_holes = (diag["diff"] > 0.05).sum()
+                        writer.add_scalar("diagnostics/idw_hole_pixels", n_holes, i)
+                        writer.add_scalar("diagnostics/idw_mean_cell_weight", diag["cell_weight"].mean(), i)
+                        writer.add_scalar("diagnostics/idw_mean_neighbor_count", diag["neighbor_count"].mean(), i)
+
                 if iters_since_update >= triangulation_update_period:
                     model.update_triangulation(incremental=True)
                     iters_since_update = 0
@@ -425,6 +436,13 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
             with open(f"{out_dir}/metrics.txt", "a") as f:
                 for key, val in slice_metrics.items():
                     f.write(f"Slice {key}: {val:.4f}\n")
+
+        # Final IDW diagnostics
+        diag_coords = make_slice_coords(axis=2, coord=0.0, resolution=256, extent=1.0)
+        diag = sample_idw_diagnostic(field, diag_coords)
+        diag_writer = partial(writer.add_figure, f"idw_diagnostics/{experiment_name}", global_step=pipeline_args.iterations)
+        visualize_idw_diagnostics(diag, writer_fn=diag_writer,
+                                  out_path=f"{out_dir}/idw_diagnostics.jpg")
 
         # Optionally save full volume
         if pipeline_args.save_volume:
