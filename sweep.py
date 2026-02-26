@@ -48,7 +48,7 @@ GRAD_CONFIGS = {
 
 TV_CONFIGS = {
     "T-0": {"tv_weight": 0, "tv_start": -1},
-    #"T-4a": {"tv_weight": 1e-4, "tv_start": 8000, "tv_area_weighted": True},
+    "T-4a": {"tv_weight": 1e-4, "tv_start": 8000, "tv_area_weighted": True},
     "T-5a": {"tv_weight": 1e-5, "tv_start": 8000, "tv_area_weighted": True},
 }
 
@@ -99,7 +99,7 @@ BASELINE = {
     "viewer": False,
 }
 
-SWEEP_NAM = "sweep5"
+SWEEP_NAM = "sweep6"
 SWEEP_DIR = f"output/{SWEEP_NAM}"
 
 
