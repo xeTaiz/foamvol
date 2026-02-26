@@ -111,7 +111,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
     # Setting up dataset
     train_data_handler = DataHandler(
-        dataset_args, rays_per_batch=1_000_000, device=device
+        dataset_args, rays_per_batch=2_000_000, device=device
     )
     train_data_handler.reload(split="train")
 
