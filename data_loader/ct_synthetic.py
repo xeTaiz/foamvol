@@ -23,6 +23,8 @@ class CTSyntheticDataset:
         self.det_h = detector_size // downsample
         self.det_w = detector_size // downsample
         self.detector_extent = 2.0 * radius * 1.5  # cover the sphere with margin
+        self.pixel_size = self.detector_extent / detector_size
+        self.beam_type = "parallel"
 
         if split == "train":
             angles = torch.linspace(0, math.pi, num_angles + 1)[:-1]
