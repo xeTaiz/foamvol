@@ -21,7 +21,7 @@ from radfoam_model.scene import CTScene
 from voxelize import voxelize
 from visualize_volume import visualize
 from vis_foam import (load_density_field, field_from_model, query_density,
-                      sample_idw, make_slice_coords,
+                      sample_idw, supersample_slice, make_slice_coords,
                       compute_cell_density_slice, visualize_slices,
                       load_gt_volume, sample_gt_slice)
 import radfoam
@@ -283,17 +283,18 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         gt_slices = []
                         for a in axes:
                             for c in slice_coords:
-                                sc = make_slice_coords(a, c, resolution=256, extent=1.0)
-                                d_slices.append(query_density(field, sc))
-                                idw_slices.append(sample_idw(field, sc))
+                                d_slices.append(supersample_slice(query_density, field, a, c, 256, 1.0, ss=2))
+                                idw_slices.append(supersample_slice(sample_idw, field, a, c, 256, 1.0, ss=2))
                                 cd_slices.append(
                                     compute_cell_density_slice(field["points"], a, c, 64, 1.0)
                                 )
                                 gt_slices.append(sample_gt_slice(gt_volume, a, c, 256, 1.0))
-                        log_fig = partial(writer.add_figure, "volume/slices", global_step=i)
+                        log_fig = partial(writer.add_figure, f"slices/{experiment_name}", global_step=i)
+                        log_fig_il = partial(writer.add_figure, f"slices_interleaved/{experiment_name}", global_step=i)
                         metrics = visualize_slices(
                             d_slices, idw_slices, cd_slices,
                             gt_slices=gt_slices, writer_fn=log_fig,
+                            writer_fn_interleaved=log_fig_il,
                         )
                         if metrics is not None:
                             for key, val in metrics.items():
@@ -402,18 +403,19 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         gt_slices_final = []
         for a in axes:
             for c in coords:
-                sc = make_slice_coords(a, c, resolution=256, extent=1.0)
-                density_slices.append(query_density(field, sc))
-                idw_slices.append(sample_idw(field, sc))
+                density_slices.append(supersample_slice(query_density, field, a, c, 256, 1.0, ss=2))
+                idw_slices.append(supersample_slice(sample_idw, field, a, c, 256, 1.0, ss=2))
                 cell_density_slices.append(
                     compute_cell_density_slice(field["points"], a, c, 64, 1.0)
                 )
                 gt_slices_final.append(sample_gt_slice(gt_volume, a, c, 256, 1.0))
 
-        log_fig = partial(writer.add_figure, "volume/slices", global_step=pipeline_args.iterations)
+        log_fig = partial(writer.add_figure, f"slices/{experiment_name}", global_step=pipeline_args.iterations)
+        log_fig_il = partial(writer.add_figure, f"slices_interleaved/{experiment_name}", global_step=pipeline_args.iterations)
         slice_metrics = visualize_slices(
             density_slices, idw_slices, cell_density_slices,
             gt_slices=gt_slices_final, writer_fn=log_fig,
+            writer_fn_interleaved=log_fig_il,
             out_path=f"{out_dir}/vis.jpg",
         )
         if slice_metrics is not None:

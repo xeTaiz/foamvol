@@ -129,6 +129,7 @@ def sample_idw(field, coordinates):
 
     result = torch.zeros(coords_flat.shape[0], device=field["device"])
     batch_size = 2_000_000
+    global_max_k = int((adj_off[1:] - adj_off[:-1]).max().item())
 
     for start in range(0, coords_flat.shape[0], batch_size):
         end = min(start + batch_size, coords_flat.shape[0])
@@ -140,7 +141,7 @@ def sample_idw(field, coordinates):
 
         # Gather neighbor counts and build padded neighbor tensor
         counts = adj_off[nn_idx + 1] - adj_off[nn_idx]  # (B,)
-        max_k = min(int(counts.max().item()), 40)
+        max_k = global_max_k
         offsets = adj_off[nn_idx]  # (B,) start offset per cell
 
         # Padded (B, max_k+1) index tensor: slot 0 = cell itself, 1..max_k = neighbors
@@ -165,7 +166,7 @@ def sample_idw(field, coordinates):
         dist_sq = ((query.unsqueeze(1) - centers) ** 2).sum(dim=-1)  # (B, max_k+1)
 
         # IDW weights: 1/dist^4 (sharper weighting toward nearest cell)
-        eps = 1e-16
+        eps = 1e-10
         inv_dist = 1.0 / (dist_sq + eps) ** 2
         inv_dist[~valid] = 0.0
         weights = inv_dist / inv_dist.sum(dim=1, keepdim=True)  # (B, max_k+1)
@@ -176,6 +177,27 @@ def sample_idw(field, coordinates):
         result[start:end] = (weights * vals).sum(dim=1)
 
     return result.reshape(original_shape).cpu().numpy()
+
+
+def supersample_slice(sample_fn, field, axis, coord, resolution, extent,
+                      ss=2):
+    """Run a slice sampling function at ss× resolution and avg-pool back.
+
+    Args:
+        sample_fn: callable(field, coords) -> (H, W) numpy array
+        field: density field dict
+        axis, coord, resolution, extent: same args as make_slice_coords
+        ss: supersample factor (1 = no supersampling)
+
+    Returns:
+        (resolution, resolution) numpy array
+    """
+    if ss <= 1:
+        return sample_fn(field, make_slice_coords(axis, coord, resolution, extent))
+    coords_hi = make_slice_coords(axis, coord, resolution * ss, extent)
+    hi = sample_fn(field, coords_hi)  # (resolution*ss, resolution*ss)
+    t = torch.from_numpy(hi).float().unsqueeze(0).unsqueeze(0)
+    return F.avg_pool2d(t, kernel_size=ss).squeeze().numpy()
 
 
 def make_slice_coords(axis, coord, resolution, extent):
@@ -353,8 +375,11 @@ def compute_slice_ssim(pred, gt, window_size=11):
 
 def visualize_slices(density_slices, idw_slices, cell_density_slices,
                      gt_slices=None, vmax=1.0, writer_fn=None,
-                     out_path=None, title=None):
+                     writer_fn_interleaved=None, out_path=None, title=None):
     """Plot density slices. 3x9 without GT, 6x9 with GT comparison.
+
+    Also produces an interleaved view (grouped by slice instead of by
+    vis type) if writer_fn_interleaved is provided.
 
     Args:
         density_slices: list of 9 (res, res) arrays (3 axes x 3 coords)
@@ -362,7 +387,8 @@ def visualize_slices(density_slices, idw_slices, cell_density_slices,
         cell_density_slices: list of 9 matching arrays
         gt_slices: optional list of 9 (res, res) GT arrays (or Nones)
         vmax: density colorbar max
-        writer_fn: optional callable(fig) for TensorBoard
+        writer_fn: optional callable(fig) for TensorBoard (by-type layout)
+        writer_fn_interleaved: optional callable(fig) for TensorBoard (per-slice layout)
         out_path: optional file path for saving
         title: optional figure title
 
@@ -478,6 +504,37 @@ def visualize_slices(density_slices, idw_slices, cell_density_slices,
         print(f"Saved {out_path}")
     if writer_fn is not None:
         writer_fn(fig)
+
+    # Build interleaved view by rearranging rendered tiles
+    if writer_fn_interleaved is not None:
+        fig.canvas.draw()
+        buf = np.asarray(fig.canvas.buffer_rgba())
+        h, w, _ = buf.shape
+        th, tw = h // nrows, w // 9
+        new_buf = np.zeros_like(buf)
+        for a in range(3):
+            for ci in range(3):
+                moves = [
+                    ((a, ci),     (a * 2, ci * 3)),
+                    ((a, ci + 3), (a * 2, ci * 3 + 1)),
+                    ((a, ci + 6), (a * 2, ci * 3 + 2)),
+                ]
+                if has_gt:
+                    moves += [
+                        ((a + 3, ci),     (a * 2 + 1, ci * 3)),
+                        ((a + 3, ci + 3), (a * 2 + 1, ci * 3 + 1)),
+                        ((a + 3, ci + 6), (a * 2 + 1, ci * 3 + 2)),
+                    ]
+                for (sr, sc), (dr, dc) in moves:
+                    new_buf[dr*th:(dr+1)*th, dc*tw:(dc+1)*tw] = \
+                        buf[sr*th:(sr+1)*th, sc*tw:(sc+1)*tw]
+        fig2, ax2 = plt.subplots(figsize=(27, nrows * 3))
+        ax2.imshow(new_buf)
+        ax2.axis("off")
+        fig2.tight_layout(pad=0)
+        writer_fn_interleaved(fig2)
+        plt.close(fig2)
+
     plt.close(fig)
 
     if has_gt and raw_psnrs:
