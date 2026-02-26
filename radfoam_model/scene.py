@@ -480,24 +480,12 @@ class CTScene(torch.nn.Module):
             contrast_weight[edge_length < 1e-3] = 0.0
 
             ######################## Pruning ########################
-            self_mask = point_contribution > 1e-2
-            neighbor_mask = self_mask.long()[point_adjacency.long()]
-            neighbor_mask = torch.cat(
-                [neighbor_mask, torch.zeros_like(neighbor_mask[:1])], dim=0
-            )
-            nsum = torch.cumsum(neighbor_mask, dim=0)
-
-            n_masked_adj = nsum[offsets[1:]] - nsum[offsets[:-1]]
-
-            contrib_mask = ((n_masked_adj == 0) & ~self_mask).squeeze()
-            cell_size_mask = cell_radius < 1e-1
-            prune_mask = contrib_mask * cell_size_mask
+            prune_mask = torch.logical_or(point_contribution.squeeze() < 1e-2, cell_radius < 1e-3)
+            n_pruned = prune_mask.sum().item()
+            if n_pruned > 0:
+                print(f"Pruning {n_pruned}/{num_curr_points} cells (contribution < 1e-2)")
 
             ######################## Sampling ########################
-            primal_contribution_accum = point_contribution.squeeze()
-            mask = primal_contribution_accum < 1e-3
-            self.density[mask] = -1
-
             perturbation = 0.25 * (points[farthest_neighbor] - points)
             delta = torch.randn_like(perturbation)
             delta /= delta.norm(dim=-1, keepdim=True)
