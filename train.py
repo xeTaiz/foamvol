@@ -314,6 +314,23 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 model.optimizer.step()
                 model.update_learning_rate(i)
 
+                # Interpolation interleaving schedule
+                if pipeline_args.interpolation_start >= 0:
+                    if i >= pipeline_args.interpolation_start:
+                        # 100% interpolation
+                        if not getattr(model, '_interpolation_mode', False):
+                            model.set_interpolation_mode(True)
+                            print(f"Full interpolation mode at iter {i}")
+                    elif i >= pipeline_args.densify_until:
+                        # Linear ramp: fraction of steps that use interpolation
+                        ramp_length = pipeline_args.interpolation_start - pipeline_args.densify_until
+                        frac = (i - pipeline_args.densify_until) / ramp_length
+                        period = 10
+                        use_interp = (i % period) < (frac * period)
+                        model.set_interpolation_mode(use_interp)
+                    else:
+                        model.set_interpolation_mode(False)
+
                 train.set_postfix(loss=f"{loss.item():.5f}")
 
                 if i % log_interval == log_interval - 1 and not pipeline_args.debug:
@@ -356,6 +373,11 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                             model.grad_scheduler_args(i - model._gradient_start),
                             i,
                         )
+
+                    if pipeline_args.interpolation_start >= 0 and i >= pipeline_args.densify_until:
+                        ramp_length = max(1, pipeline_args.interpolation_start - pipeline_args.densify_until)
+                        frac = min(1.0, (i - pipeline_args.densify_until) / ramp_length)
+                        writer.add_scalar("train/interp_fraction", frac, i)
 
                 if i % diag_interval == diag_interval - 1 and not pipeline_args.debug:
                     log_diagnostics(model, writer, i)
@@ -458,27 +480,21 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     model.update_triangulation(incremental=False)
                     model.prune_only(train_data_handler)
 
+                    if pipeline_args.interpolation_start >= 0:
+                        _, cell_radius = radfoam.farthest_neighbor(
+                            model.primal_points,
+                            model.point_adjacency,
+                            model.point_adjacency_offsets,
+                        )
+                        sigma = pipeline_args.interp_sigma_scale * cell_radius.median().item()
+                        model.set_interpolation_mode(False, sigma=sigma, sigma_v=pipeline_args.interp_sigma_v)
+                        print(f"Prepared interpolation sigma={sigma:.6f} at densify_until={i}")
+
                 if (
                     optimizer_args.gradient_start >= 0
                     and i == optimizer_args.gradient_start
                 ):
                     model.initialize_gradients(optimizer_args)
-
-                if (
-                    pipeline_args.interpolation_start >= 0
-                    and i == pipeline_args.interpolation_start
-                ):
-                    _, cell_radius = radfoam.farthest_neighbor(
-                        model.primal_points,
-                        model.point_adjacency,
-                        model.point_adjacency_offsets,
-                    )
-                    sigma = pipeline_args.interp_sigma_scale * cell_radius.median().item()
-                    model.set_interpolation_mode(
-                        True, sigma=sigma, sigma_v=pipeline_args.interp_sigma_v
-                    )
-                    print(f"Enabled interpolation mode at iter {i}: "
-                          f"sigma={sigma:.6f}, sigma_v={pipeline_args.interp_sigma_v}")
 
                 if i == optimizer_args.freeze_points:
                     model.update_triangulation(incremental=False)
