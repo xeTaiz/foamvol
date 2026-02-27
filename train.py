@@ -18,13 +18,13 @@ from torch.utils.tensorboard import SummaryWriter
 from data_loader import DataHandler
 from configs import *
 from radfoam_model.scene import CTScene
-from voxelize import voxelize
 from visualize_volume import visualize
 from vis_foam import (load_density_field, field_from_model, query_density,
                       sample_idw, sample_idw_diagnostic,
                       visualize_idw_diagnostics, supersample_slice,
                       make_slice_coords, compute_cell_density_slice,
-                      visualize_slices, load_gt_volume, sample_gt_slice)
+                      visualize_slices, load_gt_volume, sample_gt_slice,
+                      voxelize_volumes)
 import radfoam
 
 
@@ -73,6 +73,88 @@ def compute_ssim(pred, gt, window_size=11):
         (mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2)
     )
     return ssim_map.mean().item()
+
+
+@torch.no_grad()
+def compute_volume_psnr(pred, gt):
+    """3D PSNR matching R2-Gaussian: 10*log10(pixel_max^2 / MSE).
+
+    Uses gt.max() as pixel_max (R2 default when pixel_max=None).
+    """
+    if isinstance(pred, np.ndarray):
+        pred = torch.from_numpy(pred)
+    if isinstance(gt, np.ndarray):
+        gt = torch.from_numpy(gt)
+    pred, gt = pred.float(), gt.float()
+    pixel_max = gt.max()
+    mse = torch.mean((pred - gt) ** 2)
+    if mse == 0:
+        return float("inf")
+    return (10 * torch.log10(pixel_max ** 2 / mse)).item()
+
+
+@torch.no_grad()
+def compute_volume_ssim(pred, gt, window_size=11):
+    """3D SSIM matching R2-Gaussian: slice-by-slice 2D SSIM averaged over 3 axes.
+
+    Skips slices where gt.max() <= 0.
+
+    Returns:
+        (mean_ssim, [ssim_x, ssim_y, ssim_z])
+    """
+    if isinstance(pred, np.ndarray):
+        pred = torch.from_numpy(pred)
+    if isinstance(gt, np.ndarray):
+        gt = torch.from_numpy(gt)
+    pred, gt = pred.float(), gt.float()
+
+    sigma = 1.5
+    coords = torch.arange(window_size, dtype=torch.float32, device=pred.device) - window_size // 2
+    gauss = torch.exp(-coords ** 2 / (2 * sigma ** 2))
+    gauss = gauss / gauss.sum()
+    kernel = (gauss[:, None] * gauss[None, :]).unsqueeze(0).unsqueeze(0)
+    if pred.is_cuda:
+        kernel = kernel.cuda()
+
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+    pad = window_size // 2
+
+    axis_ssims = []
+    for axis in range(3):
+        n_slices = pred.shape[axis]
+        ssim_sum = 0.0
+        count = 0
+        for i in range(n_slices):
+            if axis == 0:
+                s_pred, s_gt = pred[i, :, :], gt[i, :, :]
+            elif axis == 1:
+                s_pred, s_gt = pred[:, i, :], gt[:, i, :]
+            else:
+                s_pred, s_gt = pred[:, :, i], gt[:, :, i]
+
+            if s_gt.max() <= 0:
+                continue
+
+            img1 = s_pred.unsqueeze(0).unsqueeze(0)
+            img2 = s_gt.unsqueeze(0).unsqueeze(0)
+
+            mu1 = F.conv2d(img1, kernel, padding=pad)
+            mu2 = F.conv2d(img2, kernel, padding=pad)
+
+            sigma1_sq = F.conv2d(img1 ** 2, kernel, padding=pad) - mu1 ** 2
+            sigma2_sq = F.conv2d(img2 ** 2, kernel, padding=pad) - mu2 ** 2
+            sigma12 = F.conv2d(img1 * img2, kernel, padding=pad) - mu1 * mu2
+
+            ssim_map = ((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) / (
+                (mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2)
+            )
+            ssim_sum += ssim_map.mean().item()
+            count += 1
+
+        axis_ssims.append(ssim_sum / count if count > 0 else 0.0)
+
+    return float(np.mean(axis_ssims)), axis_ssims
 
 
 def log_diagnostics(model, writer, step):
@@ -279,6 +361,13 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     log_diagnostics(model, writer, i)
                     with torch.no_grad():
                         field = field_from_model(model)
+                        _, cell_radius = radfoam.farthest_neighbor(
+                            model.primal_points,
+                            model.point_adjacency,
+                            model.point_adjacency_offsets,
+                        )
+                        sigma = pipeline_args.interp_sigma_scale * cell_radius.median().item()
+                        sigma_v = pipeline_args.interp_sigma_v
                         axes = [0, 1, 2]
                         slice_coords = [-0.2, 0.0, 0.2]
                         d_slices = []
@@ -289,7 +378,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                             for c in slice_coords:
                                 d_slices.append(supersample_slice(query_density, field, a, c, 256, 1.0, ss=2))
                                 idw_slices.append(supersample_slice(sample_idw, field, a, c, 256, 1.0, ss=2,
-                                                                    sigma=pipeline_args.idw_sigma_s, sigma_v=pipeline_args.idw_sigma_v))
+                                                                    sigma=sigma, sigma_v=sigma_v))
                                 cd_slices.append(
                                     compute_cell_density_slice(field["points"], a, c, 64, 1.0)
                                 )
@@ -309,7 +398,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         # IDW diagnostic for a single Z=0 slice
                         diag_coords = make_slice_coords(axis=2, coord=0.0, resolution=256, extent=1.0)
                         diag = sample_idw_diagnostic(field, diag_coords,
-                                                     sigma=pipeline_args.idw_sigma_s, sigma_v=pipeline_args.idw_sigma_v)
+                                                     sigma=sigma, sigma_v=sigma_v)
                         diag_writer = partial(writer.add_figure, f"idw_diagnostics/{experiment_name}", global_step=i)
                         visualize_idw_diagnostics(diag, writer_fn=diag_writer)
                         n_holes = (diag["diff"] > 0.05).sum()
@@ -427,6 +516,16 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
         model_path = f"{out_dir}/model.pt"
 
+        # Compute interp sigma from live model for Python-side IDW
+        with torch.no_grad():
+            _, cell_radius = radfoam.farthest_neighbor(
+                model.primal_points,
+                model.point_adjacency,
+                model.point_adjacency_offsets,
+            )
+            interp_sigma = pipeline_args.interp_sigma_scale * cell_radius.median().item()
+            interp_sigma_v = pipeline_args.interp_sigma_v
+
         # Direct slice evaluation (no full volume needed)
         field = load_density_field(model_path)
         axes = [0, 1, 2]
@@ -439,7 +538,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
             for c in coords:
                 density_slices.append(supersample_slice(query_density, field, a, c, 256, 1.0, ss=2))
                 idw_slices.append(supersample_slice(sample_idw, field, a, c, 256, 1.0, ss=2,
-                                                    sigma=pipeline_args.idw_sigma_s, sigma_v=pipeline_args.idw_sigma_v))
+                                                    sigma=interp_sigma, sigma_v=interp_sigma_v))
                 cell_density_slices.append(
                     compute_cell_density_slice(field["points"], a, c, 64, 1.0)
                 )
@@ -464,15 +563,55 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         # Final IDW diagnostics
         diag_coords = make_slice_coords(axis=2, coord=0.0, resolution=256, extent=1.0)
         diag = sample_idw_diagnostic(field, diag_coords,
-                                     sigma=pipeline_args.idw_sigma_s, sigma_v=pipeline_args.idw_sigma_v)
+                                     sigma=interp_sigma, sigma_v=interp_sigma_v)
         diag_writer = partial(writer.add_figure, f"idw_diagnostics/{experiment_name}", global_step=pipeline_args.iterations)
         visualize_idw_diagnostics(diag, writer_fn=diag_writer,
                                   out_path=f"{out_dir}/idw_diagnostics.jpg")
 
-        # Optionally save full volume
-        if pipeline_args.save_volume:
-            volume_path = f"{out_dir}/volume.npy"
-            voxelize(model_path, resolution=256, output_path=volume_path, extent=1.0)
+        # 3D volume metrics (matching R2-Gaussian evaluation)
+        if gt_volume is not None:
+            vol_res = gt_volume.shape[0]
+            print(f"Voxelizing at {vol_res}³ for 3D volume metrics...")
+            raw_vol, idw_vol = voxelize_volumes(
+                field, resolution=vol_res, extent=1.0,
+                sigma=interp_sigma,
+                sigma_v=interp_sigma_v,
+            )
+
+            vol_gt_t = torch.from_numpy(gt_volume).float().cuda()
+            raw_vol_t = torch.from_numpy(raw_vol).float().cuda()
+            idw_vol_t = torch.from_numpy(idw_vol).float().cuda()
+
+            raw_psnr_3d = compute_volume_psnr(raw_vol_t, vol_gt_t)
+            raw_ssim_3d, raw_ssim_ax = compute_volume_ssim(raw_vol_t, vol_gt_t)
+            idw_psnr_3d = compute_volume_psnr(idw_vol_t, vol_gt_t)
+            idw_ssim_3d, idw_ssim_ax = compute_volume_ssim(idw_vol_t, vol_gt_t)
+
+            print(f"Vol Raw  PSNR: {raw_psnr_3d:.4f}, SSIM: {raw_ssim_3d:.6f}")
+            print(f"Vol IDW  PSNR: {idw_psnr_3d:.4f}, SSIM: {idw_ssim_3d:.6f}")
+
+            iters = pipeline_args.iterations
+            writer.add_scalar("test/vol_raw_psnr", raw_psnr_3d, iters)
+            writer.add_scalar("test/vol_raw_ssim", raw_ssim_3d, iters)
+            writer.add_scalar("test/vol_idw_psnr", idw_psnr_3d, iters)
+            writer.add_scalar("test/vol_idw_ssim", idw_ssim_3d, iters)
+            for ax_i, ax_name in enumerate(["x", "y", "z"]):
+                writer.add_scalar(f"test/vol_raw_ssim_{ax_name}", raw_ssim_ax[ax_i], iters)
+                writer.add_scalar(f"test/vol_idw_ssim_{ax_name}", idw_ssim_ax[ax_i], iters)
+
+            with open(f"{out_dir}/metrics.txt", "a") as f:
+                f.write(f"Vol Raw PSNR: {raw_psnr_3d:.4f}\n")
+                f.write(f"Vol Raw SSIM: {raw_ssim_3d:.6f}\n")
+                f.write(f"Vol IDW PSNR: {idw_psnr_3d:.4f}\n")
+                f.write(f"Vol IDW SSIM: {idw_ssim_3d:.6f}\n")
+                for ax_i, ax_name in enumerate(["X", "Y", "Z"]):
+                    f.write(f"Vol Raw SSIM_{ax_name}: {raw_ssim_ax[ax_i]:.6f}\n")
+                    f.write(f"Vol IDW SSIM_{ax_name}: {idw_ssim_ax[ax_i]:.6f}\n")
+
+            if pipeline_args.save_volume:
+                np.save(f"{out_dir}/volume_raw.npy", raw_vol)
+                np.save(f"{out_dir}/volume_idw.npy", idw_vol)
+                print(f"Saved volumes to {out_dir}/volume_raw.npy, volume_idw.npy")
 
         writer.close()
 
