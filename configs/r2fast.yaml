@@ -1,7 +1,7 @@
 # Pipeline (iterations /10, schedule params /10)
 iterations: 10000
 densify_from: 1000
-densify_until: 5500
+densify_until: 6000
 densify_factor: 1.15
 contrast_fraction: 0.5
 contrast_power: 0.1
@@ -9,8 +9,8 @@ loss_type: l2
 debug: False
 viewer: False
 save_volume: False
-interpolation_start: 7500
-interp_sigma_scale: 0.55
+interpolation_start: 9000
+interp_sigma_scale: 0.5
 interp_sigma_v: 0.2
 
 
@@ -27,9 +27,9 @@ points_lr_init: 2e-4
 points_lr_final: 1e-6
 density_lr_init: 1e-1
 density_lr_final: 5e-3
-freeze_points: 8500
-tv_weight: 1e-4
-tv_start: 4000
+freeze_points: 8800
+tv_weight: 1e-5
+tv_start: -1
 tv_epsilon: 1e-4
 tv_area_weighted: False
 gradient_start: -1
