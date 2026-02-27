@@ -16,3 +16,4 @@ __pycache__
 src/radfoam/*.so
 **/*.npy
 *.jpg
+*.sif
