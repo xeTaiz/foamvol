@@ -114,7 +114,10 @@ py::object trace_forward(Pipeline &self,
                          py::object max_intersections,
                          bool return_contribution,
                          std::optional<torch::Tensor> density_grad_in,
-                         float gradient_max_slope) {
+                         float gradient_max_slope,
+                         bool interpolation_mode,
+                         float idw_sigma,
+                         float idw_sigma_v) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -165,6 +168,9 @@ py::object trace_forward(Pipeline &self,
         settings.max_intersections = max_intersections.cast<uint32_t>();
     }
     settings.gradient_max_slope = gradient_max_slope;
+    settings.interpolation_mode = interpolation_mode;
+    settings.idw_sigma = idw_sigma;
+    settings.idw_sigma_v = idw_sigma_v;
 
     std::vector<int64_t> output_shape;
     for (int i = 0; i < rays.dim() - 1; i++) {
@@ -236,7 +242,10 @@ py::object trace_backward(Pipeline &self,
                           std::optional<torch::Tensor> ray_error_in,
                           py::object max_intersections,
                           std::optional<torch::Tensor> density_grad_in,
-                          float gradient_max_slope) {
+                          float gradient_max_slope,
+                          bool interpolation_mode,
+                          float idw_sigma,
+                          float idw_sigma_v) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -325,6 +334,9 @@ py::object trace_backward(Pipeline &self,
         settings.max_intersections = max_intersections.cast<uint32_t>();
     }
     settings.gradient_max_slope = gradient_max_slope;
+    settings.interpolation_mode = interpolation_mode;
+    settings.idw_sigma = idw_sigma;
+    settings.idw_sigma_v = idw_sigma_v;
 
     int64_t num_attr = attributes.size(0);
 
@@ -444,7 +456,10 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("max_intersections") = py::none(),
              py::arg("return_contribution") = false,
              py::arg("density_grad") = py::none(),
-             py::arg("gradient_max_slope") = 5.0f)
+             py::arg("gradient_max_slope") = 5.0f,
+             py::arg("interpolation_mode") = false,
+             py::arg("idw_sigma") = 0.01f,
+             py::arg("idw_sigma_v") = 0.1f)
         .def("trace_backward",
              trace_backward,
              py::arg("points"),
@@ -457,7 +472,10 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("ray_error") = py::none(),
              py::arg("max_intersections") = py::none(),
              py::arg("density_grad") = py::none(),
-             py::arg("gradient_max_slope") = 5.0f);
+             py::arg("gradient_max_slope") = 5.0f,
+             py::arg("interpolation_mode") = false,
+             py::arg("idw_sigma") = 0.01f,
+             py::arg("idw_sigma_v") = 0.1f);
 
     module.def("create_ct_pipeline", create_ct_pipeline_binding);
 

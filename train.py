@@ -372,9 +372,25 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 ):
                     model.initialize_gradients(optimizer_args)
 
+                if (
+                    pipeline_args.interpolation_start >= 0
+                    and i == pipeline_args.interpolation_start
+                ):
+                    _, cell_radius = radfoam.farthest_neighbor(
+                        model.primal_points,
+                        model.point_adjacency,
+                        model.point_adjacency_offsets,
+                    )
+                    sigma = pipeline_args.interp_sigma_scale * cell_radius.median().item()
+                    model.set_interpolation_mode(
+                        True, sigma=sigma, sigma_v=pipeline_args.interp_sigma_v
+                    )
+                    print(f"Enabled interpolation mode at iter {i}: "
+                          f"sigma={sigma:.6f}, sigma_v={pipeline_args.interp_sigma_v}")
+
                 if i == optimizer_args.freeze_points:
                     model.update_triangulation(incremental=False)
-                    model.prune_only(train_data_handler)
+                    #model.prune_only(train_data_handler)
 
                 if viewer is not None and viewer.is_closed():
                     break
