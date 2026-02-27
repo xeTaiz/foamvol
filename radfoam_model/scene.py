@@ -531,7 +531,7 @@ class CTScene(torch.nn.Module):
 
             ######################## Pruning ########################
             low_contrib = point_contribution.squeeze() < 1e-2
-            tiny_radius = cell_radius < 1e-3
+            tiny_radius = cell_radius < 5e-3
             prune_mask = low_contrib | tiny_radius
             n_pruned_low_contrib = (low_contrib & ~tiny_radius).sum().item()
             n_pruned_tiny_radius = (tiny_radius & ~low_contrib).sum().item()
