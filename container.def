@@ -1,0 +1,27 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
+
+%post
+    apt-get update && apt-get install -y --no-install-recommends \
+        libglfw3-dev \
+        libdl-dev \
+        && rm -rf /var/lib/apt/lists/*
+
+    # Copy and install Python dependencies
+    pip install --no-cache-dir -r /opt/radfoam/requirements.txt
+
+    # Build and install radfoam in editable mode
+    cd /opt/radfoam && \
+        CUDACXX=/usr/local/cuda/bin/nvcc CUDA_HOME=/usr/local/cuda \
+        pip install --no-cache-dir -e .
+
+%files
+    . /opt/radfoam
+
+%environment
+    export CUDACXX=/usr/local/cuda/bin/nvcc
+    export CUDA_HOME=/usr/local/cuda
+
+%runscript
+    cd /opt/radfoam
+    exec python "$@"
