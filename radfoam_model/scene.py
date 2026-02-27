@@ -487,7 +487,7 @@ class CTScene(torch.nn.Module):
 
     def prune_and_densify(
         self, point_error, point_contribution, upsample_factor=1.2,
-        contrast_fraction=0.5, contrast_power=0.5,
+        contrast_fraction=0.5,
         redundancy_threshold=0.0, redundancy_cap=0.0,
         sigma_scale=0.5, sigma_v=0.1,
     ):
@@ -507,7 +507,7 @@ class CTScene(torch.nn.Module):
             )
             farthest_neighbor = farthest_neighbor.long()
 
-            ################### Edge contrast ###################
+            ################### Edge weights ###################
             activated = self.get_primal_density().squeeze()  # [N]
             offsets = point_adjacency_offsets.long()
             adj = point_adjacency.long()
@@ -522,14 +522,12 @@ class CTScene(torch.nn.Module):
             src = source[edge_mask]
             tgt = adj[edge_mask]
 
-            # Per-edge properties
-            edge_contrast = (activated[src] - activated[tgt]).abs()
             edge_vec = points[src] - points[tgt]
             edge_length = edge_vec.norm(dim=-1)
 
-            # Sampling weight
-            contrast_weight = edge_contrast.pow(contrast_power) * edge_length
-            contrast_weight[edge_length < 1e-3] = 0.0
+            # Per-cell bilateral prediction error as interface score
+            cell_error = self.compute_redundancy_error(cell_radius, sigma_scale, sigma_v)
+            contrast_weight = (cell_error[src] + cell_error[tgt]) * edge_length
 
             ######################## Pruning ########################
             low_contrib = point_contribution.squeeze() < 1e-2
@@ -549,15 +547,14 @@ class CTScene(torch.nn.Module):
 
             ################ Redundancy pruning ################
             if redundancy_cap > 0:
-                error = self.compute_redundancy_error(cell_radius, sigma_scale, sigma_v)
                 density_scale = torch.quantile(activated, 0.95).item()
-                candidates = error < redundancy_threshold * density_scale
+                candidates = cell_error < redundancy_threshold * density_scale
                 # Don't re-mark cells already pruned
                 candidates = candidates & ~prune_mask
 
                 if candidates.sum() > 0:
                     # Independent set: error-based priority (most redundant neighbor wins)
-                    priorities = error.clone()
+                    priorities = cell_error.clone()
                     priorities[~candidates] = float('inf')
                     neighbor_min = torch.full(
                         (num_curr_points,), float('inf'), device=points.device
@@ -568,7 +565,7 @@ class CTScene(torch.nn.Module):
                     max_remove = int(redundancy_cap * num_curr_points)
                     n_removable = removable.sum().item()
                     if n_removable > max_remove:
-                        err_vals = error.clone()
+                        err_vals = cell_error.clone()
                         err_vals[~removable] = float('inf')
                         _, topk = err_vals.topk(max_remove, largest=False)
                         removable = torch.zeros_like(removable)

@@ -46,7 +46,6 @@ class PipelineParams(ParamGroup):
         self.densify_until = 11_000
         self.densify_factor = 1.15
         self.contrast_fraction = 0.5
-        self.contrast_power = 0.5
         self.loss_type = "l2"
         self.experiment_name = ""
         self.debug = False
