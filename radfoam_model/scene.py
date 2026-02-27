@@ -229,6 +229,38 @@ class CTScene(torch.nn.Module):
 
         return edge_loss.mean()
 
+    @torch.no_grad()
+    def compute_redundancy_error(self, cell_radius, sigma_scale, sigma_v):
+        """Per-cell leave-one-out IDW error: |density_i - interp_from_neighbors|."""
+        activated = self.get_primal_density().squeeze()  # (N,)
+        points = self.primal_points                       # (N, 3)
+        offsets = self.point_adjacency_offsets.long()
+        adj = self.point_adjacency.long()
+        N = points.shape[0]
+
+        sigma = sigma_scale * cell_radius.median().item()
+        sigma_sq = sigma ** 2
+
+        counts = offsets[1:] - offsets[:-1]
+        source = torch.repeat_interleave(
+            torch.arange(N, device=points.device), counts
+        )
+
+        # Gaussian spatial weight
+        d_sq = (points[adj] - points[source]).pow(2).sum(dim=-1)
+        # Bilateral weight (density similarity)
+        bilateral = (activated[source] - activated[adj]).abs()
+        w = torch.exp(-d_sq / sigma_sq - bilateral / sigma_v)
+
+        # Per-cell weighted sum
+        w_sum = torch.zeros(N, device=points.device).scatter_add_(0, source, w)
+        w_mu_sum = torch.zeros(N, device=points.device).scatter_add_(
+            0, source, w * activated[adj]
+        )
+
+        interp = w_mu_sum / w_sum.clamp(min=1e-8)
+        return (activated - interp).abs()
+
     def set_interpolation_mode(self, enabled, sigma=None, sigma_v=None):
         self._interpolation_mode = enabled
         if sigma is not None:
@@ -456,6 +488,8 @@ class CTScene(torch.nn.Module):
     def prune_and_densify(
         self, point_error, point_contribution, upsample_factor=1.2,
         contrast_fraction=0.5, contrast_power=0.5,
+        redundancy_threshold=0.0, redundancy_cap=0.0,
+        sigma_scale=0.5, sigma_v=0.1,
     ):
         with torch.no_grad():
             num_curr_points = self.primal_points.shape[0]
@@ -498,10 +532,54 @@ class CTScene(torch.nn.Module):
             contrast_weight[edge_length < 1e-3] = 0.0
 
             ######################## Pruning ########################
-            prune_mask = torch.logical_or(point_contribution.squeeze() < 1e-2, cell_radius < 2e-3)
-            n_pruned = prune_mask.sum().item()
-            if n_pruned > 0:
-                print(f"Pruning {n_pruned}/{num_curr_points} cells (contribution < 1e-2)")
+            low_contrib = point_contribution.squeeze() < 1e-2
+            tiny_radius = cell_radius < 1e-3
+            prune_mask = low_contrib | tiny_radius
+            n_pruned_low_contrib = (low_contrib & ~tiny_radius).sum().item()
+            n_pruned_tiny_radius = (tiny_radius & ~low_contrib).sum().item()
+            n_pruned_both = (low_contrib & tiny_radius).sum().item()
+            n_redundant = 0
+            n_added_gradient = 0
+            n_added_contrast = 0
+            n_filtered_dupes = 0
+            n_basic_pruned = prune_mask.sum().item()
+            if n_basic_pruned > 0:
+                print(f"Pruning {n_basic_pruned}/{num_curr_points} cells "
+                      f"(low_contrib={n_pruned_low_contrib}, tiny_radius={n_pruned_tiny_radius}, both={n_pruned_both})")
+
+            ################ Redundancy pruning ################
+            if redundancy_cap > 0:
+                error = self.compute_redundancy_error(cell_radius, sigma_scale, sigma_v)
+                density_scale = torch.quantile(activated, 0.95).item()
+                candidates = error < redundancy_threshold * density_scale
+                # Don't re-mark cells already pruned
+                candidates = candidates & ~prune_mask
+
+                if candidates.sum() > 0:
+                    # Independent set: error-based priority (most redundant neighbor wins)
+                    priorities = error.clone()
+                    priorities[~candidates] = float('inf')
+                    neighbor_min = torch.full(
+                        (num_curr_points,), float('inf'), device=points.device
+                    ).scatter_reduce_(0, source, priorities[adj], reduce='amin')
+                    removable = candidates & (priorities < neighbor_min)
+
+                    # Cap: at most redundancy_cap fraction of total cells
+                    max_remove = int(redundancy_cap * num_curr_points)
+                    n_removable = removable.sum().item()
+                    if n_removable > max_remove:
+                        err_vals = error.clone()
+                        err_vals[~removable] = float('inf')
+                        _, topk = err_vals.topk(max_remove, largest=False)
+                        removable = torch.zeros_like(removable)
+                        removable[topk] = True
+
+                    n_redundant_here = removable.sum().item()
+                    if n_redundant_here > 0:
+                        n_redundant = n_redundant_here
+                        print(f"Redundancy prune: {n_redundant}/{num_curr_points} cells "
+                              f"(threshold={redundancy_threshold * density_scale:.4f})")
+                        prune_mask = prune_mask | removable
 
             ######################## Sampling ########################
             perturbation = 0.25 * (points[farthest_neighbor] - points)
@@ -533,6 +611,7 @@ class CTScene(torch.nn.Module):
                 sampled_density_list.append(self.density[grad_inds])
                 if has_density_grad:
                     sampled_density_grad_list.append(self.density_grad[grad_inds])
+                n_added_gradient += num_gradient_points
 
             # --- Contrast-based sampling (edge-based strategy) ---
             if num_contrast_points > 0:
@@ -550,11 +629,13 @@ class CTScene(torch.nn.Module):
                         sampled_density_list.append(self.density[extra_inds])
                         if has_density_grad:
                             sampled_density_grad_list.append(self.density_grad[extra_inds])
+                        n_added_gradient += num_contrast_points
                 else:
                     n_sample = min(num_contrast_points, num_viable)
                     edge_inds = torch.multinomial(
                         contrast_weight, n_sample, replacement=False,
                     )
+                    n_added_contrast += n_sample
                     # Radius-ratio placement: bias towards the larger cell
                     p_a = points[src[edge_inds]]
                     p_b = points[tgt[edge_inds]]
@@ -590,9 +671,9 @@ class CTScene(torch.nn.Module):
             min_sep = 0.05 * cell_radius[sampled_inds].squeeze()
             keep_mask = nn_dists > min_sep
 
-            if not keep_mask.all():
-                n_filtered = (~keep_mask).sum().item()
-                print(f"Filtered {n_filtered}/{sampled_points.shape[0]} new points (too close to existing)")
+            n_filtered_dupes = (~keep_mask).sum().item()
+            if n_filtered_dupes > 0:
+                print(f"Filtered {n_filtered_dupes}/{sampled_points.shape[0]} new points (too close to existing)")
                 sampled_points = sampled_points[keep_mask]
                 sampled_inds = sampled_inds[keep_mask]
                 sampled_density = sampled_density[keep_mask]
@@ -619,6 +700,18 @@ class CTScene(torch.nn.Module):
 
             self.densification_postfix(new_params)
             self.prune_points(prune_mask)
+
+            return {
+                "points_before": num_curr_points,
+                "pruned_low_contrib": n_pruned_low_contrib,
+                "pruned_tiny_radius": n_pruned_tiny_radius,
+                "pruned_both": n_pruned_both,
+                "pruned_redundancy": n_redundant,
+                "added_gradient": n_added_gradient,
+                "added_contrast": n_added_contrast,
+                "filtered_duplicates": n_filtered_dupes,
+                "points_after": self.primal_points.shape[0],
+            }
 
     def prune_only(self, data_handler):
         """Standalone prune pass: remove cells with negligible contribution or tiny radius."""

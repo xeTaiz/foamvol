@@ -55,6 +55,8 @@ class PipelineParams(ParamGroup):
         self.interpolation_start = -1
         self.interp_sigma_scale = 0.5
         self.interp_sigma_v = 0.1
+        self.redundancy_threshold = 0.01   # relative to max activated density
+        self.redundancy_cap = 0.05         # max fraction of cells removed per step
         super().__init__(parser, "Setting Pipeline parameters")
 
 

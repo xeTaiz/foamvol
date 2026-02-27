@@ -12,6 +12,8 @@ save_volume: False
 interpolation_start: 9000
 interp_sigma_scale: 0.55
 interp_sigma_v: 0.2
+redundancy_threshold: 0.01
+redundancy_cap: 0.05
 
 
 # Model

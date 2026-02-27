@@ -447,13 +447,21 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     point_error, point_contribution = model.collect_error_map(
                         train_data_handler
                     )
-                    model.prune_and_densify(
+                    densify_stats = model.prune_and_densify(
                         point_error,
                         point_contribution,
                         pipeline_args.densify_factor,
                         pipeline_args.contrast_fraction,
                         pipeline_args.contrast_power,
+                        redundancy_threshold=pipeline_args.redundancy_threshold,
+                        redundancy_cap=pipeline_args.redundancy_cap,
+                        sigma_scale=pipeline_args.interp_sigma_scale,
+                        sigma_v=pipeline_args.interp_sigma_v,
                     )
+
+                    if not pipeline_args.debug and densify_stats is not None:
+                        for key, val in densify_stats.items():
+                            writer.add_scalar(f"densify/{key}", val, i)
 
                     model.update_triangulation(incremental=False)
                     triangulation_update_period = 1
@@ -478,7 +486,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                 if i == pipeline_args.densify_until:
                     model.update_triangulation(incremental=False)
-                    model.prune_only(train_data_handler)
+                    n_standalone_pruned = model.prune_only(train_data_handler)
+                    if not pipeline_args.debug:
+                        writer.add_scalar("densify/standalone_pruned", n_standalone_pruned, i)
+                        writer.add_scalar("densify/points_after", model.primal_points.shape[0], i)
 
                     if pipeline_args.interpolation_start >= 0:
                         _, cell_radius = radfoam.farthest_neighbor(
