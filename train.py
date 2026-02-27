@@ -187,6 +187,9 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     def train_loop(viewer):
         print("Training")
 
+        log_interval = max(1, pipeline_args.iterations // 200)    # 0.5%
+        diag_interval = max(1, pipeline_args.iterations // 20)    # 5%
+
         torch.cuda.synchronize()
 
         data_iterator = train_data_handler.get_iter()
@@ -231,7 +234,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                 train.set_postfix(loss=f"{loss.item():.5f}")
 
-                if i % 100 == 99 and not pipeline_args.debug:
+                if i % log_interval == log_interval - 1 and not pipeline_args.debug:
                     writer.add_scalar("train/loss", loss.item(), i)
                     if optimizer_args.tv_weight > 0 and i >= optimizer_args.tv_start:
                         writer.add_scalar("train/tv_loss", tv_loss.item(), i)
@@ -272,7 +275,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                             i,
                         )
 
-                if i % 1000 == 999 and not pipeline_args.debug:
+                if i % diag_interval == diag_interval - 1 and not pipeline_args.debug:
                     log_diagnostics(model, writer, i)
                     with torch.no_grad():
                         field = field_from_model(model)
