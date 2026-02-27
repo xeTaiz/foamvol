@@ -225,16 +225,45 @@ def load_phase1_summary():
 # ---------------------------------------------------------------------------
 
 
-def phase1():
-    """Run all 25 one-at-a-time screening experiments."""
-    names = list(PHASE1_RUNS.keys())
-    print(f"Phase 1: {len(names)} runs")
+def filter_runs(names, runs=None, axes=None):
+    """Filter run names by explicit IDs and/or axis letters."""
+    if runs is None and axes is None:
+        return names
+    selected = set()
+    if runs:
+        for r in runs:
+            if r in PHASE1_RUNS:
+                selected.add(r)
+            else:
+                print(f"[WARN] Unknown run ID: {r}")
+    if axes:
+        for name in names:
+            axis = AXIS_MAP.get(name, "")
+            if axis in axes or name in axes:
+                selected.add(name)
+    # Preserve original order
+    return [n for n in names if n in selected]
 
-    for name in names:
-        cfg = build_config(PHASE1_RUNS[name])
-        run_experiment(name, cfg)
 
-    return collect_summary(names, os.path.join(SWEEP_DIR, "summary_phase1.csv"))
+def phase1(runs=None, axes=None, summarize=False):
+    """Run one-at-a-time screening experiments.
+
+    Args:
+        runs: Optional list of specific run IDs to execute.
+        axes: Optional list of axis letters (A/B/C/D) or 'baseline'.
+        summarize: If True, only collect summary from existing results.
+    """
+    all_names = list(PHASE1_RUNS.keys())
+    names = filter_runs(all_names, runs, axes)
+    print(f"Phase 1: {len(names)}/{len(all_names)} runs selected")
+
+    if not summarize:
+        for name in names:
+            cfg = build_config(PHASE1_RUNS[name])
+            run_experiment(name, cfg)
+
+    # Summary always covers all available results
+    return collect_summary(all_names, os.path.join(SWEEP_DIR, "summary_phase1.csv"))
 
 
 # ---------------------------------------------------------------------------
@@ -356,15 +385,30 @@ def phase2():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CT reconstruction hyperparameter sweep (sweep 8)")
+    parser = argparse.ArgumentParser(
+        description="CT reconstruction hyperparameter sweep (sweep 8)",
+        epilog="Examples:\n"
+               "  python sweep.py --phase 1                    # all 25 runs\n"
+               "  python sweep.py --phase 1 --axis A B         # axes A+B (9 runs)\n"
+               "  python sweep.py --phase 1 --axis C D baseline  # axes C+D + baseline\n"
+               "  python sweep.py --phase 1 --runs A1-dli5e2 A2-dli2e1  # specific runs\n"
+               "  python sweep.py --phase 1 --summarize        # just collect results\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--phase", type=int, default=1, choices=[1, 2],
                         help="1 = one-at-a-time screening, 2 = combine winners")
+    parser.add_argument("--axis", nargs="+", metavar="X",
+                        help="Phase 1: only run these axes (A/B/C/D/baseline)")
+    parser.add_argument("--runs", nargs="+", metavar="ID",
+                        help="Phase 1: only run these specific run IDs")
+    parser.add_argument("--summarize", action="store_true",
+                        help="Skip training, just collect existing results into summary CSV")
     args = parser.parse_args()
 
     os.makedirs(SWEEP_DIR, exist_ok=True)
 
     if args.phase == 1:
-        phase1()
+        phase1(runs=args.runs, axes=args.axis, summarize=args.summarize)
     elif args.phase == 2:
         phase2()
 
