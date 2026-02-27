@@ -257,6 +257,8 @@ def voxelize(model_path, resolution, output_path, extent=None, blur_sigma=0.0,
     except ImportError:
         pass
 
+    return volume_np
+
 
 def main():
     parser = argparse.ArgumentParser(description="Voxelize a CT reconstruction")
