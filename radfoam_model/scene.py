@@ -498,7 +498,7 @@ class CTScene(torch.nn.Module):
             contrast_weight[edge_length < 1e-3] = 0.0
 
             ######################## Pruning ########################
-            prune_mask = torch.logical_or(point_contribution.squeeze() < 1e-2, cell_radius < 1e-2)
+            prune_mask = torch.logical_or(point_contribution.squeeze() < 1e-2, cell_radius < 2e-3)
             n_pruned = prune_mask.sum().item()
             if n_pruned > 0:
                 print(f"Pruning {n_pruned}/{num_curr_points} cells (contribution < 1e-2)")

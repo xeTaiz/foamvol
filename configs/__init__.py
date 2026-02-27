@@ -52,8 +52,6 @@ class PipelineParams(ParamGroup):
         self.debug = False
         self.viewer = False
         self.save_volume = False
-        self.idw_sigma_s = 0.01
-        self.idw_sigma_v = 0.1
         self.interpolation_start = -1
         self.interp_sigma_scale = 0.5
         self.interp_sigma_v = 0.1

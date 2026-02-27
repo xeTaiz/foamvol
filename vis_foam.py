@@ -167,12 +167,12 @@ def sample_idw(field, coordinates, sigma=0.01, sigma_v=None):
         pad_idx[:, 1:] = adj[flat_offsets]
         valid[:, 1:] = has_k
 
-        # Compute distances from query to each candidate center
+        # Gaussian spatial weights (matches CUDA kernel: exp(-d²/σ²))
         centers = points[pad_idx]  # (B, max_k+1, 3)
-        dist = (query.unsqueeze(1) - centers).norm(dim=-1)  # (B, max_k+1)
-
-        # Weights: exp(-dist/sigma)
-        w = torch.exp(-dist / sigma)
+        diff = query.unsqueeze(1) - centers  # (B, max_k+1, 3)
+        dist_sq = diff.pow(2).sum(dim=-1)  # (B, max_k+1)
+        sigma_sq = sigma * sigma
+        w = torch.exp(-dist_sq / sigma_sq)
 
         # Bilateral value-similarity weighting
         vals = activated[pad_idx]  # (B, max_k+1)
@@ -182,7 +182,7 @@ def sample_idw(field, coordinates, sigma=0.01, sigma_v=None):
             w = w * torch.exp(-val_diff / sigma_v)
 
         w[~valid] = 0.0
-        weights = w / w.sum(dim=1, keepdim=True)  # (B, max_k+1)
+        weights = w / w.sum(dim=1, keepdim=True).clamp(min=1e-7)
 
         # Weighted sum of activated densities
         vals[~valid] = 0.0
@@ -254,12 +254,13 @@ def sample_idw_diagnostic(field, coordinates, sigma=0.001, sigma_v=None):
     pad_idx[:, 1:] = adj[flat_offsets]
     valid[:, 1:] = has_k
 
-    # Compute distances from query to each candidate center
+    # Gaussian spatial weights (matches CUDA kernel: exp(-d²/σ²))
     centers = points[pad_idx]  # (B, max_k+1, 3)
-    dist = (coords_flat.unsqueeze(1) - centers).norm(dim=-1)  # (B, max_k+1)
-
-    # Weights: exp(-dist/sigma)
-    w = torch.exp(-dist / sigma)
+    diff = coords_flat.unsqueeze(1) - centers  # (B, max_k+1, 3)
+    dist_sq = diff.pow(2).sum(dim=-1)  # (B, max_k+1)
+    dist = dist_sq.sqrt()  # needed for max_neighbor_dist diagnostic
+    sigma_sq = sigma * sigma
+    w = torch.exp(-dist_sq / sigma_sq)
 
     # Activated values
     vals = activated[pad_idx]  # (B, max_k+1)
@@ -278,7 +279,7 @@ def sample_idw_diagnostic(field, coordinates, sigma=0.001, sigma_v=None):
         val_weight_map = vw_valid.sum(dim=1) / n_valid  # (B,)
 
     w[~valid] = 0.0
-    weights = w / w.sum(dim=1, keepdim=True)  # (B, max_k+1)
+    weights = w / w.sum(dim=1, keepdim=True).clamp(min=1e-7)
 
     vals[~valid] = 0.0
 
@@ -521,6 +522,97 @@ def load_gt_volume(data_path, dataset_type):
         vol[x ** 2 + y ** 2 + z ** 2 <= 1.0] = 1.0
         return vol
     return None
+
+
+def voxelize_volumes(field, resolution, extent, sigma, sigma_v):
+    """Voxelize the field into two 3D volumes in one pass.
+
+    Raw volume: softplus(density[nearest_cell]) — constant per Voronoi cell.
+    IDW volume: Gaussian bilateral natural-neighbor interpolation matching
+    the CUDA tracing kernel (exp(-d²/σ²) spatial, exp(-|Δμ|/σ_v) bilateral).
+
+    Args:
+        field: dict from load_density_field() or field_from_model()
+        resolution: grid resolution per axis
+        extent: half-extent (grid spans [-extent, extent]^3)
+        sigma: spatial scale for Gaussian weighting
+        sigma_v: bilateral value-similarity scale
+
+    Returns:
+        (raw_volume, idw_volume) — both (resolution, resolution, resolution) numpy arrays
+    """
+    device = field["device"]
+    points = field["points"]
+    density_flat = field["density_flat"]
+    adj = field["adjacency"]
+    adj_off = field["adjacency_offsets"]
+    activated = F.softplus(density_flat, beta=10)
+
+    sigma_sq = sigma * sigma
+
+    lin = torch.linspace(-extent, extent, resolution, device=device)
+    gx, gy, gz = torch.meshgrid(lin, lin, lin, indexing="ij")
+    coords_flat = torch.stack([gx, gy, gz], dim=-1).reshape(-1, 3)
+
+    num_voxels = coords_flat.shape[0]
+    raw_vol = torch.zeros(num_voxels, device=device)
+    idw_vol = torch.zeros(num_voxels, device=device)
+
+    global_max_k = int((adj_off[1:] - adj_off[:-1]).max().item())
+    batch_size = 2_000_000
+
+    for start in range(0, num_voxels, batch_size):
+        end = min(start + batch_size, num_voxels)
+        query = coords_flat[start:end]
+        B = query.shape[0]
+
+        nn_idx = radfoam.nn(points, field["aabb_tree"], query).long()
+
+        # Raw: nearest-neighbor softplus
+        raw_vol[start:end] = activated[nn_idx]
+
+        # Build padded neighbor tensor
+        counts = adj_off[nn_idx + 1] - adj_off[nn_idx]
+        max_k = global_max_k
+        offsets = adj_off[nn_idx]
+
+        pad_idx = torch.zeros(B, max_k + 1, dtype=torch.long, device=device)
+        valid = torch.zeros(B, max_k + 1, dtype=torch.bool, device=device)
+
+        pad_idx[:, 0] = nn_idx
+        valid[:, 0] = True
+
+        k_range = torch.arange(max_k, device=device)
+        has_k = counts.unsqueeze(1) > k_range.unsqueeze(0)
+        flat_offsets = offsets.unsqueeze(1) + k_range.unsqueeze(0)
+        flat_offsets = flat_offsets.clamp(max=adj.shape[0] - 1)
+        pad_idx[:, 1:] = adj[flat_offsets]
+        valid[:, 1:] = has_k
+
+        # Gaussian spatial weights
+        centers = points[pad_idx]
+        diff = query.unsqueeze(1) - centers
+        dist_sq = diff.pow(2).sum(dim=-1)
+        w = torch.exp(-dist_sq / sigma_sq)
+
+        # Bilateral value-similarity weighting
+        vals = activated[pad_idx]
+        if sigma_v is not None:
+            ref_val = activated[nn_idx]
+            val_diff = (vals - ref_val.unsqueeze(1)).abs()
+            w = w * torch.exp(-val_diff / sigma_v)
+
+        w[~valid] = 0.0
+        w_sum = w.sum(dim=1, keepdim=True).clamp(min=1e-7)
+        weights = w / w_sum
+
+        vals[~valid] = 0.0
+        idw_vol[start:end] = torch.nan_to_num((weights * vals).sum(dim=1))
+
+    raw_vol = raw_vol.reshape(resolution, resolution, resolution)
+    idw_vol = idw_vol.reshape(resolution, resolution, resolution)
+
+    return raw_vol.cpu().numpy(), idw_vol.cpu().numpy()
 
 
 def sample_gt_slice(gt_volume, axis, coord, resolution, extent):

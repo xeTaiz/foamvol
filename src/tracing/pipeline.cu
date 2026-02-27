@@ -230,10 +230,28 @@ __global__ void ct_backward(TraceSettings settings,
                          functor);
 }
 
+__global__ void precompute_activated_density(
+    const float *__restrict__ density,
+    float *__restrict__ activated,
+    float *__restrict__ dsigmoid_out,
+    uint32_t num_points) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_points)
+        return;
+    constexpr float sp_beta = 10.0f;
+    float raw = density[i];
+    float e = expf(sp_beta * raw);
+    float mu = (sp_beta * raw > 20.0f) ? raw : logf(1.0f + e) / sp_beta;
+    activated[i] = mu;
+    if (dsigmoid_out) {
+        dsigmoid_out[i] = (sp_beta * raw > 20.0f) ? 1.0f : e / (1.0f + e);
+    }
+}
+
 template <int block_size>
 __global__ void ct_interp_forward(TraceSettings settings,
                                    const Vec3f *__restrict__ points,
-                                   const float *__restrict__ density,
+                                   const float *__restrict__ activated,
                                    const uint32_t *__restrict__ point_adjacency,
                                    const uint32_t *__restrict__ point_adjacency_offsets,
                                    const Vec4h *__restrict__ adjacent_diff,
@@ -253,8 +271,7 @@ __global__ void ct_interp_forward(TraceSettings settings,
 
     float projection = 0.0f;
 
-    constexpr float sp_beta = 10.0f;
-    float sigma = settings.idw_sigma;
+    float sigma_sq = settings.idw_sigma * settings.idw_sigma;
     float sigma_v = settings.idw_sigma_v;
     constexpr float eps = 1e-7f;
 
@@ -263,39 +280,39 @@ __global__ void ct_interp_forward(TraceSettings settings,
                        float t_1,
                        const Vec3f &current_point,
                        const Vec3f &next_point) {
-        float raw_self = density[point_idx];
+        float mu_ref = activated[point_idx];
         float delta_t = fmaxf(t_1 - t_0, 0.0f);
-
-        // softplus on self
-        float mu_ref = (sp_beta * raw_self > 20.0f)
-                           ? raw_self
-                           : logf(1.0f + expf(sp_beta * raw_self)) / sp_beta;
 
         float t_mid = (t_0 + t_1) * 0.5f;
         Vec3f x_mid = ray.origin + t_mid * ray.direction;
+        Vec3f diff_self = x_mid - current_point;
 
-        // Self contribution
-        float d_self = (x_mid - current_point).norm();
-        float w_self = expf(-d_self / sigma);  // bilateral diff = 0
+        // Self contribution (Gaussian kernel, bilateral diff = 0)
+        float d_sq_self = diff_self.squaredNorm();
+        float w_self = expf(-d_sq_self / sigma_sq);
 
         float w_sum = w_self;
         float mu_weighted = w_self * mu_ref;
 
-        // Neighbor contributions
+        // Neighbor contributions via adjacent_diff offsets
         uint32_t adj_begin = point_adjacency_offsets[point_idx];
         uint32_t adj_end = point_adjacency_offsets[point_idx + 1];
 
         for (uint32_t j = adj_begin; j < adj_end; ++j) {
             uint32_t nb = point_adjacency[j];
-            Vec3f nb_pos = points[nb];
-            float raw_nb = density[nb];
-            float mu_nb = (sp_beta * raw_nb > 20.0f)
-                              ? raw_nb
-                              : logf(1.0f + expf(sp_beta * raw_nb)) / sp_beta;
+            float mu_nb = activated[nb];
 
-            float d_nb = (x_mid - nb_pos).norm();
+            // Use precomputed half-precision offset instead of random global read
+            Vec4h adj_h = adjacent_diff[j];
+            Vec3f offset(__half2float(adj_h[0]),
+                         __half2float(adj_h[1]),
+                         __half2float(adj_h[2]));
+            Vec3f diff_nb = diff_self - offset;
+
+            // Fused Gaussian spatial + bilateral in single exp
+            float d_sq_nb = diff_nb.squaredNorm();
             float bilateral = fabsf(mu_nb - mu_ref);
-            float w_nb = expf(-d_nb / sigma) * expf(-bilateral / sigma_v);
+            float w_nb = expf(-d_sq_nb / sigma_sq - bilateral / sigma_v);
 
             w_sum += w_nb;
             mu_weighted += w_nb * mu_nb;
@@ -331,7 +348,8 @@ __global__ void ct_interp_forward(TraceSettings settings,
 template <int block_size>
 __global__ void ct_interp_backward(TraceSettings settings,
                                     const Vec3f *__restrict__ points,
-                                    const float *__restrict__ density,
+                                    const float *__restrict__ activated,
+                                    const float *__restrict__ dsigmoid,
                                     const uint32_t *__restrict__ point_adjacency,
                                     const uint32_t *__restrict__ point_adjacency_offsets,
                                     const Vec4h *__restrict__ adjacent_diff,
@@ -365,18 +383,16 @@ __global__ void ct_interp_backward(TraceSettings settings,
     Vec3f current_point_grad = Vec3f::Zero();
     Vec3f next_point_grad = Vec3f::Zero();
 
-    constexpr float sp_beta = 10.0f;
-    float sigma = settings.idw_sigma;
+    float sigma_sq = settings.idw_sigma * settings.idw_sigma;
     float sigma_v = settings.idw_sigma_v;
     constexpr float eps = 1e-7f;
-    constexpr int MAX_NEIGHBORS = 64;
 
     auto functor = [&](uint32_t point_idx,
                        float t_0,
                        float t_1,
                        const Vec3f &current_point,
                        const Vec3f &next_point) {
-        float raw_self = density[point_idx];
+        float mu_ref = activated[point_idx];
         float delta_t = fmaxf(t_1 - t_0, 0.0f);
 
         if (point_error) {
@@ -384,55 +400,37 @@ __global__ void ct_interp_backward(TraceSettings settings,
             atomicAdd(point_error + point_idx, weight * error);
         }
 
-        // softplus on self
-        float mu_ref = (sp_beta * raw_self > 20.0f)
-                           ? raw_self
-                           : logf(1.0f + expf(sp_beta * raw_self)) / sp_beta;
-
         float t_mid = (t_0 + t_1) * 0.5f;
         Vec3f x_mid = ray.origin + t_mid * ray.direction;
-
-        // Self contribution
         Vec3f diff_self = x_mid - current_point;
-        float d_self = diff_self.norm();
-        float w_self = expf(-d_self / sigma);
+
+        // Self contribution (Gaussian kernel, bilateral diff = 0)
+        float d_sq_self = diff_self.squaredNorm();
+        float w_self = expf(-d_sq_self / sigma_sq);
 
         float w_sum = w_self;
         float mu_weighted = w_self * mu_ref;
 
-        // Collect neighbor data on stack
         uint32_t adj_begin = point_adjacency_offsets[point_idx];
         uint32_t adj_end = point_adjacency_offsets[point_idx + 1];
-        uint32_t num_nb = min(adj_end - adj_begin, (uint32_t)MAX_NEIGHBORS);
 
-        uint32_t nb_indices[MAX_NEIGHBORS];
-        float nb_weights[MAX_NEIGHBORS];
-        float nb_mu[MAX_NEIGHBORS];
-        float nb_raw[MAX_NEIGHBORS];
-        Vec3f nb_diff[MAX_NEIGHBORS];  // x_mid - nb_pos
-        float nb_dist[MAX_NEIGHBORS];
+        // --- Pass 1: accumulate w_sum and mu_weighted (2 running floats) ---
+        for (uint32_t j = adj_begin; j < adj_end; ++j) {
+            uint32_t nb = point_adjacency[j];
+            float mu_nb = activated[nb];
 
-        for (uint32_t j = 0; j < num_nb; ++j) {
-            uint32_t nb = point_adjacency[adj_begin + j];
-            nb_indices[j] = nb;
-            Vec3f nb_pos = points[nb];
-            float raw_nb = density[nb];
-            nb_raw[j] = raw_nb;
-            float mu_nb = (sp_beta * raw_nb > 20.0f)
-                              ? raw_nb
-                              : logf(1.0f + expf(sp_beta * raw_nb)) / sp_beta;
-            nb_mu[j] = mu_nb;
+            Vec4h adj_h = adjacent_diff[j];
+            Vec3f offset(__half2float(adj_h[0]),
+                         __half2float(adj_h[1]),
+                         __half2float(adj_h[2]));
+            Vec3f diff_nb = diff_self - offset;
 
-            Vec3f d = x_mid - nb_pos;
-            nb_diff[j] = d;
-            float dist = d.norm();
-            nb_dist[j] = dist;
+            float d_sq_nb = diff_nb.squaredNorm();
             float bilateral = fabsf(mu_nb - mu_ref);
-            float w = expf(-dist / sigma) * expf(-bilateral / sigma_v);
-            nb_weights[j] = w;
+            float w_nb = expf(-d_sq_nb / sigma_sq - bilateral / sigma_v);
 
-            w_sum += w;
-            mu_weighted += w * mu_nb;
+            w_sum += w_nb;
+            mu_weighted += w_nb * mu_nb;
         }
 
         float W = fmaxf(w_sum, eps);
@@ -442,60 +440,48 @@ __global__ void ct_interp_backward(TraceSettings settings,
         float indicator = (mu > 0.0f) ? 1.0f : 0.0f;
         float dL_dmu = dL_dprojection * delta_t * indicator;
 
-        // --- Density gradients (stop-grad through bilateral weights) ---
-        // Self: alpha_self = w_self / W
+        // --- Density gradient for self ---
         float alpha_self = w_self / W;
-        float d_softplus_self = 1.0f / (1.0f + expf(-sp_beta * raw_self));
         atomicAdd(density_scalar_grad + point_idx,
-                  dL_dmu * alpha_self * d_softplus_self);
+                  dL_dmu * alpha_self * dsigmoid[point_idx]);
 
-        for (uint32_t j = 0; j < num_nb; ++j) {
-            float alpha_k = nb_weights[j] / W;
-            float d_softplus_nb = 1.0f / (1.0f + expf(-sp_beta * nb_raw[j]));
-            atomicAdd(density_scalar_grad + nb_indices[j],
-                      dL_dmu * alpha_k * d_softplus_nb);
-        }
-
-        // --- Position gradients through spatial weights ---
-        // For self: dw_self/d(center_self) = w_self * (x_mid - center_self) / (sigma * max(d_self, eps))
-        //           but direction is negative since moving center changes diff
-        //           dw/d(center) = -w * (x_mid - center) / (sigma * d)  (d(||x-c||)/dc = -(x-c)/||x-c||)
-        //           dmu/d(center) = (dw/d(center) / W) * (mu_val - mu)
+        // --- Position gradient for self (Gaussian: no 1/d singularity) ---
+        // dw/d(center) = w * 2*diff / sigma_sq  (derivative of exp(-||diff||^2/sigma_sq) w.r.t. center)
+        // dmu/d(center) = (dw/d(center) / W) * (mu_val - mu)
         {
-            float d_safe = fmaxf(d_self, eps);
-            // dw_self/d(center_self) = w_self / (sigma * d_safe) * (-(x_mid - center_self))
-            //                        = -w_self / (sigma * d_safe) * diff_self
-            // dmu/d(center_self) = (-w_self / (sigma * d_safe * W)) * diff_self * (mu_ref - mu)
             Vec3f pos_grad_self =
-                dL_dmu * (-w_self / (sigma * d_safe * W)) * (mu_ref - mu) * diff_self;
-            // Accumulate into current_point_grad (will be written via cell_intersection_grad logic)
+                dL_dmu * (w_self * 2.0f / (sigma_sq * W)) * (mu_ref - mu) * diff_self;
             current_point_grad += pos_grad_self;
         }
 
-        for (uint32_t j = 0; j < num_nb; ++j) {
-            float d_safe = fmaxf(nb_dist[j], eps);
-            // dw_k/d(center_k) = -w_k / (sigma * d_safe) * nb_diff[j]
-            // (only spatial part; bilateral is stopped)
-            // But bilateral factor is exp(-|mu_k - mu_ref|/sigma_v), and the spatial is exp(-d/sigma)
-            // The spatial derivative: d(exp(-d/sigma))/d(center) = exp(-d/sigma) * (1/(sigma*d)) * (x_mid - center)
-            //   but we want d/d(center), and d = ||x_mid - center||, so dd/d(center) = -(x_mid - center)/d
-            //   => derivative of exp(-d/sigma) w.r.t. center = exp(-d/sigma) / (sigma * d) * (x_mid - center)  ... wait sign
-            //   Actually: dd/d(center_k) = -(x_mid - center_k)/||x_mid - center_k|| = -nb_diff/d
-            //   d(exp(-d/sigma))/d(center_k) = exp(-d/sigma) * (-1/sigma) * dd/d(center_k)
-            //                                = exp(-d/sigma) * (-1/sigma) * (-nb_diff/d)
-            //                                = exp(-d/sigma) * nb_diff / (sigma * d)
-            //   Including bilateral constant: dw_k/d(center_k) = w_k * nb_diff / (sigma * d)
-            //   Wait, w_k = exp(-d/sigma) * bilateral_const
-            //   dw_k/d(center_k) = bilateral_const * exp(-d/sigma) * nb_diff / (sigma * d)
-            //                     = w_k * nb_diff / (sigma * d)
-            // dmu/d(center_k) = (dw_k/d(center_k) / W) * (mu_k - mu)
+        // --- Pass 2: recompute weights, apply density + position gradients ---
+        // Neighbor data is L1/L2-hot from pass 1; cost is ~N exp recomputed.
+        for (uint32_t j = adj_begin; j < adj_end; ++j) {
+            uint32_t nb = point_adjacency[j];
+            float mu_nb = activated[nb];
+
+            Vec4h adj_h = adjacent_diff[j];
+            Vec3f offset(__half2float(adj_h[0]),
+                         __half2float(adj_h[1]),
+                         __half2float(adj_h[2]));
+            Vec3f diff_nb = diff_self - offset;
+
+            float d_sq_nb = diff_nb.squaredNorm();
+            float bilateral = fabsf(mu_nb - mu_ref);
+            float w_nb = expf(-d_sq_nb / sigma_sq - bilateral / sigma_v);
+
+            // Density gradient for neighbor
+            float alpha_k = w_nb / W;
+            atomicAdd(density_scalar_grad + nb,
+                      dL_dmu * alpha_k * dsigmoid[nb]);
+
+            // Position gradient for neighbor (Gaussian kernel)
             Vec3f pos_grad_nb =
-                dL_dmu * (nb_weights[j] / (sigma * d_safe * W)) * (nb_mu[j] - mu) * nb_diff[j];
-            atomic_add_vec(points_grad + nb_indices[j], pos_grad_nb);
+                dL_dmu * (w_nb * 2.0f / (sigma_sq * W)) * (mu_nb - mu) * diff_nb;
+            atomic_add_vec(points_grad + nb, pos_grad_nb);
         }
 
-        // --- Cell intersection position gradients (existing) ---
-        // dL/d(delta_t) = dL/dprojection * mu (using interpolated mu)
+        // --- Cell intersection position gradients ---
         float dL_ddelta_t = dL_dprojection * mu;
 
         float dL_dt0 = -dL_ddelta_t;
@@ -765,13 +751,22 @@ class CUDADensityPipeline : public Pipeline {
 
         constexpr uint32_t block_size = 128;
         if (settings.interpolation_mode) {
+            CUDAArray<float> activated(num_points);
+            launch_kernel_1d<256>(precompute_activated_density,
+                                  num_points,
+                                  nullptr,
+                                  density,
+                                  activated.begin(),
+                                  (float *)nullptr,
+                                  num_points);
+
             launch_kernel_1d<block_size>(
                 ct_interp_forward<block_size>,
                 num_rays,
                 nullptr,
                 settings,
                 points,
-                density,
+                activated.begin(),
                 point_adjacency,
                 point_adjacency_offsets,
                 adjacent_diff.begin(),
@@ -831,13 +826,24 @@ class CUDADensityPipeline : public Pipeline {
 
         constexpr uint32_t block_size = 128;
         if (settings.interpolation_mode) {
+            CUDAArray<float> activated(num_points);
+            CUDAArray<float> dsigmoid_buf(num_points);
+            launch_kernel_1d<256>(precompute_activated_density,
+                                  num_points,
+                                  nullptr,
+                                  density,
+                                  activated.begin(),
+                                  dsigmoid_buf.begin(),
+                                  num_points);
+
             launch_kernel_1d<block_size>(
                 ct_interp_backward<block_size>,
                 num_rays,
                 nullptr,
                 settings,
                 points,
-                density,
+                activated.begin(),
+                dsigmoid_buf.begin(),
                 point_adjacency,
                 point_adjacency_offsets,
                 adjacent_diff.begin(),
