@@ -76,7 +76,6 @@ BASELINE = {
     "tv_area_weighted": False,
     "tv_epsilon": 1e-3,
     "contrast_fraction": 0.5,
-    "contrast_power": 0.5,
     "interpolation_start": -1,
     "interp_sigma_scale": 0.5,
     "interp_sigma_v": 0.1,
