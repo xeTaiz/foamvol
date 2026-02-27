@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Hyperparameter sweep for CT reconstruction.
 
-Phase 1: Screen 4(G) x 5(T) x 5(C) = 100 runs at 64k points.
-Phase 2: Validate top N configs from Phase 1 at 128k, 256k, and 512k points.
+Sweep 7: Interpolation + Density Grad evaluation.
+5 feature configs × 2 point budgets = 10 runs.
 
 Usage:
     python sweep.py --phase 1
-    python sweep.py --phase 2 --top_n 5
 """
 
 import argparse
@@ -16,7 +15,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 
 import yaml
 
@@ -24,50 +22,35 @@ import yaml
 # Sweep axes
 # ---------------------------------------------------------------------------
 
-GRAD_CONFIGS = {
-    "G0": {"gradient_start": -1},
-    #"G-5S5": {
-    #    "gradient_start": 11000,
-    #    "gradient_lr_init": 1e-5,
-    #    "gradient_lr_final": 1e-7,
-    #    "gradient_max_slope": 2.0,
-    #},
-    # "G-4S5": {
-    #     "gradient_start": 11000,
-    #     "gradient_lr_init": 1e-4,
-    #     "gradient_lr_final": 1e-6,
-    #     "gradient_max_slope": 5.0,
-    # },
-    # "G-3S5": {
-    #     "gradient_start": 11000,
-    #     "gradient_lr_init": 1e-3,
-    #     "gradient_lr_final": 1e-5,
-    #     "gradient_max_slope": 5.0,
-    # },
-}
-
-TV_CONFIGS = {
-    "T-0": {"tv_weight": 0, "tv_start": -1},
-    "T-4a": {"tv_weight": 1e-4, "tv_start": 8000, "tv_area_weighted": True},
-    "T-5a": {"tv_weight": 1e-5, "tv_start": 8000, "tv_area_weighted": True},
-}
-
-CONTRAST_CONFIGS = {
-    "C25p05": {"contrast_fraction": 0.25, "contrast_power": 0.5},
-    "C50p05": {"contrast_fraction": 0.50, "contrast_power": 0.5},
-    "C75p05": {"contrast_fraction": 0.75, "contrast_power": 0.5},
-    "C90p05": {"contrast_fraction": 0.90, "contrast_power": 0.5},
-    "C25p01": {"contrast_fraction": 0.25, "contrast_power": 0.1},
-    "C50p01": {"contrast_fraction": 0.50, "contrast_power": 0.1},
-    "C75p01": {"contrast_fraction": 0.75, "contrast_power": 0.1},
-    "C90p01": {"contrast_fraction": 0.90, "contrast_power": 0.1},
+FEATURE_CONFIGS = {
+    "base": {},
+    "I-sharp": {
+        "interpolation_start": 15000,
+        "interp_sigma_scale": 0.25,
+        "interp_sigma_v": 0.05,
+    },
+    "I-smooth": {
+        "interpolation_start": 15000,
+        "interp_sigma_scale": 0.4,
+        "interp_sigma_v": 0.2,
+    },
+    "G-lr5": {
+        "gradient_start": 15000,
+        "gradient_lr_init": 1e-5,
+        "gradient_lr_final": 1e-7,
+        "gradient_freeze_points": 0,
+    },
+    "G-lr6": {
+        "gradient_start": 15000,
+        "gradient_lr_init": 1e-6,
+        "gradient_lr_final": 1e-8,
+        "gradient_freeze_points": 0,
+    },
 }
 
 POINTS_CONFIGS = {
-    "P64": {"init_points": 8000, "final_points": 64000},
     "P128": {"init_points": 8000, "final_points": 128000},
     "P256": {"init_points": 16000, "final_points": 256000},
-    "P512": {"init_points": 32000, "final_points": 512000},
 }
 
 # ---------------------------------------------------------------------------
@@ -88,18 +71,26 @@ BASELINE = {
     "density_lr_init": 1e-1,
     "density_lr_final": 1e-2,
     "freeze_points": 18000,
+    "tv_weight": 1e-5,
+    "tv_start": 8000,
+    "tv_area_weighted": False,
     "tv_epsilon": 1e-3,
+    "contrast_fraction": 0.5,
+    "contrast_power": 0.5,
+    "interpolation_start": -1,
+    "interp_sigma_scale": 0.5,
+    "interp_sigma_v": 0.1,
+    "gradient_start": -1,
     "gradient_warmup": 50,
     "gradient_max_slope": 5.0,
     "gradient_freeze_points": 1000,
-    "contrast_power": 0.5,
     "dataset": "r2_gaussian",
     "data_path": "/mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
     "debug": False,
     "viewer": False,
 }
 
-SWEEP_NAM = "sweep6"
+SWEEP_NAM = "sweep7"
 SWEEP_DIR = f"output/{SWEEP_NAM}"
 
 
@@ -108,18 +99,16 @@ SWEEP_DIR = f"output/{SWEEP_NAM}"
 # ---------------------------------------------------------------------------
 
 
-def build_config(g_id, t_id, c_id, p_id):
-    """Merge baseline with the four axis configs."""
+def build_config(f_id, p_id):
+    """Merge baseline with feature and points configs."""
     cfg = dict(BASELINE)
-    cfg.update(GRAD_CONFIGS[g_id])
-    cfg.update(TV_CONFIGS[t_id])
-    cfg.update(CONTRAST_CONFIGS[c_id])
+    cfg.update(FEATURE_CONFIGS[f_id])
     cfg.update(POINTS_CONFIGS[p_id])
     return cfg
 
 
-def run_name(g_id, t_id, c_id, p_id):
-    return f"{g_id}_{t_id}_{c_id}_{p_id}"
+def run_name(f_id, p_id):
+    return f"{f_id}_{p_id}"
 
 
 def metrics_path(name):
@@ -202,64 +191,24 @@ def collect_summary(names, output_csv):
 
 
 # ---------------------------------------------------------------------------
-# Phase runners
+# Phase runner
 # ---------------------------------------------------------------------------
 
 
 def phase1():
-    """Screen all G x T x C combos at P64."""
-    p_id = "P64"
+    """Run all feature × points combos."""
     runs = []
-    for g_id, t_id, c_id in itertools.product(
-        GRAD_CONFIGS, TV_CONFIGS, CONTRAST_CONFIGS
-    ):
-        name = run_name(g_id, t_id, c_id, p_id)
-        cfg = build_config(g_id, t_id, c_id, p_id)
+    for f_id, p_id in itertools.product(FEATURE_CONFIGS, POINTS_CONFIGS):
+        name = run_name(f_id, p_id)
+        cfg = build_config(f_id, p_id)
         runs.append((name, cfg))
 
-    print(f"Phase 1: {len(runs)} runs at {p_id}")
+    print(f"Phase 1: {len(runs)} runs")
     for name, cfg in runs:
         run_experiment(name, cfg)
 
     names = [name for name, _ in runs]
     return collect_summary(names, os.path.join(SWEEP_DIR, "summary_phase1.csv"))
-
-
-def phase2(top_n=5):
-    """Validate top N configs from Phase 1 at P128, P256, and P512."""
-    phase1_csv = os.path.join(SWEEP_DIR, "summary_phase1.csv")
-    if not os.path.exists(phase1_csv):
-        print(f"[ERROR] {phase1_csv} not found. Run --phase 1 first.")
-        sys.exit(1)
-
-    with open(phase1_csv) as f:
-        reader = csv.DictReader(f)
-        phase1_rows = list(reader)
-
-    # Extract the G/T/C combo from the top N names
-    top_combos = []
-    for row in phase1_rows[:top_n]:
-        name = row["name"]
-        parts = name.split("_")  # e.g. G2_T1_C1_P64
-        g_id, t_id, c_id = parts[0], parts[1], parts[2]
-        top_combos.append((g_id, t_id, c_id))
-
-    print(f"Phase 2: Top {len(top_combos)} combos × 3 point budgets")
-    for g_id, t_id, c_id in top_combos:
-        print(f"  {g_id}_{t_id}_{c_id}")
-
-    runs = []
-    for g_id, t_id, c_id in top_combos:
-        for p_id in ("P128", "P256", "P512"):
-            name = run_name(g_id, t_id, c_id, p_id)
-            cfg = build_config(g_id, t_id, c_id, p_id)
-            runs.append((name, cfg))
-
-    for name, cfg in runs:
-        run_experiment(name, cfg)
-
-    names = [name for name, _ in runs]
-    return collect_summary(names, os.path.join(SWEEP_DIR, "summary_phase2.csv"))
 
 
 # ---------------------------------------------------------------------------
@@ -269,18 +218,13 @@ def phase2(top_n=5):
 
 def main():
     parser = argparse.ArgumentParser(description="CT reconstruction hyperparameter sweep")
-    parser.add_argument("--phase", type=int, required=True, choices=[1, 2],
-                        help="1 = screen at 64k, 2 = validate top N at 128k/256k/512k")
-    parser.add_argument("--top_n", type=int, default=5,
-                        help="Number of top configs to validate in Phase 2")
+    parser.add_argument("--phase", type=int, default=1, choices=[1],
+                        help="1 = run all feature × points combos")
     args = parser.parse_args()
 
     os.makedirs(SWEEP_DIR, exist_ok=True)
 
-    if args.phase == 1:
-        phase1()
-    else:
-        phase2(top_n=args.top_n)
+    phase1()
 
 
 if __name__ == "__main__":
