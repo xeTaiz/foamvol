@@ -452,7 +452,6 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         point_contribution,
                         pipeline_args.densify_factor,
                         pipeline_args.contrast_fraction,
-                        pipeline_args.contrast_power,
                         redundancy_threshold=pipeline_args.redundancy_threshold,
                         redundancy_cap=pipeline_args.redundancy_cap,
                         sigma_scale=pipeline_args.interp_sigma_scale,
