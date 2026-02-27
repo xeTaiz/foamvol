@@ -22,21 +22,16 @@ device: cuda
 
 # Optimization
 points_lr_init: 2e-4
-points_lr_final: 5e-6
+points_lr_final: 1e-6
 density_lr_init: 1e-1
-density_lr_final: 1e-2
-freeze_points: 18000
+density_lr_final: 5e-3
+freeze_points: 17000
 tv_weight: 1e-4
 tv_start: 8000
 tv_epsilon: 1e-4
 tv_area_weighted: False
 gradient_start: -1
-gradient_lr_init: 1e-4
-gradient_lr_final: 1e-6
-gradient_warmup: 50
-gradient_max_slope: 5.0
-gradient_freeze_points: 1000
-
+#
 # Dataset
 dataset: r2_gaussian
 data_path: /mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone
