@@ -229,6 +229,13 @@ class CTScene(torch.nn.Module):
 
         return edge_loss.mean()
 
+    def set_interpolation_mode(self, enabled, sigma=None, sigma_v=None):
+        self._interpolation_mode = enabled
+        if sigma is not None:
+            self._idw_sigma = sigma
+        if sigma_v is not None:
+            self._idw_sigma_v = sigma_v
+
     def get_trace_data(self):
         points = self.primal_points
         density = self.density  # raw — kernel applies softplus
@@ -261,6 +268,14 @@ class CTScene(torch.nn.Module):
             self.get_trace_data()
         )
 
+        interpolation_mode = getattr(self, "_interpolation_mode", False)
+        idw_sigma = getattr(self, "_idw_sigma", 0.01)
+        idw_sigma_v = getattr(self, "_idw_sigma_v", 0.1)
+
+        # When interpolation is active, suppress the linear gradient feature
+        if interpolation_mode:
+            density_grad = None
+
         if start_point is None:
             start_point = self.get_starting_point(rays, points, self.aabb_tree)
         else:
@@ -276,6 +291,9 @@ class CTScene(torch.nn.Module):
             return_contribution,
             density_grad,
             gradient_max_slope,
+            interpolation_mode,
+            idw_sigma,
+            idw_sigma_v,
         )
 
     def declare_optimizer(self, args, warmup, max_iterations):

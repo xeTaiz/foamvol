@@ -21,6 +21,9 @@ class TraceRays(torch.autograd.Function):
         return_contribution,
         _density_grad=None,
         _gradient_max_slope=5.0,
+        _interpolation_mode=False,
+        _idw_sigma=0.01,
+        _idw_sigma_v=0.1,
     ):
         ctx.rays = rays
         ctx.start_point = start_point
@@ -31,6 +34,9 @@ class TraceRays(torch.autograd.Function):
         ctx.point_adjacency_offsets = _point_adjacency_offsets
         ctx.has_density_grad = _density_grad is not None
         ctx.gradient_max_slope = _gradient_max_slope
+        ctx.interpolation_mode = _interpolation_mode
+        ctx.idw_sigma = _idw_sigma
+        ctx.idw_sigma_v = _idw_sigma_v
         if ctx.has_density_grad:
             ctx.density_grad = _density_grad
 
@@ -44,6 +50,9 @@ class TraceRays(torch.autograd.Function):
             return_contribution=return_contribution,
             density_grad=_density_grad,
             gradient_max_slope=_gradient_max_slope,
+            interpolation_mode=_interpolation_mode,
+            idw_sigma=_idw_sigma,
+            idw_sigma_v=_idw_sigma_v,
         )
 
         errbox = ErrorBox()
@@ -78,6 +87,9 @@ class TraceRays(torch.autograd.Function):
         has_density_grad = ctx.has_density_grad
         _density_grad = ctx.density_grad if has_density_grad else None
         gradient_max_slope = ctx.gradient_max_slope
+        interpolation_mode = ctx.interpolation_mode
+        idw_sigma = ctx.idw_sigma
+        idw_sigma_v = ctx.idw_sigma_v
 
         results = pipeline.trace_backward(
             _points,
@@ -90,6 +102,9 @@ class TraceRays(torch.autograd.Function):
             ctx.errbox.ray_error,
             density_grad=_density_grad,
             gradient_max_slope=gradient_max_slope,
+            interpolation_mode=interpolation_mode,
+            idw_sigma=idw_sigma,
+            idw_sigma_v=idw_sigma_v,
         )
         points_grad = results["points_grad"]
         attr_grad = results["attr_grad"]
@@ -111,6 +126,9 @@ class TraceRays(torch.autograd.Function):
             ctx.point_adjacency_offsets,
             ctx.has_density_grad,
             ctx.gradient_max_slope,
+            ctx.interpolation_mode,
+            ctx.idw_sigma,
+            ctx.idw_sigma_v,
         )
         if has_density_grad:
             del ctx.density_grad
@@ -126,4 +144,7 @@ class TraceRays(torch.autograd.Function):
             None,  # return_contribution
             density_grad_grad,  # _density_grad
             None,  # _gradient_max_slope
+            None,  # _interpolation_mode
+            None,  # _idw_sigma
+            None,  # _idw_sigma_v
         )

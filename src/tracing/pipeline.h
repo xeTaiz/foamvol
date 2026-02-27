@@ -11,6 +11,9 @@ struct TraceSettings {
     float weight_threshold;
     uint32_t max_intersections;
     float gradient_max_slope = 5.0f;
+    bool interpolation_mode = false;
+    float idw_sigma = 0.01f;
+    float idw_sigma_v = 0.1f;
 };
 
 inline TraceSettings default_trace_settings() {
