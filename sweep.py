@@ -64,6 +64,13 @@ BASELINE = {
 SWEEP_NAME = "sweep8"
 SWEEP_DIR = f"output/{SWEEP_NAME}"
 
+# Point budgets for Phase 2 (init_points : final_points, 1:4 ratio)
+POINT_BUDGETS = {
+    "128k": {"init_points": 32000,  "final_points": 128000},
+    "256k": {"init_points": 64000,  "final_points": 256000},
+    "512k": {"init_points": 128000, "final_points": 512000},
+}
+
 # ---------------------------------------------------------------------------
 # Phase 1: One-at-a-time screening (25 runs)
 # ---------------------------------------------------------------------------
@@ -312,39 +319,35 @@ def find_best_per_axis(rows):
     return winners, baseline_psnr
 
 
-def phase2():
-    """Combine best per-axis winners and run ablations."""
-    rows = load_phase1_summary()
+def build_phase2_configs(rows):
+    """Build Phase 2 hyperparam configs from Phase 1 results.
+
+    Returns dict: config_id -> overrides (without point budget applied yet).
+    """
     winners, baseline_psnr = find_best_per_axis(rows)
 
     if not winners:
         print("\n[INFO] No axis improved over baseline. Nothing to combine.")
-        return
+        return {}
 
     print(f"\n--- Phase 2: Combining {len(winners)} winning axes ---")
 
-    # Build combined config
     combined_overrides = {}
     for axis, (run_id, overrides, delta) in sorted(winners.items()):
         print(f"  Including {run_id}: {overrides} (delta={delta:+.4f})")
         combined_overrides.update(overrides)
 
-    # Phase 2 runs: combined + ablation of each winner
-    phase2_runs = {"P2-combined": combined_overrides}
+    configs = {"P2-combined": combined_overrides}
 
     # Ablation: combined minus each axis
     if len(winners) > 1:
         for axis, (run_id, overrides, _) in sorted(winners.items()):
             ablation_overrides = {k: v for k, v in combined_overrides.items()
                                   if k not in overrides}
-            phase2_runs[f"P2-no{axis}"] = ablation_overrides
+            configs[f"P2-no{axis}"] = ablation_overrides
 
     # If both sigma_scale and sigma_v won, add 2x2 mini-grid
     if "D" in winners:
-        d_winner_id = winners["D"][0]
-        d_overrides = winners["D"][1]
-        # Check if there's a sigma_scale winner and a sigma_v winner
-        # Find the second-best D variant of the other type
         d_scale_runs = [r for r in rows if r["name"].startswith("D") and "ss" in r["name"]]
         d_sv_runs = [r for r in rows if r["name"].startswith("D") and "sv" in r["name"]]
 
@@ -352,31 +355,91 @@ def phase2():
             best_scale = max(d_scale_runs, key=lambda r: r.get("vol_idw_psnr", 0))
             best_sv = max(d_sv_runs, key=lambda r: r.get("vol_idw_psnr", 0))
 
-            if (best_scale["name"] != "baseline" and best_sv["name"] != "baseline"
-                    and best_scale.get("vol_idw_psnr", 0) > baseline_psnr
+            if (best_scale.get("vol_idw_psnr", 0) > baseline_psnr
                     and best_sv.get("vol_idw_psnr", 0) > baseline_psnr):
-                # Both sigma types beat baseline — add combined D variant
                 scale_overrides = PHASE1_RUNS[best_scale["name"]]
                 sv_overrides = PHASE1_RUNS[best_sv["name"]]
                 combo_d = {**scale_overrides, **sv_overrides}
-                # Only add if it differs from what's already in combined
                 if combo_d != {k: v for k, v in combined_overrides.items()
                                if k in ("interp_sigma_scale", "interp_sigma_v")}:
-                    phase2_runs["P2-Dcombo"] = {
+                    configs["P2-Dcombo"] = {
                         **{k: v for k, v in combined_overrides.items()
                            if k not in ("interp_sigma_scale", "interp_sigma_v")},
                         **combo_d,
                     }
 
-    print(f"\nPhase 2: {len(phase2_runs)} runs")
-    names = list(phase2_runs.keys())
+    return configs
 
-    for name in names:
-        cfg = build_config(phase2_runs[name])
-        run_experiment(name, cfg)
 
-    all_names = ["baseline"] + names
+def phase2(runs=None, points=None, summarize=False):
+    """Combine best per-axis winners, cross with point budgets, and run.
+
+    Args:
+        runs: Optional list of run IDs to execute (e.g. P2-combined-256k).
+        points: Optional list of point budget keys (128k/256k/512k).
+        summarize: If True, only collect summary from existing results.
+    """
+    rows = load_phase1_summary()
+    configs = build_phase2_configs(rows)
+
+    if not configs:
+        return
+
+    budgets = points if points else list(POINT_BUDGETS.keys())
+
+    # Cross configs × point budgets
+    phase2_runs = {}
+    for cfg_id, overrides in configs.items():
+        for budget in budgets:
+            name = f"{cfg_id}-{budget}"
+            phase2_runs[name] = {**overrides, **POINT_BUDGETS[budget]}
+
+    # Also include baseline at each budget for comparison
+    for budget in budgets:
+        name = f"P2-baseline-{budget}"
+        phase2_runs[name] = dict(POINT_BUDGETS[budget])
+
+    # Filter by --runs if specified
+    all_names = list(phase2_runs.keys())
+    if runs:
+        selected = set(runs)
+        names = [n for n in all_names if n in selected]
+        unknown = selected - set(all_names)
+        for u in unknown:
+            print(f"[WARN] Unknown run ID: {u}")
+    else:
+        names = all_names
+
+    print(f"\nPhase 2: {len(names)}/{len(all_names)} runs selected "
+          f"({len(configs)} configs × {len(budgets)} budgets + {len(budgets)} baselines)")
+
+    if not summarize:
+        for name in names:
+            cfg = build_config(phase2_runs[name])
+            run_experiment(name, cfg)
+
+    # Summary covers all available results
     return collect_summary(all_names, os.path.join(SWEEP_DIR, "summary_phase2.csv"))
+
+
+def phase2_list(points=None):
+    """Print all Phase 2 run names (for planning worker splits)."""
+    rows = load_phase1_summary()
+    configs = build_phase2_configs(rows)
+    if not configs:
+        return
+
+    budgets = points if points else list(POINT_BUDGETS.keys())
+    names = []
+    for cfg_id in configs:
+        for budget in budgets:
+            names.append(f"{cfg_id}-{budget}")
+    for budget in budgets:
+        names.append(f"P2-baseline-{budget}")
+
+    print(f"\n{len(names)} Phase 2 runs:")
+    for name in names:
+        print(f"  {name}")
 
 
 # ---------------------------------------------------------------------------
@@ -390,19 +453,27 @@ def main():
         epilog="Examples:\n"
                "  python sweep.py --phase 1                    # all 25 runs\n"
                "  python sweep.py --phase 1 --axis A B         # axes A+B (9 runs)\n"
-               "  python sweep.py --phase 1 --axis C D baseline  # axes C+D + baseline\n"
-               "  python sweep.py --phase 1 --runs A1-dli5e2 A2-dli2e1  # specific runs\n"
-               "  python sweep.py --phase 1 --summarize        # just collect results\n",
+               "  python sweep.py --phase 1 --runs A1-dli5e2 A2-dli2e1\n"
+               "  python sweep.py --phase 2                    # all configs × all budgets\n"
+               "  python sweep.py --phase 2 --points 256k 512k # only higher budgets\n"
+               "  python sweep.py --phase 2 --runs P2-combined-256k P2-combined-512k\n"
+               "  python sweep.py --phase 2 --list             # show run names, don't run\n"
+               "  python sweep.py --phase 2 --summarize        # just collect results\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--phase", type=int, default=1, choices=[1, 2],
-                        help="1 = one-at-a-time screening, 2 = combine winners")
+                        help="1 = one-at-a-time screening, 2 = combine winners + point budgets")
     parser.add_argument("--axis", nargs="+", metavar="X",
                         help="Phase 1: only run these axes (A/B/C/D/baseline)")
     parser.add_argument("--runs", nargs="+", metavar="ID",
-                        help="Phase 1: only run these specific run IDs")
+                        help="Only run these specific run IDs")
+    parser.add_argument("--points", nargs="+", metavar="BUD",
+                        choices=list(POINT_BUDGETS.keys()),
+                        help="Phase 2: point budgets to test (default: all)")
     parser.add_argument("--summarize", action="store_true",
                         help="Skip training, just collect existing results into summary CSV")
+    parser.add_argument("--list", action="store_true",
+                        help="Phase 2: print all run names and exit (for planning worker splits)")
     args = parser.parse_args()
 
     os.makedirs(SWEEP_DIR, exist_ok=True)
@@ -410,7 +481,10 @@ def main():
     if args.phase == 1:
         phase1(runs=args.runs, axes=args.axis, summarize=args.summarize)
     elif args.phase == 2:
-        phase2()
+        if args.list:
+            phase2_list(points=args.points)
+        else:
+            phase2(runs=args.runs, points=args.points, summarize=args.summarize)
 
 
 if __name__ == "__main__":
