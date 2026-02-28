@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Hyperparameter sweep for CT reconstruction.
 
-Sweep 9: Refinement around sweep 8 winners.
-Combined base: density_lr_init=5e-2, interp_sigma_scale=0.7 (rest from r2fast.yaml).
+Sweep 10: Point budgets, TV annealing, batch size, L1 loss.
+
+Baseline: r2fast.yaml (sigma_v=0.35, density_lr_final=1e-3, init_scale=1.05,
+          interp_sigma_scale=0.7).
 
 Usage:
     python sweep.py                           # all 15 runs
-    python sweep.py --runs E1-sv03 E2-sv04    # specific runs for worker splitting
+    python sweep.py --runs A1-256k A2-512k    # specific runs for worker splitting
     python sweep.py --list                    # print run names
     python sweep.py --summarize               # collect results only
 """
@@ -21,7 +23,7 @@ import sys
 import yaml
 
 # ---------------------------------------------------------------------------
-# Baseline (combined best from sweep 8: density_lr_init=5e-2 + sigma_scale=0.7)
+# Baseline (from r2fast.yaml — sweep 9 winners applied)
 # ---------------------------------------------------------------------------
 
 BASELINE = {
@@ -37,20 +39,20 @@ BASELINE = {
     "save_volume": False,
     "interpolation_start": 9000,
     "interp_sigma_scale": 0.7,
-    "interp_sigma_v": 0.2,
+    "interp_sigma_v": 0.35,
     "redundancy_threshold": 0.01,
     "redundancy_cap": 0.05,
     # Model
     "init_points": 32000,
     "final_points": 128000,
     "activation_scale": 1.0,
-    "init_scale": 1.0,
+    "init_scale": 1.05,
     "init_type": "random",
     # Optimization
     "points_lr_init": 2e-4,
     "points_lr_final": 5e-6,
     "density_lr_init": 5e-2,
-    "density_lr_final": 1e-2,
+    "density_lr_final": 1e-3,
     "freeze_points": 9500,
     "tv_weight": 1e-4,
     "tv_start": 5000,
@@ -62,34 +64,40 @@ BASELINE = {
     "data_path": "/mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
 }
 
-SWEEP_NAME = "sweep9"
+SWEEP_NAME = "sweep10"
 SWEEP_DIR = f"output/{SWEEP_NAME}"
 
 # ---------------------------------------------------------------------------
-# All sweep 9 runs (flat dict — no phases)
+# Sweep 10 runs
 # ---------------------------------------------------------------------------
 
-SWEEP9_RUNS = {
+SWEEP10_RUNS = {
+    # Group A: Point budgets (extend densify_until for larger budgets)
+    "A1-256k":   {"init_points": 64000,  "final_points": 256000,  "densify_until": 7000, "freeze_points": 9500},
+    "A2-512k":   {"init_points": 128000, "final_points": 512000,  "densify_until": 7500, "freeze_points": 9500},
+    "A3-768k":   {"init_points": 192000, "final_points": 768000,  "densify_until": 8000, "freeze_points": 9500},
+    "A4-1M":     {"init_points": 256000, "final_points": 1000000, "densify_until": 8000, "freeze_points": 9500},
+
+    # Group B: Densification params at 512k
+    "B1-df110":  {"init_points": 128000, "final_points": 512000, "densify_until": 7500, "densify_factor": 1.10},
+    "B2-df120":  {"init_points": 128000, "final_points": 512000, "densify_until": 7500, "densify_factor": 1.20},
+    "B3-du8500": {"init_points": 128000, "final_points": 512000, "densify_until": 8500, "densify_factor": 1.15},
+
+    # Group C: TV annealing
+    "C1-anneal":      {"tv_anneal": True},
+    "C2-anneal-512k": {"init_points": 128000, "final_points": 512000, "densify_until": 7500, "tv_anneal": True},
+
+    # Group D: L1 loss
+    "D1-l1":      {"loss_type": "l1"},
+    "D2-l1-512k": {"init_points": 128000, "final_points": 512000, "densify_until": 7500, "loss_type": "l1"},
+
+    # Group E: Batch size (rays_per_batch)
+    "E1-500k": {"rays_per_batch": 500000},
+    "E2-1M":   {"rays_per_batch": 1000000},
+    "E3-4M":   {"rays_per_batch": 4000000},
+
+    # Reference
     "baseline": {},
-    # Group E: sigma_v exploration
-    "E1-sv03":   {"interp_sigma_v": 0.3},
-    "E2-sv04":   {"interp_sigma_v": 0.4},
-    "E3-sv06":   {"interp_sigma_v": 0.6},
-    # Group F: density_lr_final annealing
-    "F1-dlf5e3": {"density_lr_final": 5e-3},
-    "F2-dlf2e3": {"density_lr_final": 2e-3},
-    "F3-dlf1e3": {"density_lr_final": 1e-3},
-    # Group G: sigma_scale refinement
-    "G1-ss06":   {"interp_sigma_scale": 0.6},
-    "G2-ss08":   {"interp_sigma_scale": 0.8},
-    # Group H: point budgets (1:4 init:final ratio)
-    "H1-64k":    {"init_points": 16000, "final_points": 64000},
-    "H2-80k":    {"init_points": 20000, "final_points": 80000},
-    "H3-100k":   {"init_points": 25000, "final_points": 100000},
-    "H4-140k":   {"init_points": 35000, "final_points": 140000},
-    # Group X: spot-checks
-    "X1-pli1e3": {"points_lr_init": 1e-3},
-    "X2-tv5e5":  {"tv_weight": 5e-5},
 }
 
 # ---------------------------------------------------------------------------
@@ -188,13 +196,13 @@ def collect_summary(names, output_csv, sort_key="vol_idw_psnr"):
 
 
 def run_sweep(runs=None, summarize=False):
-    """Run all (or selected) sweep 9 experiments.
+    """Run all (or selected) sweep 10 experiments.
 
     Args:
         runs: Optional list of specific run IDs to execute.
         summarize: If True, only collect summary from existing results.
     """
-    all_names = list(SWEEP9_RUNS.keys())
+    all_names = list(SWEEP10_RUNS.keys())
 
     if runs:
         selected = set(runs)
@@ -205,11 +213,11 @@ def run_sweep(runs=None, summarize=False):
     else:
         names = all_names
 
-    print(f"Sweep 9: {len(names)}/{len(all_names)} runs selected")
+    print(f"Sweep 10: {len(names)}/{len(all_names)} runs selected")
 
     if not summarize:
         for name in names:
-            cfg = build_config(SWEEP9_RUNS[name])
+            cfg = build_config(SWEEP10_RUNS[name])
             run_experiment(name, cfg)
 
     # Summary always covers all available results
@@ -223,10 +231,10 @@ def run_sweep(runs=None, summarize=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CT reconstruction hyperparameter sweep (sweep 9)",
+        description="CT reconstruction hyperparameter sweep (sweep 10)",
         epilog="Examples:\n"
                "  python sweep.py                           # all 15 runs\n"
-               "  python sweep.py --runs E1-sv03 E2-sv04    # specific runs\n"
+               "  python sweep.py --runs A1-256k A2-512k    # specific runs\n"
                "  python sweep.py --list                    # show run names\n"
                "  python sweep.py --summarize               # just collect results\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -240,11 +248,11 @@ def main():
     args = parser.parse_args()
 
     if args.list:
-        print(f"\n{len(SWEEP9_RUNS)} sweep 9 runs:")
-        for name in SWEEP9_RUNS:
-            overrides = SWEEP9_RUNS[name]
-            desc = ", ".join(f"{k}={v}" for k, v in overrides.items()) if overrides else "(combined base)"
-            print(f"  {name:12s}  {desc}")
+        print(f"\n{len(SWEEP10_RUNS)} sweep 10 runs:")
+        for name in SWEEP10_RUNS:
+            overrides = SWEEP10_RUNS[name]
+            desc = ", ".join(f"{k}={v}" for k, v in overrides.items()) if overrides else "(baseline)"
+            print(f"  {name:16s}  {desc}")
         return
 
     os.makedirs(SWEEP_DIR, exist_ok=True)

@@ -193,7 +193,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
     # Setting up dataset
     train_data_handler = DataHandler(
-        dataset_args, rays_per_batch=2_000_000, device=device
+        dataset_args, rays_per_batch=pipeline_args.rays_per_batch, device=device
     )
     train_data_handler.reload(split="train")
 
@@ -299,7 +299,12 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                             epsilon=optimizer_args.tv_epsilon,
                             area_weighted=optimizer_args.tv_area_weighted,
                         )
-                    loss = loss + optimizer_args.tv_weight * tv_loss
+                    tv_scale = 1.0
+                    if optimizer_args.tv_anneal:
+                        anneal_range = optimizer_args.freeze_points - optimizer_args.tv_start
+                        if anneal_range > 0:
+                            tv_scale = max(0.0, 1.0 - (i - optimizer_args.tv_start) / anneal_range)
+                    loss = loss + optimizer_args.tv_weight * tv_scale * tv_loss
 
                 model.optimizer.zero_grad(set_to_none=True)
 
@@ -337,6 +342,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     writer.add_scalar("train/loss", loss.item(), i)
                     if optimizer_args.tv_weight > 0 and i >= optimizer_args.tv_start:
                         writer.add_scalar("train/tv_loss", tv_loss.item(), i)
+                        if optimizer_args.tv_anneal:
+                            writer.add_scalar("train/tv_scale", tv_scale, i)
                     num_points = model.primal_points.shape[0]
                     writer.add_scalar("train/num_points", num_points, i)
 
