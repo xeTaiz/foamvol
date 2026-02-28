@@ -63,8 +63,8 @@ def load_density_field(model_path, device="cuda"):
         gradients = scene_data["density_grad"].to(device)
         grad_max_slope = scene_data.get("gradient_max_slope", 5.0)
 
-    adjacency = scene_data["adjacency"].to(device).long()
-    adjacency_offsets = scene_data["adjacency_offsets"].to(device).long()
+    adjacency = scene_data["adjacency"].to(device).to(torch.int32)
+    adjacency_offsets = scene_data["adjacency_offsets"].to(device).to(torch.int32)
     aabb_tree = radfoam.build_aabb_tree(points)
 
     return {
