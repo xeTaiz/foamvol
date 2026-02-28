@@ -9,7 +9,7 @@ debug: False
 viewer: False
 save_volume: False
 interpolation_start: 9000
-interp_sigma_scale: 0.55
+interp_sigma_scale: 0.7
 interp_sigma_v: 0.2
 redundancy_threshold: 0.01
 redundancy_cap: 0.05
@@ -26,7 +26,7 @@ device: cuda
 # Optimization 
 points_lr_init: 2e-4
 points_lr_final: 5e-6
-density_lr_init: 1e-1
+density_lr_init: 5e-2
 density_lr_final: 1e-2
 freeze_points: 9500
 tv_weight: 1e-4
