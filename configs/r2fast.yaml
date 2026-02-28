@@ -13,6 +13,7 @@ interp_sigma_scale: 0.7
 interp_sigma_v: 0.35
 redundancy_threshold: 0.01
 redundancy_cap: 0.05
+rays_per_batch: 2000000
 
 # Model
 init_points: 32000
