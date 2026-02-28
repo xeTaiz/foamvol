@@ -18,7 +18,7 @@ redundancy_cap: 0.05
 init_points: 16000
 final_points: 128000
 activation_scale: 1.0
-init_scale: 1.0
+init_scale: 1.05
 init_type: random
 device: cuda
 
