@@ -14,12 +14,11 @@ interp_sigma_v: 0.2
 redundancy_threshold: 0.01
 redundancy_cap: 0.05
 
-
 # Model
 init_points: 32000
 final_points: 128000
 activation_scale: 1.0
-init_scale: 1.0
+init_scale: 1.05
 init_type: random
 device: cuda
 

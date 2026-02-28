@@ -275,17 +275,23 @@ __global__ void ct_interp_forward(TraceSettings settings,
     float sigma_v = settings.idw_sigma_v;
     constexpr float eps = 1e-7f;
     constexpr float w_floor = 1e-6f;
+    constexpr float volume_extent = 1.05f;
 
     auto functor = [&](uint32_t point_idx,
                        float t_0,
                        float t_1,
                        const Vec3f &current_point,
                        const Vec3f &next_point) {
-        float mu_ref = activated[point_idx];
         float delta_t = fmaxf(t_1 - t_0, 0.0f);
-
         float t_mid = (t_0 + t_1) * 0.5f;
         Vec3f x_mid = ray.origin + t_mid * ray.direction;
+
+        // Skip interpolation outside the reconstruction volume
+        if (fabsf(x_mid[0]) > volume_extent || fabsf(x_mid[1]) > volume_extent || fabsf(x_mid[2]) > volume_extent) {
+            return true;
+        }
+
+        float mu_ref = activated[point_idx];
         Vec3f diff_self = x_mid - current_point;
 
         // Self contribution (Gaussian kernel, bilateral diff = 0)
@@ -394,16 +400,17 @@ __global__ void ct_interp_backward(TraceSettings settings,
                        float t_1,
                        const Vec3f &current_point,
                        const Vec3f &next_point) {
-        float mu_ref = activated[point_idx];
         float delta_t = fmaxf(t_1 - t_0, 0.0f);
+        float t_mid = (t_0 + t_1) * 0.5f;
+        Vec3f x_mid = ray.origin + t_mid * ray.direction;
+
+        float mu_ref = activated[point_idx];
 
         if (point_error) {
             float weight = delta_t;
             atomicAdd(point_error + point_idx, weight * error);
         }
 
-        float t_mid = (t_0 + t_1) * 0.5f;
-        Vec3f x_mid = ray.origin + t_mid * ray.direction;
         Vec3f diff_self = x_mid - current_point;
 
         // Self contribution (Gaussian kernel, bilateral diff = 0)
@@ -443,7 +450,7 @@ __global__ void ct_interp_backward(TraceSettings settings,
         float dL_dmu = dL_dprojection * delta_t * indicator;
 
         // --- Density gradient for self ---
-        float alpha_self = (w_self + w_floor) / W;
+        float alpha_self = w_self / W;
         atomicAdd(density_scalar_grad + point_idx,
                   dL_dmu * alpha_self * dsigmoid[point_idx]);
 
@@ -473,7 +480,7 @@ __global__ void ct_interp_backward(TraceSettings settings,
             float w_nb = expf(-d_sq_nb / sigma_sq - bilateral / sigma_v);
 
             // Density gradient for neighbor
-            float alpha_k = (w_nb + w_floor) / W;
+            float alpha_k = w_nb / W;
             atomicAdd(density_scalar_grad + nb,
                       dL_dmu * alpha_k * dsigmoid[nb]);
 
