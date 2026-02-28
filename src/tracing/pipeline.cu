@@ -274,6 +274,7 @@ __global__ void ct_interp_forward(TraceSettings settings,
     float sigma_sq = settings.idw_sigma * settings.idw_sigma;
     float sigma_v = settings.idw_sigma_v;
     constexpr float eps = 1e-7f;
+    constexpr float w_floor = 1e-6f;
 
     auto functor = [&](uint32_t point_idx,
                        float t_0,
@@ -291,8 +292,8 @@ __global__ void ct_interp_forward(TraceSettings settings,
         float d_sq_self = diff_self.squaredNorm();
         float w_self = expf(-d_sq_self / sigma_sq);
 
-        float w_sum = w_self;
-        float mu_weighted = w_self * mu_ref;
+        float w_sum = w_self + w_floor;
+        float mu_weighted = (w_self + w_floor) * mu_ref;
 
         // Neighbor contributions via adjacent_diff offsets
         uint32_t adj_begin = point_adjacency_offsets[point_idx];
@@ -314,8 +315,8 @@ __global__ void ct_interp_forward(TraceSettings settings,
             float bilateral = fabsf(mu_nb - mu_ref);
             float w_nb = expf(-d_sq_nb / sigma_sq - bilateral / sigma_v);
 
-            w_sum += w_nb;
-            mu_weighted += w_nb * mu_nb;
+            w_sum += w_nb + w_floor;
+            mu_weighted += (w_nb + w_floor) * mu_nb;
         }
 
         float mu = fmaxf(0.0f, mu_weighted / fmaxf(w_sum, eps));
@@ -386,6 +387,7 @@ __global__ void ct_interp_backward(TraceSettings settings,
     float sigma_sq = settings.idw_sigma * settings.idw_sigma;
     float sigma_v = settings.idw_sigma_v;
     constexpr float eps = 1e-7f;
+    constexpr float w_floor = 1e-6f;
 
     auto functor = [&](uint32_t point_idx,
                        float t_0,
@@ -408,8 +410,8 @@ __global__ void ct_interp_backward(TraceSettings settings,
         float d_sq_self = diff_self.squaredNorm();
         float w_self = expf(-d_sq_self / sigma_sq);
 
-        float w_sum = w_self;
-        float mu_weighted = w_self * mu_ref;
+        float w_sum = w_self + w_floor;
+        float mu_weighted = (w_self + w_floor) * mu_ref;
 
         uint32_t adj_begin = point_adjacency_offsets[point_idx];
         uint32_t adj_end = point_adjacency_offsets[point_idx + 1];
@@ -429,8 +431,8 @@ __global__ void ct_interp_backward(TraceSettings settings,
             float bilateral = fabsf(mu_nb - mu_ref);
             float w_nb = expf(-d_sq_nb / sigma_sq - bilateral / sigma_v);
 
-            w_sum += w_nb;
-            mu_weighted += w_nb * mu_nb;
+            w_sum += w_nb + w_floor;
+            mu_weighted += (w_nb + w_floor) * mu_nb;
         }
 
         float W = fmaxf(w_sum, eps);
@@ -441,7 +443,7 @@ __global__ void ct_interp_backward(TraceSettings settings,
         float dL_dmu = dL_dprojection * delta_t * indicator;
 
         // --- Density gradient for self ---
-        float alpha_self = w_self / W;
+        float alpha_self = (w_self + w_floor) / W;
         atomicAdd(density_scalar_grad + point_idx,
                   dL_dmu * alpha_self * dsigmoid[point_idx]);
 
@@ -471,7 +473,7 @@ __global__ void ct_interp_backward(TraceSettings settings,
             float w_nb = expf(-d_sq_nb / sigma_sq - bilateral / sigma_v);
 
             // Density gradient for neighbor
-            float alpha_k = w_nb / W;
+            float alpha_k = (w_nb + w_floor) / W;
             atomicAdd(density_scalar_grad + nb,
                       dL_dmu * alpha_k * dsigmoid[nb]);
 
