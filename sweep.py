@@ -195,12 +195,14 @@ def collect_summary(names, output_csv, sort_key="vol_idw_psnr"):
 # ---------------------------------------------------------------------------
 
 
-def run_sweep(runs=None, summarize=False):
+def run_sweep(runs=None, summarize=False, worker=None, num_workers=None):
     """Run all (or selected) sweep 10 experiments.
 
     Args:
         runs: Optional list of specific run IDs to execute.
         summarize: If True, only collect summary from existing results.
+        worker: 1-indexed worker ID for splitting runs.
+        num_workers: Total number of workers.
     """
     all_names = list(SWEEP10_RUNS.keys())
 
@@ -213,7 +215,13 @@ def run_sweep(runs=None, summarize=False):
     else:
         names = all_names
 
-    print(f"Sweep 10: {len(names)}/{len(all_names)} runs selected")
+    if worker is not None and num_workers is not None:
+        # Split names into num_workers chunks, take the worker-th (1-indexed)
+        chunks = [names[i::num_workers] for i in range(num_workers)]
+        names = chunks[worker - 1]
+        print(f"Sweep 10: worker {worker}/{num_workers} — {len(names)} runs: {', '.join(names)}")
+    else:
+        print(f"Sweep 10: {len(names)}/{len(all_names)} runs selected")
 
     if not summarize:
         for name in names:
@@ -235,6 +243,7 @@ def main():
         epilog="Examples:\n"
                "  python sweep.py                           # all 15 runs\n"
                "  python sweep.py --runs A1-256k A2-512k    # specific runs\n"
+               "  python sweep.py --worker 1 --of 4         # run 1st quarter\n"
                "  python sweep.py --list                    # show run names\n"
                "  python sweep.py --summarize               # just collect results\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -243,9 +252,18 @@ def main():
                         help="Only run these specific run IDs")
     parser.add_argument("--summarize", action="store_true",
                         help="Skip training, just collect existing results into summary CSV")
+    parser.add_argument("--worker", type=int, metavar="W",
+                        help="Worker index (1-indexed)")
+    parser.add_argument("--of", type=int, metavar="N", dest="num_workers",
+                        help="Total number of workers")
     parser.add_argument("--list", action="store_true",
                         help="Print all run names and exit")
     args = parser.parse_args()
+
+    if (args.worker is None) != (args.num_workers is None):
+        parser.error("--worker and --of must be used together")
+    if args.worker is not None and not (1 <= args.worker <= args.num_workers):
+        parser.error(f"--worker must be between 1 and {args.num_workers}")
 
     if args.list:
         print(f"\n{len(SWEEP10_RUNS)} sweep 10 runs:")
@@ -256,7 +274,8 @@ def main():
         return
 
     os.makedirs(SWEEP_DIR, exist_ok=True)
-    run_sweep(runs=args.runs, summarize=args.summarize)
+    run_sweep(runs=args.runs, summarize=args.summarize,
+              worker=args.worker, num_workers=args.num_workers)
 
 
 if __name__ == "__main__":
