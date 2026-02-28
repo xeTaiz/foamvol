@@ -24,6 +24,9 @@ class TraceRays(torch.autograd.Function):
         _interpolation_mode=False,
         _idw_sigma=0.01,
         _idw_sigma_v=0.1,
+        _per_cell_sigma=False,
+        _per_neighbor_sigma=False,
+        _cell_radius=None,
     ):
         ctx.rays = rays
         ctx.start_point = start_point
@@ -37,6 +40,9 @@ class TraceRays(torch.autograd.Function):
         ctx.interpolation_mode = _interpolation_mode
         ctx.idw_sigma = _idw_sigma
         ctx.idw_sigma_v = _idw_sigma_v
+        ctx.per_cell_sigma = _per_cell_sigma
+        ctx.per_neighbor_sigma = _per_neighbor_sigma
+        ctx.cell_radius = _cell_radius
         if ctx.has_density_grad:
             ctx.density_grad = _density_grad
 
@@ -53,6 +59,9 @@ class TraceRays(torch.autograd.Function):
             interpolation_mode=_interpolation_mode,
             idw_sigma=_idw_sigma,
             idw_sigma_v=_idw_sigma_v,
+            per_cell_sigma=_per_cell_sigma,
+            per_neighbor_sigma=_per_neighbor_sigma,
+            cell_radius=_cell_radius,
         )
 
         errbox = ErrorBox()
@@ -90,6 +99,9 @@ class TraceRays(torch.autograd.Function):
         interpolation_mode = ctx.interpolation_mode
         idw_sigma = ctx.idw_sigma
         idw_sigma_v = ctx.idw_sigma_v
+        per_cell_sigma = ctx.per_cell_sigma
+        per_neighbor_sigma = ctx.per_neighbor_sigma
+        cell_radius = ctx.cell_radius
 
         results = pipeline.trace_backward(
             _points,
@@ -105,6 +117,9 @@ class TraceRays(torch.autograd.Function):
             interpolation_mode=interpolation_mode,
             idw_sigma=idw_sigma,
             idw_sigma_v=idw_sigma_v,
+            per_cell_sigma=per_cell_sigma,
+            per_neighbor_sigma=per_neighbor_sigma,
+            cell_radius=cell_radius,
         )
         points_grad = results["points_grad"]
         attr_grad = results["attr_grad"]
@@ -129,6 +144,9 @@ class TraceRays(torch.autograd.Function):
             ctx.interpolation_mode,
             ctx.idw_sigma,
             ctx.idw_sigma_v,
+            ctx.per_cell_sigma,
+            ctx.per_neighbor_sigma,
+            ctx.cell_radius,
         )
         if has_density_grad:
             del ctx.density_grad
@@ -147,4 +165,7 @@ class TraceRays(torch.autograd.Function):
             None,  # _interpolation_mode
             None,  # _idw_sigma
             None,  # _idw_sigma_v
+            None,  # _per_cell_sigma
+            None,  # _per_neighbor_sigma
+            None,  # _cell_radius
         )

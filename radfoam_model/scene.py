@@ -248,9 +248,9 @@ class CTScene(torch.nn.Module):
 
         # Gaussian spatial weight
         d_sq = (points[adj] - points[source]).pow(2).sum(dim=-1)
-        # Bilateral weight (density similarity)
-        bilateral = (activated[source] - activated[adj]).abs()
-        w = torch.exp(-d_sq / sigma_sq - bilateral / sigma_v)
+        # Gaussian bilateral weight (density similarity)
+        dmu = activated[source] - activated[adj]
+        w = torch.exp(-d_sq / sigma_sq - dmu * dmu / (sigma_v * sigma_v))
 
         # Per-cell weighted sum
         w_sum = torch.zeros(N, device=points.device).scatter_add_(0, source, w)
@@ -261,12 +261,17 @@ class CTScene(torch.nn.Module):
         interp = w_mu_sum / w_sum.clamp(min=1e-8)
         return (activated - interp).abs()
 
-    def set_interpolation_mode(self, enabled, sigma=None, sigma_v=None):
+    def set_interpolation_mode(self, enabled, sigma=None, sigma_v=None,
+                               per_cell_sigma=None, per_neighbor_sigma=None):
         self._interpolation_mode = enabled
         if sigma is not None:
             self._idw_sigma = sigma
         if sigma_v is not None:
             self._idw_sigma_v = sigma_v
+        if per_cell_sigma is not None:
+            self._per_cell_sigma = per_cell_sigma
+        if per_neighbor_sigma is not None:
+            self._per_neighbor_sigma = per_neighbor_sigma
 
     def get_trace_data(self):
         points = self.primal_points
@@ -277,6 +282,16 @@ class CTScene(torch.nn.Module):
         gradient_max_slope = getattr(self, "_gradient_max_slope", 5.0)
 
         return points, density, point_adjacency, point_adjacency_offsets, density_grad, gradient_max_slope
+
+    @torch.no_grad()
+    def _get_cell_radius(self):
+        """Compute per-cell radius (cached until triangulation changes)."""
+        _, cell_radius = radfoam.farthest_neighbor(
+            self.primal_points,
+            self.point_adjacency,
+            self.point_adjacency_offsets,
+        )
+        return cell_radius.squeeze()
 
     def get_starting_point(self, rays, points, aabb_tree):
         with torch.no_grad():
@@ -303,6 +318,13 @@ class CTScene(torch.nn.Module):
         interpolation_mode = getattr(self, "_interpolation_mode", False)
         idw_sigma = getattr(self, "_idw_sigma", 0.01)
         idw_sigma_v = getattr(self, "_idw_sigma_v", 0.1)
+        per_cell_sigma = getattr(self, "_per_cell_sigma", False)
+        per_neighbor_sigma = getattr(self, "_per_neighbor_sigma", False)
+
+        # Compute cell_radius on demand when adaptive sigma is active
+        cell_radius = None
+        if interpolation_mode and (per_cell_sigma or per_neighbor_sigma):
+            cell_radius = self._get_cell_radius()
 
         # When interpolation is active, suppress the linear gradient feature
         if interpolation_mode:
@@ -326,6 +348,9 @@ class CTScene(torch.nn.Module):
             interpolation_mode,
             idw_sigma,
             idw_sigma_v,
+            per_cell_sigma,
+            per_neighbor_sigma,
+            cell_radius,
         )
 
     def declare_optimizer(self, args, warmup, max_iterations):

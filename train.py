@@ -498,14 +498,24 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         writer.add_scalar("densify/points_after", model.primal_points.shape[0], i)
 
                     if pipeline_args.interpolation_start >= 0:
-                        _, cell_radius = radfoam.farthest_neighbor(
-                            model.primal_points,
-                            model.point_adjacency,
-                            model.point_adjacency_offsets,
+                        use_adaptive = pipeline_args.per_cell_sigma or pipeline_args.per_neighbor_sigma
+                        if use_adaptive:
+                            # Pass raw scale factor — kernel multiplies by per-cell radius
+                            sigma = pipeline_args.interp_sigma_scale
+                        else:
+                            _, cell_radius = radfoam.farthest_neighbor(
+                                model.primal_points,
+                                model.point_adjacency,
+                                model.point_adjacency_offsets,
+                            )
+                            sigma = pipeline_args.interp_sigma_scale * cell_radius.median().item()
+                        model.set_interpolation_mode(
+                            False, sigma=sigma, sigma_v=pipeline_args.interp_sigma_v,
+                            per_cell_sigma=pipeline_args.per_cell_sigma,
+                            per_neighbor_sigma=pipeline_args.per_neighbor_sigma,
                         )
-                        sigma = pipeline_args.interp_sigma_scale * cell_radius.median().item()
-                        model.set_interpolation_mode(False, sigma=sigma, sigma_v=pipeline_args.interp_sigma_v)
-                        print(f"Prepared interpolation sigma={sigma:.6f} at densify_until={i}")
+                        print(f"Prepared interpolation sigma={sigma:.6f} "
+                              f"adaptive={use_adaptive} at densify_until={i}")
 
                 if (
                     optimizer_args.gradient_start >= 0

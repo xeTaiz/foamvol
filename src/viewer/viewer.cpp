@@ -1485,6 +1485,7 @@ struct ViewerPrivate : public Viewer {
                 num_point_adjacency,
                 reinterpret_cast<const uint32_t *>(point_adjacency),
                 reinterpret_cast<const uint32_t *>(point_adjacency_offsets),
+                nullptr,
                 reinterpret_cast<Vec4h *>(adjacent_diff_buffer.begin()),
                 nullptr);
 
