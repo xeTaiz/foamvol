@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Hyperparameter sweep for CT reconstruction.
 
-Sweep 8: Hyperparameter Screening & Refinement.
-Phase 1: One-at-a-time screening (25 runs).
-Phase 2: Combine best per-axis settings + ablation (~4-8 runs).
+Sweep 9: Refinement around sweep 8 winners.
+Combined base: density_lr_init=5e-2, interp_sigma_scale=0.7 (rest from r2fast.yaml).
 
 Usage:
-    python sweep.py --phase 1
-    python sweep.py --phase 2
+    python sweep.py                           # all 15 runs
+    python sweep.py --runs E1-sv03 E2-sv04    # specific runs for worker splitting
+    python sweep.py --list                    # print run names
+    python sweep.py --summarize               # collect results only
 """
 
 import argparse
@@ -20,7 +21,7 @@ import sys
 import yaml
 
 # ---------------------------------------------------------------------------
-# Baseline (matches r2fast.yaml)
+# Baseline (combined best from sweep 8: density_lr_init=5e-2 + sigma_scale=0.7)
 # ---------------------------------------------------------------------------
 
 BASELINE = {
@@ -35,7 +36,7 @@ BASELINE = {
     "viewer": False,
     "save_volume": False,
     "interpolation_start": 9000,
-    "interp_sigma_scale": 0.55,
+    "interp_sigma_scale": 0.7,
     "interp_sigma_v": 0.2,
     "redundancy_threshold": 0.01,
     "redundancy_cap": 0.05,
@@ -48,7 +49,7 @@ BASELINE = {
     # Optimization
     "points_lr_init": 2e-4,
     "points_lr_final": 5e-6,
-    "density_lr_init": 1e-1,
+    "density_lr_init": 5e-2,
     "density_lr_final": 1e-2,
     "freeze_points": 9500,
     "tv_weight": 1e-4,
@@ -61,59 +62,35 @@ BASELINE = {
     "data_path": "/mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
 }
 
-SWEEP_NAME = "sweep8"
+SWEEP_NAME = "sweep9"
 SWEEP_DIR = f"output/{SWEEP_NAME}"
 
-# Point budgets for Phase 2 (init_points : final_points, 1:4 ratio)
-POINT_BUDGETS = {
-    "128k": {"init_points": 32000,  "final_points": 128000},
-    "256k": {"init_points": 64000,  "final_points": 256000},
-    "512k": {"init_points": 128000, "final_points": 512000},
-}
-
 # ---------------------------------------------------------------------------
-# Phase 1: One-at-a-time screening (25 runs)
+# All sweep 9 runs (flat dict — no phases)
 # ---------------------------------------------------------------------------
 
-PHASE1_RUNS = {
+SWEEP9_RUNS = {
     "baseline": {},
-    # Axis A: Learning rates
-    "A1-dli5e2": {"density_lr_init": 5e-2},
-    "A2-dli2e1": {"density_lr_init": 2e-1},
-    "A3-dli5e1": {"density_lr_init": 5e-1},
-    "A4-dlf5e3": {"density_lr_final": 5e-3},
-    "A5-dlf2e2": {"density_lr_final": 2e-2},
-    "A6-pli1e4": {"points_lr_init": 1e-4},
-    "A7-pli5e4": {"points_lr_init": 5e-4},
-    "A8-pli1e3": {"points_lr_init": 1e-3},
-    # Axis B: Schedule timing
-    "B1-frz8k": {"freeze_points": 8000},
-    "B2-frz99": {"freeze_points": 9900},
-    "B3-den45": {"densify_until": 4500},
-    "B4-den75": {"densify_until": 7500},
-    "B5-int75": {"interpolation_start": 7500},
-    "B6-intOff": {"interpolation_start": -1},
-    # Axis C: TV regularization
-    "C1-tv0": {"tv_weight": 0.0},
-    "C2-tv1e5": {"tv_weight": 1e-5},
-    "C3-tv1e3": {"tv_weight": 1e-3},
-    # Axis D: Interpolation sigmas
-    "D1-ss03": {"interp_sigma_scale": 0.3},
-    "D2-ss04": {"interp_sigma_scale": 0.4},
-    "D3-ss07": {"interp_sigma_scale": 0.7},
-    "D4-ss09": {"interp_sigma_scale": 0.9},
-    "D5-sv005": {"interp_sigma_v": 0.05},
-    "D6-sv01": {"interp_sigma_v": 0.1},
-    "D7-sv04": {"interp_sigma_v": 0.4},
+    # Group E: sigma_v exploration
+    "E1-sv03":   {"interp_sigma_v": 0.3},
+    "E2-sv04":   {"interp_sigma_v": 0.4},
+    "E3-sv06":   {"interp_sigma_v": 0.6},
+    # Group F: density_lr_final annealing
+    "F1-dlf5e3": {"density_lr_final": 5e-3},
+    "F2-dlf2e3": {"density_lr_final": 2e-3},
+    "F3-dlf1e3": {"density_lr_final": 1e-3},
+    # Group G: sigma_scale refinement
+    "G1-ss06":   {"interp_sigma_scale": 0.6},
+    "G2-ss08":   {"interp_sigma_scale": 0.8},
+    # Group H: point budgets (1:4 init:final ratio)
+    "H1-64k":    {"init_points": 16000, "final_points": 64000},
+    "H2-80k":    {"init_points": 20000, "final_points": 80000},
+    "H3-100k":   {"init_points": 25000, "final_points": 100000},
+    "H4-140k":   {"init_points": 35000, "final_points": 140000},
+    # Group X: spot-checks
+    "X1-pli1e3": {"points_lr_init": 1e-3},
+    "X2-tv5e5":  {"tv_weight": 5e-5},
 }
-
-# Map each run to its axis for Phase 2 analysis
-AXIS_MAP = {}
-for run_id in PHASE1_RUNS:
-    if run_id == "baseline":
-        AXIS_MAP[run_id] = "baseline"
-    else:
-        AXIS_MAP[run_id] = run_id[0]  # 'A', 'B', 'C', 'D'
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -205,202 +182,20 @@ def collect_summary(names, output_csv, sort_key="vol_idw_psnr"):
     return rows
 
 
-def load_phase1_summary():
-    """Load Phase 1 summary CSV and return rows as list of dicts."""
-    csv_path = os.path.join(SWEEP_DIR, "summary_phase1.csv")
-    if not os.path.exists(csv_path):
-        print(f"[ERROR] Phase 1 summary not found: {csv_path}")
-        print("        Run --phase 1 first.")
-        sys.exit(1)
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-    # Convert numeric fields
-    for row in rows:
-        for k, v in row.items():
-            if k == "name":
-                continue
-            try:
-                row[k] = float(v)
-            except (ValueError, TypeError):
-                pass
-    return rows
-
-
 # ---------------------------------------------------------------------------
-# Phase 1
+# Sweep runner
 # ---------------------------------------------------------------------------
 
 
-def filter_runs(names, runs=None, axes=None):
-    """Filter run names by explicit IDs and/or axis letters."""
-    if runs is None and axes is None:
-        return names
-    selected = set()
-    if runs:
-        for r in runs:
-            if r in PHASE1_RUNS:
-                selected.add(r)
-            else:
-                print(f"[WARN] Unknown run ID: {r}")
-    if axes:
-        for name in names:
-            axis = AXIS_MAP.get(name, "")
-            if axis in axes or name in axes:
-                selected.add(name)
-    # Preserve original order
-    return [n for n in names if n in selected]
-
-
-def phase1(runs=None, axes=None, summarize=False):
-    """Run one-at-a-time screening experiments.
+def run_sweep(runs=None, summarize=False):
+    """Run all (or selected) sweep 9 experiments.
 
     Args:
         runs: Optional list of specific run IDs to execute.
-        axes: Optional list of axis letters (A/B/C/D) or 'baseline'.
         summarize: If True, only collect summary from existing results.
     """
-    all_names = list(PHASE1_RUNS.keys())
-    names = filter_runs(all_names, runs, axes)
-    print(f"Phase 1: {len(names)}/{len(all_names)} runs selected")
+    all_names = list(SWEEP9_RUNS.keys())
 
-    if not summarize:
-        for name in names:
-            cfg = build_config(PHASE1_RUNS[name])
-            run_experiment(name, cfg)
-
-    # Summary always covers all available results
-    return collect_summary(all_names, os.path.join(SWEEP_DIR, "summary_phase1.csv"))
-
-
-# ---------------------------------------------------------------------------
-# Phase 2: Combine best per-axis + ablations
-# ---------------------------------------------------------------------------
-
-
-def find_best_per_axis(rows):
-    """For each axis, find the run that beats baseline on vol_idw_psnr.
-
-    Returns dict: axis_letter -> (run_id, overrides_dict, psnr_delta).
-    Only includes axes where the best variant beats baseline.
-    """
-    baseline_row = None
-    for row in rows:
-        if row["name"] == "baseline":
-            baseline_row = row
-            break
-
-    if baseline_row is None:
-        print("[ERROR] No baseline run found in Phase 1 results")
-        sys.exit(1)
-
-    baseline_psnr = baseline_row.get("vol_idw_psnr", 0)
-    print(f"\nBaseline vol_idw_psnr: {baseline_psnr:.4f}")
-
-    # Group runs by axis
-    axes = {}  # axis_letter -> list of (run_id, psnr)
-    for row in rows:
-        run_id = row["name"]
-        if run_id == "baseline":
-            continue
-        axis = AXIS_MAP.get(run_id, "?")
-        psnr = row.get("vol_idw_psnr", 0)
-        axes.setdefault(axis, []).append((run_id, psnr))
-
-    winners = {}
-    for axis in sorted(axes.keys()):
-        best_id, best_psnr = max(axes[axis], key=lambda x: x[1])
-        delta = best_psnr - baseline_psnr
-        status = "BETTER" if delta > 0 else "worse"
-        print(f"  Axis {axis}: best={best_id} psnr={best_psnr:.4f} (delta={delta:+.4f}) [{status}]")
-        if delta > 0:
-            winners[axis] = (best_id, PHASE1_RUNS[best_id], delta)
-
-    return winners, baseline_psnr
-
-
-def build_phase2_configs(rows):
-    """Build Phase 2 hyperparam configs from Phase 1 results.
-
-    Returns dict: config_id -> overrides (without point budget applied yet).
-    """
-    winners, baseline_psnr = find_best_per_axis(rows)
-
-    if not winners:
-        print("\n[INFO] No axis improved over baseline. Nothing to combine.")
-        return {}
-
-    print(f"\n--- Phase 2: Combining {len(winners)} winning axes ---")
-
-    combined_overrides = {}
-    for axis, (run_id, overrides, delta) in sorted(winners.items()):
-        print(f"  Including {run_id}: {overrides} (delta={delta:+.4f})")
-        combined_overrides.update(overrides)
-
-    configs = {"P2-combined": combined_overrides}
-
-    # Ablation: combined minus each axis
-    if len(winners) > 1:
-        for axis, (run_id, overrides, _) in sorted(winners.items()):
-            ablation_overrides = {k: v for k, v in combined_overrides.items()
-                                  if k not in overrides}
-            configs[f"P2-no{axis}"] = ablation_overrides
-
-    # If both sigma_scale and sigma_v won, add 2x2 mini-grid
-    if "D" in winners:
-        d_scale_runs = [r for r in rows if r["name"].startswith("D") and "ss" in r["name"]]
-        d_sv_runs = [r for r in rows if r["name"].startswith("D") and "sv" in r["name"]]
-
-        if d_scale_runs and d_sv_runs:
-            best_scale = max(d_scale_runs, key=lambda r: r.get("vol_idw_psnr", 0))
-            best_sv = max(d_sv_runs, key=lambda r: r.get("vol_idw_psnr", 0))
-
-            if (best_scale.get("vol_idw_psnr", 0) > baseline_psnr
-                    and best_sv.get("vol_idw_psnr", 0) > baseline_psnr):
-                scale_overrides = PHASE1_RUNS[best_scale["name"]]
-                sv_overrides = PHASE1_RUNS[best_sv["name"]]
-                combo_d = {**scale_overrides, **sv_overrides}
-                if combo_d != {k: v for k, v in combined_overrides.items()
-                               if k in ("interp_sigma_scale", "interp_sigma_v")}:
-                    configs["P2-Dcombo"] = {
-                        **{k: v for k, v in combined_overrides.items()
-                           if k not in ("interp_sigma_scale", "interp_sigma_v")},
-                        **combo_d,
-                    }
-
-    return configs
-
-
-def phase2(runs=None, points=None, summarize=False):
-    """Combine best per-axis winners, cross with point budgets, and run.
-
-    Args:
-        runs: Optional list of run IDs to execute (e.g. P2-combined-256k).
-        points: Optional list of point budget keys (128k/256k/512k).
-        summarize: If True, only collect summary from existing results.
-    """
-    rows = load_phase1_summary()
-    configs = build_phase2_configs(rows)
-
-    if not configs:
-        return
-
-    budgets = points if points else list(POINT_BUDGETS.keys())
-
-    # Cross configs × point budgets
-    phase2_runs = {}
-    for cfg_id, overrides in configs.items():
-        for budget in budgets:
-            name = f"{cfg_id}-{budget}"
-            phase2_runs[name] = {**overrides, **POINT_BUDGETS[budget]}
-
-    # Also include baseline at each budget for comparison
-    for budget in budgets:
-        name = f"P2-baseline-{budget}"
-        phase2_runs[name] = dict(POINT_BUDGETS[budget])
-
-    # Filter by --runs if specified
-    all_names = list(phase2_runs.keys())
     if runs:
         selected = set(runs)
         names = [n for n in all_names if n in selected]
@@ -410,36 +205,15 @@ def phase2(runs=None, points=None, summarize=False):
     else:
         names = all_names
 
-    print(f"\nPhase 2: {len(names)}/{len(all_names)} runs selected "
-          f"({len(configs)} configs × {len(budgets)} budgets + {len(budgets)} baselines)")
+    print(f"Sweep 9: {len(names)}/{len(all_names)} runs selected")
 
     if not summarize:
         for name in names:
-            cfg = build_config(phase2_runs[name])
+            cfg = build_config(SWEEP9_RUNS[name])
             run_experiment(name, cfg)
 
-    # Summary covers all available results
-    return collect_summary(all_names, os.path.join(SWEEP_DIR, "summary_phase2.csv"))
-
-
-def phase2_list(points=None):
-    """Print all Phase 2 run names (for planning worker splits)."""
-    rows = load_phase1_summary()
-    configs = build_phase2_configs(rows)
-    if not configs:
-        return
-
-    budgets = points if points else list(POINT_BUDGETS.keys())
-    names = []
-    for cfg_id in configs:
-        for budget in budgets:
-            names.append(f"{cfg_id}-{budget}")
-    for budget in budgets:
-        names.append(f"P2-baseline-{budget}")
-
-    print(f"\n{len(names)} Phase 2 runs:")
-    for name in names:
-        print(f"  {name}")
+    # Summary always covers all available results
+    return collect_summary(all_names, os.path.join(SWEEP_DIR, "summary.csv"))
 
 
 # ---------------------------------------------------------------------------
@@ -449,42 +223,32 @@ def phase2_list(points=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CT reconstruction hyperparameter sweep (sweep 8)",
+        description="CT reconstruction hyperparameter sweep (sweep 9)",
         epilog="Examples:\n"
-               "  python sweep.py --phase 1                    # all 25 runs\n"
-               "  python sweep.py --phase 1 --axis A B         # axes A+B (9 runs)\n"
-               "  python sweep.py --phase 1 --runs A1-dli5e2 A2-dli2e1\n"
-               "  python sweep.py --phase 2                    # all configs × all budgets\n"
-               "  python sweep.py --phase 2 --points 256k 512k # only higher budgets\n"
-               "  python sweep.py --phase 2 --runs P2-combined-256k P2-combined-512k\n"
-               "  python sweep.py --phase 2 --list             # show run names, don't run\n"
-               "  python sweep.py --phase 2 --summarize        # just collect results\n",
+               "  python sweep.py                           # all 15 runs\n"
+               "  python sweep.py --runs E1-sv03 E2-sv04    # specific runs\n"
+               "  python sweep.py --list                    # show run names\n"
+               "  python sweep.py --summarize               # just collect results\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--phase", type=int, default=1, choices=[1, 2],
-                        help="1 = one-at-a-time screening, 2 = combine winners + point budgets")
-    parser.add_argument("--axis", nargs="+", metavar="X",
-                        help="Phase 1: only run these axes (A/B/C/D/baseline)")
     parser.add_argument("--runs", nargs="+", metavar="ID",
                         help="Only run these specific run IDs")
-    parser.add_argument("--points", nargs="+", metavar="BUD",
-                        choices=list(POINT_BUDGETS.keys()),
-                        help="Phase 2: point budgets to test (default: all)")
     parser.add_argument("--summarize", action="store_true",
                         help="Skip training, just collect existing results into summary CSV")
     parser.add_argument("--list", action="store_true",
-                        help="Phase 2: print all run names and exit (for planning worker splits)")
+                        help="Print all run names and exit")
     args = parser.parse_args()
 
-    os.makedirs(SWEEP_DIR, exist_ok=True)
+    if args.list:
+        print(f"\n{len(SWEEP9_RUNS)} sweep 9 runs:")
+        for name in SWEEP9_RUNS:
+            overrides = SWEEP9_RUNS[name]
+            desc = ", ".join(f"{k}={v}" for k, v in overrides.items()) if overrides else "(combined base)"
+            print(f"  {name:12s}  {desc}")
+        return
 
-    if args.phase == 1:
-        phase1(runs=args.runs, axes=args.axis, summarize=args.summarize)
-    elif args.phase == 2:
-        if args.list:
-            phase2_list(points=args.points)
-        else:
-            phase2(runs=args.runs, points=args.points, summarize=args.summarize)
+    os.makedirs(SWEEP_DIR, exist_ok=True)
+    run_sweep(runs=args.runs, summarize=args.summarize)
 
 
 if __name__ == "__main__":
