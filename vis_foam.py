@@ -34,14 +34,20 @@ IDWResult = namedtuple("IDWResult", [
 def field_from_model(model):
     """Build a field dict from a live CTScene (no checkpoint save/load)."""
     with torch.no_grad():
+        adj = model.point_adjacency.long()
+        adj_off = model.point_adjacency_offsets.long()
+        _, cell_radius = radfoam.farthest_neighbor(
+            model.primal_points, adj.to(torch.int32), adj_off.to(torch.int32)
+        )
         return {
             "points": model.primal_points,
             "density_flat": model.density.squeeze(-1),
             "gradients": getattr(model, "density_grad", None),
             "grad_max_slope": getattr(model, "_gradient_max_slope", None),
-            "adjacency": model.point_adjacency.long(),
-            "adjacency_offsets": model.point_adjacency_offsets.long(),
+            "adjacency": adj,
+            "adjacency_offsets": adj_off,
             "aabb_tree": model.aabb_tree,
+            "cell_radius": cell_radius,
             "device": model.primal_points.device,
         }
 
@@ -66,6 +72,7 @@ def load_density_field(model_path, device="cuda"):
     adjacency = scene_data["adjacency"].to(device).to(torch.int32)
     adjacency_offsets = scene_data["adjacency_offsets"].to(device).to(torch.int32)
     aabb_tree = radfoam.build_aabb_tree(points)
+    _, cell_radius = radfoam.farthest_neighbor(points, adjacency, adjacency_offsets)
 
     return {
         "points": points,
@@ -75,6 +82,7 @@ def load_density_field(model_path, device="cuda"):
         "adjacency": adjacency,
         "adjacency_offsets": adjacency_offsets,
         "aabb_tree": aabb_tree,
+        "cell_radius": cell_radius,
         "device": device,
     }
 
@@ -116,10 +124,11 @@ def query_density(field, coordinates):
     return result.reshape(original_shape).cpu().numpy()
 
 
-def _idw_query(query, field, activated, sigma, sigma_v, global_max_k=None):
+def _idw_query(query, field, activated, sigma, sigma_v, global_max_k=None,
+               per_cell_sigma=False, per_neighbor_sigma=False):
     """Core bilateral IDW for a batch of query points.
 
-    Matches the CUDA kernel: exp(-d²/σ²) spatial × exp(-|Δμ|/σ_v) bilateral.
+    Matches the CUDA kernel: exp(-d²/σ²) spatial × exp(-Δμ²/σ_v²) bilateral.
     Applies a 1e-6 weight floor on valid neighbors to prevent black spots
     when all spatial+bilateral weights collapse to near-zero.
 
@@ -127,9 +136,14 @@ def _idw_query(query, field, activated, sigma, sigma_v, global_max_k=None):
         query: (B, 3) tensor of query positions
         field: density field dict
         activated: (N,) precomputed softplus-activated densities
-        sigma: spatial Gaussian scale
+        sigma: spatial Gaussian scale (or sigma_scale when per_cell_sigma=True)
         sigma_v: bilateral value-similarity scale (None=disabled)
         global_max_k: max neighbor count (computed if None)
+        per_cell_sigma: if True, sigma is treated as a scale factor multiplied
+            by each cell's radius instead of a global value
+        per_neighbor_sigma: only used when per_cell_sigma=True.
+            False (Mode A): all slots use containing cell's radius.
+            True (Mode B): each slot uses its own cell's radius.
 
     Returns:
         IDWResult namedtuple
@@ -167,15 +181,27 @@ def _idw_query(query, field, activated, sigma, sigma_v, global_max_k=None):
     centers = points[pad_idx]
     diff = query.unsqueeze(1) - centers
     dist_sq = diff.pow(2).sum(dim=-1)
-    sigma_sq = sigma * sigma
+
+    if per_cell_sigma:
+        cell_radius = field["cell_radius"]
+        if per_neighbor_sigma:
+            # Mode B: each slot uses its own cell's radius
+            sigma_sq = (sigma * cell_radius[pad_idx]).pow(2)  # (B, K+1)
+        else:
+            # Mode A: all slots use the containing cell's radius
+            sigma_sq = (sigma * cell_radius[nn_idx]).pow(2)   # (B,)
+            sigma_sq = sigma_sq.unsqueeze(1)                  # (B, 1) broadcast
+    else:
+        sigma_sq = sigma * sigma
+
     w = torch.exp(-dist_sq / sigma_sq)
 
-    # 4. Bilateral: w *= exp(-|Δμ|/σ_v)
+    # 4. Bilateral: w *= exp(-Δμ²/σ_v²)
     vals = activated[pad_idx]
     if sigma_v is not None:
         ref_val = activated[nn_idx]
-        val_diff = (vals - ref_val.unsqueeze(1)).abs()
-        w = w * torch.exp(-val_diff / sigma_v)
+        val_diff = vals - ref_val.unsqueeze(1)
+        w = w * torch.exp(-val_diff * val_diff / (sigma_v * sigma_v))
 
     # 5. Mask invalid, apply weight floor, normalize, weighted sum
     w[~valid] = 0.0
@@ -198,22 +224,27 @@ def _idw_query(query, field, activated, sigma, sigma_v, global_max_k=None):
     )
 
 
-def sample_idw(field, coordinates, sigma=0.01, sigma_v=None):
+def sample_idw(field, coordinates, sigma=0.01, sigma_v=None,
+               per_cell_sigma=False, per_neighbor_sigma=False):
     """Inverse-distance weighted interpolation over Voronoi neighbors.
 
     For each query point, finds the containing cell, gathers its Voronoi
     neighbors, and returns the IDW-weighted average of their activated
     densities (softplus of raw values).
 
-    When sigma_v is set, applies bilateral weighting: neighbors with
+    When sigma_v is set, applies Gaussian bilateral weighting: neighbors with
     dissimilar density to the containing cell are downweighted by
-    exp(-|mu_i - mu_ref| / sigma_v).
+    exp(-(mu_i - mu_ref)² / sigma_v²).
 
     Args:
         field: dict from load_density_field() or field_from_model()
         coordinates: numpy or torch array of shape (..., 3)
         sigma: length scale for exp(-dist/sigma) spatial weighting
+            (or sigma_scale when per_cell_sigma=True)
         sigma_v: value-similarity scale for bilateral weighting (None=disabled)
+        per_cell_sigma: use per-cell adaptive sigma instead of global
+        per_neighbor_sigma: Mode B (each neighbor uses its own radius)
+            vs Mode A (all slots use containing cell's radius)
 
     Returns:
         numpy array of shape (...) with interpolated density values
@@ -233,7 +264,9 @@ def sample_idw(field, coordinates, sigma=0.01, sigma_v=None):
     for start in range(0, coords_flat.shape[0], batch_size):
         end = min(start + batch_size, coords_flat.shape[0])
         res = _idw_query(coords_flat[start:end], field, activated,
-                         sigma, sigma_v, global_max_k)
+                         sigma, sigma_v, global_max_k,
+                         per_cell_sigma=per_cell_sigma,
+                         per_neighbor_sigma=per_neighbor_sigma)
         result[start:end] = res.idw_result
 
     return torch.nan_to_num(result).reshape(original_shape).cpu().numpy()
@@ -307,8 +340,8 @@ def sample_idw_diagnostic(field, coordinates, sigma=0.001, sigma_v=None):
 
     if sigma_v is not None:
         ref_val = activated[res.nn_idx]
-        val_diff = (res.vals - ref_val.unsqueeze(1)).abs()
-        vw = torch.exp(-val_diff / sigma_v)
+        val_diff = res.vals - ref_val.unsqueeze(1)
+        vw = torch.exp(-val_diff * val_diff / (sigma_v * sigma_v))
         vw[~res.valid] = 0.0
         n_valid = res.valid.float().sum(dim=1).clamp(min=1)
         result["value_weight"] = to_hw(vw.sum(dim=1) / n_valid)
@@ -519,7 +552,7 @@ def voxelize_volumes(field, resolution, extent, sigma, sigma_v):
 
     Raw volume: softplus(density[nearest_cell]) — constant per Voronoi cell.
     IDW volume: Gaussian bilateral natural-neighbor interpolation matching
-    the CUDA tracing kernel (exp(-d²/σ²) spatial, exp(-|Δμ|/σ_v) bilateral).
+    the CUDA tracing kernel (exp(-d²/σ²) spatial, exp(-Δμ²/σ_v²) bilateral).
 
     Args:
         field: dict from load_density_field() or field_from_model()

@@ -27,7 +27,7 @@ device: cuda
 points_lr_init: 2e-4
 points_lr_final: 5e-6
 density_lr_init: 5e-2
-density_lr_final: 1e-3
+density_lr_final: 1e-2 # 1e-3 eventually? this was better in some sweep
 freeze_points: 9500
 tv_weight: 1e-4
 tv_start: 5000

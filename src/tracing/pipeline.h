@@ -14,6 +14,8 @@ struct TraceSettings {
     bool interpolation_mode = false;
     float idw_sigma = 0.01f;
     float idw_sigma_v = 0.1f;
+    bool per_cell_sigma = false;
+    bool per_neighbor_sigma = false;
 };
 
 inline TraceSettings default_trace_settings() {
@@ -71,6 +73,7 @@ void prefetch_adjacent_diff(const Vec3f *points,
                             uint32_t point_adjacency_size,
                             const uint32_t *point_adjacency,
                             const uint32_t *point_adjacency_offsets,
+                            const float *cell_radius,
                             Vec4h *adjacent_diff,
                             const void *stream);
 
@@ -91,7 +94,8 @@ class Pipeline {
                                const uint32_t *start_point_index,
                                float *ray_projection,
                                uint32_t *num_intersections,
-                               float *point_contribution) = 0;
+                               float *point_contribution,
+                               const float *cell_radius = nullptr) = 0;
 
     virtual void trace_backward(const TraceSettings &settings,
                                 uint32_t num_points,
@@ -109,7 +113,8 @@ class Pipeline {
                                 Vec3f *points_grad,
                                 float *density_scalar_grad,
                                 Vec3f *density_grad_grad,
-                                float *point_error) = 0;
+                                float *point_error,
+                                const float *cell_radius = nullptr) = 0;
 
     // Stub for viewer compatibility — CT pipeline does not implement this
     virtual void trace_visualization(const TraceSettings &settings,

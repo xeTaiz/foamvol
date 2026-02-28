@@ -117,7 +117,10 @@ py::object trace_forward(Pipeline &self,
                          float gradient_max_slope,
                          bool interpolation_mode,
                          float idw_sigma,
-                         float idw_sigma_v) {
+                         float idw_sigma_v,
+                         bool per_cell_sigma,
+                         bool per_neighbor_sigma,
+                         std::optional<torch::Tensor> cell_radius_in) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -163,6 +166,12 @@ py::object trace_forward(Pipeline &self,
         density_grad = density_grad_in.value().contiguous();
     }
 
+    bool has_cell_radius = cell_radius_in.has_value();
+    torch::Tensor cell_radius;
+    if (has_cell_radius) {
+        cell_radius = cell_radius_in.value().contiguous();
+    }
+
     TraceSettings settings = default_trace_settings();
     if (!max_intersections.is_none()) {
         settings.max_intersections = max_intersections.cast<uint32_t>();
@@ -171,6 +180,8 @@ py::object trace_forward(Pipeline &self,
     settings.interpolation_mode = interpolation_mode;
     settings.idw_sigma = idw_sigma;
     settings.idw_sigma_v = idw_sigma_v;
+    settings.per_cell_sigma = per_cell_sigma;
+    settings.per_neighbor_sigma = per_neighbor_sigma;
 
     std::vector<int64_t> output_shape;
     for (int i = 0; i < rays.dim() - 1; i++) {
@@ -218,6 +229,9 @@ py::object trace_forward(Pipeline &self,
         reinterpret_cast<uint32_t *>(num_intersections.data_ptr()),
         return_contribution
             ? reinterpret_cast<float *>(output_contribution.data_ptr())
+            : nullptr,
+        has_cell_radius
+            ? reinterpret_cast<const float *>(cell_radius.data_ptr())
             : nullptr);
 
     py::dict output_dict;
@@ -245,7 +259,10 @@ py::object trace_backward(Pipeline &self,
                           float gradient_max_slope,
                           bool interpolation_mode,
                           float idw_sigma,
-                          float idw_sigma_v) {
+                          float idw_sigma_v,
+                          bool per_cell_sigma,
+                          bool per_neighbor_sigma,
+                          std::optional<torch::Tensor> cell_radius_in) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -266,6 +283,12 @@ py::object trace_backward(Pipeline &self,
     torch::Tensor density_grad;
     if (has_density_grad) {
         density_grad = density_grad_in.value().contiguous();
+    }
+
+    bool has_cell_radius = cell_radius_in.has_value();
+    torch::Tensor cell_radius;
+    if (has_cell_radius) {
+        cell_radius = cell_radius_in.value().contiguous();
     }
 
     uint32_t num_points = points.size(0);
@@ -337,6 +360,8 @@ py::object trace_backward(Pipeline &self,
     settings.interpolation_mode = interpolation_mode;
     settings.idw_sigma = idw_sigma;
     settings.idw_sigma_v = idw_sigma_v;
+    settings.per_cell_sigma = per_cell_sigma;
+    settings.per_neighbor_sigma = per_neighbor_sigma;
 
     int64_t num_attr = attributes.size(0);
 
@@ -383,7 +408,10 @@ py::object trace_backward(Pipeline &self,
             ? reinterpret_cast<radfoam::Vec3f *>(density_grad_grad.data_ptr())
             : nullptr,
         return_error ? reinterpret_cast<float *>(point_error.data_ptr())
-                     : nullptr);
+                     : nullptr,
+        has_cell_radius
+            ? reinterpret_cast<const float *>(cell_radius.data_ptr())
+            : nullptr);
 
     py::dict output_dict;
 
@@ -459,7 +487,10 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("gradient_max_slope") = 5.0f,
              py::arg("interpolation_mode") = false,
              py::arg("idw_sigma") = 0.01f,
-             py::arg("idw_sigma_v") = 0.1f)
+             py::arg("idw_sigma_v") = 0.1f,
+             py::arg("per_cell_sigma") = false,
+             py::arg("per_neighbor_sigma") = false,
+             py::arg("cell_radius") = py::none())
         .def("trace_backward",
              trace_backward,
              py::arg("points"),
@@ -475,7 +506,10 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("gradient_max_slope") = 5.0f,
              py::arg("interpolation_mode") = false,
              py::arg("idw_sigma") = 0.01f,
-             py::arg("idw_sigma_v") = 0.1f);
+             py::arg("idw_sigma_v") = 0.1f,
+             py::arg("per_cell_sigma") = false,
+             py::arg("per_neighbor_sigma") = false,
+             py::arg("cell_radius") = py::none());
 
     module.def("create_ct_pipeline", create_ct_pipeline_binding);
 

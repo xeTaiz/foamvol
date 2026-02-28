@@ -54,6 +54,8 @@ class PipelineParams(ParamGroup):
         self.interpolation_start = 9_000
         self.interp_sigma_scale = 0.7
         self.interp_sigma_v = 0.35
+        self.per_cell_sigma = False
+        self.per_neighbor_sigma = False
         self.redundancy_threshold = 0.01   # relative to max activated density
         self.redundancy_cap = 0.05         # max fraction of cells removed per step
         self.rays_per_batch = 2_000_000
@@ -92,6 +94,7 @@ class OptimizationParams(ParamGroup):
         self.gradient_max_slope = 5.0
         self.gradient_freeze_points = 500
         self.tv_anneal = False
+        self.tv_on_raw = True
         super().__init__(parser, "Setting Optimization parameters")
 
 

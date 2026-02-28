@@ -255,6 +255,7 @@ __global__ void ct_interp_forward(TraceSettings settings,
                                    const uint32_t *__restrict__ point_adjacency,
                                    const uint32_t *__restrict__ point_adjacency_offsets,
                                    const Vec4h *__restrict__ adjacent_diff,
+                                   const float *__restrict__ cell_radius,
                                    const Ray *__restrict__ rays,
                                    uint32_t num_rays,
                                    const uint32_t *__restrict__ start_point_index,
@@ -271,8 +272,10 @@ __global__ void ct_interp_forward(TraceSettings settings,
 
     float projection = 0.0f;
 
-    float sigma_sq = settings.idw_sigma * settings.idw_sigma;
-    float sigma_v = settings.idw_sigma_v;
+    float sigma_sq_base = settings.idw_sigma * settings.idw_sigma;
+    float sigma_v_sq = settings.idw_sigma_v * settings.idw_sigma_v;
+    bool adaptive = settings.per_cell_sigma && cell_radius;
+    bool per_nb = settings.per_neighbor_sigma && cell_radius;
     constexpr float eps = 1e-7f;
     constexpr float w_floor = 1e-6f;
     constexpr float volume_extent = 1.05f;
@@ -291,12 +294,21 @@ __global__ void ct_interp_forward(TraceSettings settings,
             return true;
         }
 
+        // Compute self sigma_sq (Mode A: containing cell's radius)
+        float self_sigma_sq;
+        if (adaptive) {
+            float self_r = cell_radius[point_idx];
+            self_sigma_sq = sigma_sq_base * self_r * self_r;
+        } else {
+            self_sigma_sq = sigma_sq_base;
+        }
+
         float mu_ref = activated[point_idx];
         Vec3f diff_self = x_mid - current_point;
 
         // Self contribution (Gaussian kernel, bilateral diff = 0)
         float d_sq_self = diff_self.squaredNorm();
-        float w_self = expf(-d_sq_self / sigma_sq);
+        float w_self = expf(-d_sq_self / self_sigma_sq);
 
         float w_sum = w_self + w_floor;
         float mu_weighted = (w_self + w_floor) * mu_ref;
@@ -316,10 +328,19 @@ __global__ void ct_interp_forward(TraceSettings settings,
                          __half2float(adj_h[2]));
             Vec3f diff_nb = diff_self - offset;
 
-            // Fused Gaussian spatial + bilateral in single exp
+            // Per-neighbor or per-cell sigma
+            float nb_sigma_sq;
+            if (per_nb) {
+                float nb_r = __half2float(adj_h[3]);
+                nb_sigma_sq = sigma_sq_base * nb_r * nb_r;
+            } else {
+                nb_sigma_sq = self_sigma_sq;
+            }
+
+            // Fused Gaussian spatial + Gaussian bilateral in single exp
             float d_sq_nb = diff_nb.squaredNorm();
-            float bilateral = fabsf(mu_nb - mu_ref);
-            float w_nb = expf(-d_sq_nb / sigma_sq - bilateral / sigma_v);
+            float dmu = mu_nb - mu_ref;
+            float w_nb = expf(-d_sq_nb / nb_sigma_sq - dmu * dmu / sigma_v_sq);
 
             w_sum += w_nb + w_floor;
             mu_weighted += (w_nb + w_floor) * mu_nb;
@@ -360,6 +381,7 @@ __global__ void ct_interp_backward(TraceSettings settings,
                                     const uint32_t *__restrict__ point_adjacency,
                                     const uint32_t *__restrict__ point_adjacency_offsets,
                                     const Vec4h *__restrict__ adjacent_diff,
+                                    const float *__restrict__ cell_radius,
                                     const Ray *__restrict__ rays,
                                     uint32_t num_rays,
                                     const uint32_t *__restrict__ start_point_index,
@@ -390,8 +412,10 @@ __global__ void ct_interp_backward(TraceSettings settings,
     Vec3f current_point_grad = Vec3f::Zero();
     Vec3f next_point_grad = Vec3f::Zero();
 
-    float sigma_sq = settings.idw_sigma * settings.idw_sigma;
-    float sigma_v = settings.idw_sigma_v;
+    float sigma_sq_base = settings.idw_sigma * settings.idw_sigma;
+    float sigma_v_sq = settings.idw_sigma_v * settings.idw_sigma_v;
+    bool adaptive = settings.per_cell_sigma && cell_radius;
+    bool per_nb = settings.per_neighbor_sigma && cell_radius;
     constexpr float eps = 1e-7f;
     constexpr float w_floor = 1e-6f;
     constexpr float volume_extent = 1.05f;
@@ -418,6 +442,15 @@ __global__ void ct_interp_backward(TraceSettings settings,
             return true;
         }
 
+        // Compute self sigma_sq (Mode A: containing cell's radius)
+        float self_sigma_sq;
+        if (adaptive) {
+            float self_r = cell_radius[point_idx];
+            self_sigma_sq = sigma_sq_base * self_r * self_r;
+        } else {
+            self_sigma_sq = sigma_sq_base;
+        }
+
         float mu_ref = activated[point_idx];
 
         if (point_error) {
@@ -429,7 +462,7 @@ __global__ void ct_interp_backward(TraceSettings settings,
 
         // Self contribution (Gaussian kernel, bilateral diff = 0)
         float d_sq_self = diff_self.squaredNorm();
-        float w_self = expf(-d_sq_self / sigma_sq);
+        float w_self = expf(-d_sq_self / self_sigma_sq);
 
         float w_sum = w_self + w_floor;
         float mu_weighted = (w_self + w_floor) * mu_ref;
@@ -448,9 +481,17 @@ __global__ void ct_interp_backward(TraceSettings settings,
                          __half2float(adj_h[2]));
             Vec3f diff_nb = diff_self - offset;
 
+            float nb_sigma_sq;
+            if (per_nb) {
+                float nb_r = __half2float(adj_h[3]);
+                nb_sigma_sq = sigma_sq_base * nb_r * nb_r;
+            } else {
+                nb_sigma_sq = self_sigma_sq;
+            }
+
             float d_sq_nb = diff_nb.squaredNorm();
-            float bilateral = fabsf(mu_nb - mu_ref);
-            float w_nb = expf(-d_sq_nb / sigma_sq - bilateral / sigma_v);
+            float dmu = mu_nb - mu_ref;
+            float w_nb = expf(-d_sq_nb / nb_sigma_sq - dmu * dmu / sigma_v_sq);
 
             w_sum += w_nb + w_floor;
             mu_weighted += (w_nb + w_floor) * mu_nb;
@@ -469,16 +510,13 @@ __global__ void ct_interp_backward(TraceSettings settings,
                   dL_dmu * alpha_self * dsigmoid[point_idx]);
 
         // --- Position gradient for self (Gaussian: no 1/d singularity) ---
-        // dw/d(center) = w * 2*diff / sigma_sq  (derivative of exp(-||diff||^2/sigma_sq) w.r.t. center)
-        // dmu/d(center) = (dw/d(center) / W) * (mu_val - mu)
         {
             Vec3f pos_grad_self =
-                dL_dmu * (w_self * 2.0f / (sigma_sq * W)) * (mu_ref - mu) * diff_self;
+                dL_dmu * (w_self * 2.0f / (self_sigma_sq * W)) * (mu_ref - mu) * diff_self;
             current_point_grad += pos_grad_self;
         }
 
         // --- Pass 2: recompute weights, apply density + position gradients ---
-        // Neighbor data is L1/L2-hot from pass 1; cost is ~N exp recomputed.
         for (uint32_t j = adj_begin; j < adj_end; ++j) {
             uint32_t nb = point_adjacency[j];
             float mu_nb = activated[nb];
@@ -489,9 +527,17 @@ __global__ void ct_interp_backward(TraceSettings settings,
                          __half2float(adj_h[2]));
             Vec3f diff_nb = diff_self - offset;
 
+            float nb_sigma_sq;
+            if (per_nb) {
+                float nb_r = __half2float(adj_h[3]);
+                nb_sigma_sq = sigma_sq_base * nb_r * nb_r;
+            } else {
+                nb_sigma_sq = self_sigma_sq;
+            }
+
             float d_sq_nb = diff_nb.squaredNorm();
-            float bilateral = fabsf(mu_nb - mu_ref);
-            float w_nb = expf(-d_sq_nb / sigma_sq - bilateral / sigma_v);
+            float dmu = mu_nb - mu_ref;
+            float w_nb = expf(-d_sq_nb / nb_sigma_sq - dmu * dmu / sigma_v_sq);
 
             // Density gradient for neighbor
             float alpha_k = w_nb / W;
@@ -500,7 +546,7 @@ __global__ void ct_interp_backward(TraceSettings settings,
 
             // Position gradient for neighbor (Gaussian kernel)
             Vec3f pos_grad_nb =
-                dL_dmu * (w_nb * 2.0f / (sigma_sq * W)) * (mu_nb - mu) * diff_nb;
+                dL_dmu * (w_nb * 2.0f / (nb_sigma_sq * W)) * (mu_nb - mu) * diff_nb;
             atomic_add_vec(points_grad + nb, pos_grad_nb);
         }
 
@@ -562,6 +608,7 @@ __global__ void prefetch_adjacent_diff_kernel(
     uint32_t point_adjacency_size,
     const uint32_t *__restrict__ point_adjacency,
     const uint32_t *__restrict__ point_adjacency_offsets,
+    const float *__restrict__ cell_radius,
     Vec4h *__restrict__ adjacent_diff) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_points)
@@ -576,7 +623,8 @@ __global__ void prefetch_adjacent_diff_kernel(
         uint32_t adjacent_idx = point_adjacency[offset_start + j];
         Vec3f q = points[adjacent_idx];
         Vec3f diff = q - p;
-        adjacent_diff[offset_start + j] = Vec4h(diff[0], diff[1], diff[2], 0);
+        float nb_radius = cell_radius ? cell_radius[adjacent_idx] : 0.0f;
+        adjacent_diff[offset_start + j] = Vec4h(diff[0], diff[1], diff[2], nb_radius);
     }
 }
 
@@ -585,6 +633,7 @@ void prefetch_adjacent_diff(const Vec3f *points,
                             uint32_t point_adjacency_size,
                             const uint32_t *point_adjacency,
                             const uint32_t *point_adjacency_offsets,
+                            const float *cell_radius,
                             Vec4h *adjacent_diff,
                             const void *stream) {
     launch_kernel_1d<256>(prefetch_adjacent_diff_kernel,
@@ -595,6 +644,7 @@ void prefetch_adjacent_diff(const Vec3f *points,
                           point_adjacency_size,
                           point_adjacency,
                           point_adjacency_offsets,
+                          cell_radius,
                           adjacent_diff);
 }
 
@@ -761,7 +811,8 @@ class CUDADensityPipeline : public Pipeline {
                        const uint32_t *start_point_index,
                        float *ray_projection,
                        uint32_t *num_intersections,
-                       float *point_contribution) override {
+                       float *point_contribution,
+                       const float *cell_radius = nullptr) override {
 
         CUDAArray<Vec4h> adjacent_diff(point_adjacency_size + 32);
         prefetch_adjacent_diff(reinterpret_cast<const Vec3f *>(points),
@@ -769,6 +820,7 @@ class CUDADensityPipeline : public Pipeline {
                                point_adjacency_size,
                                point_adjacency,
                                point_adjacency_offsets,
+                               cell_radius,
                                adjacent_diff.begin(),
                                nullptr);
 
@@ -793,6 +845,7 @@ class CUDADensityPipeline : public Pipeline {
                 point_adjacency,
                 point_adjacency_offsets,
                 adjacent_diff.begin(),
+                cell_radius,
                 rays,
                 num_rays,
                 start_point_index,
@@ -836,7 +889,8 @@ class CUDADensityPipeline : public Pipeline {
                         Vec3f *points_grad,
                         float *density_scalar_grad,
                         Vec3f *density_grad_grad,
-                        float *point_error) override {
+                        float *point_error,
+                        const float *cell_radius = nullptr) override {
 
         CUDAArray<Vec4h> adjacent_diff(point_adjacency_size + 32);
         prefetch_adjacent_diff(reinterpret_cast<const Vec3f *>(points),
@@ -844,6 +898,7 @@ class CUDADensityPipeline : public Pipeline {
                                point_adjacency_size,
                                point_adjacency,
                                point_adjacency_offsets,
+                               cell_radius,
                                adjacent_diff.begin(),
                                nullptr);
 
@@ -870,6 +925,7 @@ class CUDADensityPipeline : public Pipeline {
                 point_adjacency,
                 point_adjacency_offsets,
                 adjacent_diff.begin(),
+                cell_radius,
                 rays,
                 num_rays,
                 start_point_index,
