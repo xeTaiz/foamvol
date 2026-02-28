@@ -394,6 +394,7 @@ __global__ void ct_interp_backward(TraceSettings settings,
     float sigma_v = settings.idw_sigma_v;
     constexpr float eps = 1e-7f;
     constexpr float w_floor = 1e-6f;
+    constexpr float volume_extent = 1.05f;
 
     auto functor = [&](uint32_t point_idx,
                        float t_0,
@@ -403,6 +404,19 @@ __global__ void ct_interp_backward(TraceSettings settings,
         float delta_t = fmaxf(t_1 - t_0, 0.0f);
         float t_mid = (t_0 + t_1) * 0.5f;
         Vec3f x_mid = ray.origin + t_mid * ray.direction;
+
+        // Skip outside reconstruction volume (must match forward)
+        if (fabsf(x_mid[0]) > volume_extent || fabsf(x_mid[1]) > volume_extent || fabsf(x_mid[2]) > volume_extent) {
+            if (prev_point_idx != UINT32_MAX) {
+                atomic_add_vec(points_grad + prev_point_idx, prev_point_grad);
+            }
+            prev_point = current_point;
+            prev_point_idx = point_idx;
+            prev_point_grad = current_point_grad;
+            current_point_grad = next_point_grad;
+            next_point_grad = Vec3f::Zero();
+            return true;
+        }
 
         float mu_ref = activated[point_idx];
 
