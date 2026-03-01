@@ -71,6 +71,7 @@ class ModelParams(ParamGroup):
         self.activation_scale = 1.0
         self.init_scale = 1.05
         self.init_type = "random"
+        self.init_density = 0.0
         self.device = "cuda"
         super().__init__(parser, "Setting Model parameters")
 
@@ -95,7 +96,8 @@ class OptimizationParams(ParamGroup):
         self.gradient_max_slope = 5.0
         self.gradient_freeze_points = 500
         self.tv_anneal = False
-        self.tv_on_raw = True
+        self.tv_on_raw = False
+        self.density_grad_clip = 1.0
         super().__init__(parser, "Setting Optimization parameters")
 
 
