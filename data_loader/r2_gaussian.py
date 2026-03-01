@@ -83,7 +83,7 @@ class R2GaussianDataset:
         projections = []
         angles = []
         for entry in entries:
-            proj = np.load(os.path.join(data_dir, entry["file_path"]))
+            proj = np.load(os.path.join(data_dir, entry["file_path"].replace("\\", "/")))
             projections.append(proj)
             angles.append(entry["angle"])
 
