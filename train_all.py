@@ -8,15 +8,22 @@ Recursively discovers datasets (directories containing proj_train/) under
     --data-root .../synthetic_dataset          →  45 datasets (3 view counts)
     --data-root .../r2_data                    →  all synthetic + real datasets
 
+Multiple roots and --filter can be combined:
+
+    --data-root .../synthetic_dataset --filter ntrain_75 ntrain_50
+    --data-root .../r2_data --filter '*chest*' '*foot*'
+
 Usage:
     python train_all.py -c configs/r2fast.yaml --name myrun
     python train_all.py -c configs/r2fast.yaml --name myrun --worker 1 --of 4
     python train_all.py --name myrun --summarize
     python train_all.py --list --data-root /mnt/hdd/r2_data
+    python train_all.py -c configs/r2.yaml --name run75 --data-root .../synthetic_dataset --filter ntrain_75
 """
 
 import argparse
 import csv
+import fnmatch
 import os
 import re
 import subprocess
@@ -25,18 +32,31 @@ import sys
 DATA_ROOT = "/mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360"
 
 
-def discover_datasets(data_root):
+def discover_datasets(data_roots):
     """Recursively find dataset directories (those containing proj_train/).
 
-    Returns sorted list of paths relative to data_root.
+    Returns sorted list of (data_root, relative_path) tuples.
     """
     datasets = []
-    for dirpath, dirnames, _filenames in os.walk(data_root):
-        if "proj_train" in dirnames:
-            rel = os.path.relpath(dirpath, data_root)
-            datasets.append(rel)
-            dirnames.clear()  # don't recurse into dataset subdirs
-    return sorted(datasets)
+    for data_root in data_roots:
+        for dirpath, dirnames, _filenames in os.walk(data_root):
+            if "proj_train" in dirnames:
+                rel = os.path.relpath(dirpath, data_root)
+                datasets.append((data_root, rel))
+                dirnames.clear()  # don't recurse into dataset subdirs
+    datasets.sort(key=lambda x: x[1])
+    return datasets
+
+
+def filter_datasets(datasets, patterns):
+    """Keep datasets where relative path matches any pattern (substring or glob)."""
+    filtered = []
+    for root, rel in datasets:
+        for pat in patterns:
+            if pat in rel or fnmatch.fnmatch(rel, pat):
+                filtered.append((root, rel))
+                break
+    return filtered
 
 
 def parse_metrics(path):
@@ -52,7 +72,7 @@ def parse_metrics(path):
     return metrics
 
 
-def run_dataset(name, config_file, run_name, data_root):
+def run_dataset(data_root, name, config_file, run_name):
     """Run train.py on a single dataset. Returns True on success."""
     mpath = os.path.join("output", run_name, name, "metrics.txt")
 
@@ -129,7 +149,9 @@ def main():
                "  python train_all.py -c configs/r2fast.yaml --name myrun\n"
                "  python train_all.py -c configs/r2fast.yaml --name myrun --worker 1 --of 4\n"
                "  python train_all.py --name myrun --summarize\n"
-               "  python train_all.py --list --data-root /mnt/hdd/r2_data\n",
+               "  python train_all.py --list --data-root /mnt/hdd/r2_data\n"
+               "  python train_all.py -c configs/r2.yaml --name run75 --data-root .../synthetic_dataset --filter ntrain_75\n"
+               "  python train_all.py --list --data-root .../synthetic .../real --filter ntrain_50 ntrain_75\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("-c", "--config", metavar="FILE",
@@ -145,9 +167,11 @@ def main():
     parser.add_argument("--list", action="store_true",
                         help="Print all dataset names and exit")
     parser.add_argument("--datasets", nargs="+", metavar="DS",
-                        help="Run only specific datasets by name (relative path)")
-    parser.add_argument("--data-root", default=DATA_ROOT,
-                        help=f"Override data root path (default: {DATA_ROOT})")
+                        help="Run only specific datasets by exact relative path")
+    parser.add_argument("--filter", nargs="+", metavar="PAT",
+                        help="Keep datasets matching any pattern (substring or glob)")
+    parser.add_argument("--data-root", nargs="+", default=[DATA_ROOT], metavar="DIR",
+                        help=f"Data root path(s) to scan (default: {DATA_ROOT})")
     args = parser.parse_args()
 
     # Validation
@@ -158,10 +182,22 @@ def main():
 
     all_datasets = discover_datasets(args.data_root)
 
+    # Apply filters early (before --list)
+    datasets = all_datasets
+    if args.filter:
+        datasets = filter_datasets(datasets, args.filter)
+    if args.datasets:
+        selected = set(args.datasets)
+        datasets = [(r, d) for r, d in datasets if d in selected]
+        found = {d for _, d in datasets}
+        for u in selected - found:
+            print(f"[WARN] Unknown dataset: {u}")
+
     if args.list:
-        print(f"\n{len(all_datasets)} datasets under {args.data_root}:")
-        for ds in all_datasets:
-            print(f"  {ds}")
+        roots_str = ", ".join(args.data_root)
+        print(f"\n{len(datasets)} datasets under {roots_str}:")
+        for _root, rel in datasets:
+            print(f"  {rel}")
         return
 
     if not args.name:
@@ -169,30 +205,23 @@ def main():
     if not args.summarize and not args.config:
         parser.error("-c/--config is required unless --summarize")
 
-    # Filter datasets
-    if args.datasets:
-        selected = set(args.datasets)
-        datasets = [d for d in all_datasets if d in selected]
-        unknown = selected - set(all_datasets)
-        for u in unknown:
-            print(f"[WARN] Unknown dataset: {u}")
-    else:
-        datasets = all_datasets
+    all_names = [d for _, d in datasets]
 
     # Worker splitting (round-robin)
     if args.worker is not None:
         datasets = datasets[args.worker - 1::args.num_workers]
-        print(f"Worker {args.worker}/{args.num_workers} — {len(datasets)} datasets: {', '.join(datasets)}")
+        names = [d for _, d in datasets]
+        print(f"Worker {args.worker}/{args.num_workers} — {len(datasets)} datasets: {', '.join(names)}")
     else:
         print(f"{len(datasets)}/{len(all_datasets)} datasets selected")
 
     # Train
     if not args.summarize:
-        for ds in datasets:
-            run_dataset(ds, args.config, args.name, args.data_root)
+        for root, ds in datasets:
+            run_dataset(root, ds, args.config, args.name)
 
-    # Summarize (always use all datasets, not just this worker's slice)
-    collect_summary(all_datasets, args.name)
+    # Summarize (always use all matching datasets, not just this worker's slice)
+    collect_summary(all_names, args.name)
 
 
 if __name__ == "__main__":
