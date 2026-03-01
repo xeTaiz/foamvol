@@ -423,12 +423,12 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 model.optimizer.zero_grad(set_to_none=True)
 
                 # Hide latency of data loading behind the backward pass
+                loss.backward()
                 event = torch.cuda.Event()
                 event.record()
-                loss.backward()
 
-                event.synchronize()
                 ray_batch, proj_batch = next(data_iterator)
+                event.synchronize()
 
                 if optimizer_args.density_grad_clip > 0 and model.density.grad is not None:
                     model.density.grad.clamp_(-optimizer_args.density_grad_clip, optimizer_args.density_grad_clip)
