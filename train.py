@@ -172,7 +172,7 @@ def sobel_filter_3d(vol):
     gx = F.conv3d(v, kx)
     gy = F.conv3d(v, ky)
     gz = F.conv3d(v, kz)
-    return torch.sqrt(gx**2 + gy**2 + gz**2).squeeze()
+    return torch.log1p(2.0 * torch.sqrt(gx**2 + gy**2 + gz**2)).clamp(0, 1).squeeze()
 
 
 def _gauss_conv3d_separable(x, gauss_1d, pad):
@@ -346,6 +346,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         iters_since_densification = 0
         next_densification_after = 1
 
+        _loss_cpu = None
         with tqdm.trange(pipeline_args.iterations) as train:
             for i in train:
                 proj_output, _, _, _ = model(ray_batch)
@@ -409,7 +410,9 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     else:
                         model.set_interpolation_mode(False)
 
-                train.set_postfix(loss=f"{loss.item():.5f}")
+                if _loss_cpu is not None:
+                    train.set_postfix(loss=f"{_loss_cpu.item():.5f}")
+                _loss_cpu = loss.detach().to("cpu", non_blocking=True)
 
                 if i % log_interval == log_interval - 1 and not pipeline_args.debug:
                     writer.add_scalar("train/loss", loss.item(), i)

@@ -681,7 +681,7 @@ def sobel_filter_2d(img):
                            dtype=torch.float32).reshape(1, 1, 3, 3)
     gx = F.conv2d(t, sobel_x)
     gy = F.conv2d(t, sobel_y)
-    mag = torch.sqrt(gx**2 + gy**2).squeeze().numpy()
+    mag = torch.log1p(2.0 * torch.sqrt(gx**2 + gy**2)).clamp(0, 1).squeeze().numpy()
     return mag
 
 
