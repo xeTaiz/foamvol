@@ -21,7 +21,7 @@ from radfoam_model.scene import CTScene
 from visualize_volume import visualize
 from vis_foam import (load_density_field, field_from_model, query_density,
                       sample_idw, sample_idw_diagnostic,
-                      visualize_idw_diagnostics, supersample_slice,
+                      visualize_idw_diagnostics,
                       make_slice_coords, compute_cell_density_slice,
                       visualize_slices, load_gt_volume, sample_gt_slice,
                       voxelize_volumes, log_density_histogram)
@@ -479,9 +479,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         gt_slices = []
                         for a in axes:
                             for c in slice_coords:
-                                d_slices.append(supersample_slice(query_density, field, a, c, 256, 1.0, ss=2))
-                                idw_slices.append(supersample_slice(sample_idw, field, a, c, 256, 1.0, ss=2,
-                                                                    sigma=sigma, sigma_v=sigma_v))
+                                coords_2d = make_slice_coords(a, c, 256, 1.0)
+                                d_slices.append(query_density(field, coords_2d))
+                                idw_slices.append(sample_idw(field, coords_2d,
+                                                             sigma=sigma, sigma_v=sigma_v))
                                 cd_slices.append(
                                     compute_cell_density_slice(field["points"], a, c, 64, 1.0)
                                 )
@@ -663,9 +664,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         gt_slices_final = []
         for a in axes:
             for c in coords:
-                density_slices.append(supersample_slice(query_density, field, a, c, 256, 1.0, ss=2))
-                idw_slices.append(supersample_slice(sample_idw, field, a, c, 256, 1.0, ss=2,
-                                                    sigma=interp_sigma, sigma_v=interp_sigma_v))
+                coords_2d = make_slice_coords(a, c, 256, 1.0)
+                density_slices.append(query_density(field, coords_2d))
+                idw_slices.append(sample_idw(field, coords_2d,
+                                             sigma=interp_sigma, sigma_v=interp_sigma_v))
                 cell_density_slices.append(
                     compute_cell_density_slice(field["points"], a, c, 64, 1.0)
                 )
