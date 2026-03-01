@@ -333,8 +333,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     def train_loop(viewer):
         print("Training")
 
-        log_interval = max(1, pipeline_args.iterations // 100)    # 1%
-        diag_interval = max(1, pipeline_args.iterations // 20)    # 5%
+        log_interval = max(1, pipeline_args.iterations // 10)    # 10%
+        diag_interval = max(1, pipeline_args.iterations // 5)    # 20%
 
         torch.cuda.synchronize()
 
