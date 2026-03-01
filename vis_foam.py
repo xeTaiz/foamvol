@@ -845,3 +845,21 @@ def visualize_slices(density_slices, idw_slices, cell_density_slices,
             "blend_ssim": np.mean(blend_ssims),
         }
     return None
+
+
+def log_density_histogram(model, writer, step):
+    """Log histogram of raw density values with 0.5-wide bins from -10 to 10."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    with torch.no_grad():
+        raw = model.density.detach().squeeze().cpu().numpy()
+        bin_edges = np.arange(-10, 10.5, 0.5)
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.hist(raw.clip(-10, 10), bins=bin_edges)
+        ax.set_xlabel("Raw density")
+        ax.set_ylabel("Count")
+        ax.set_xlim(-10, 10)
+        writer.add_figure("diagnostics/density_histogram", fig, step)
+        plt.close(fig)
