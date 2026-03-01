@@ -157,6 +157,70 @@ def compute_volume_ssim(pred, gt, window_size=11):
     return float(np.mean(axis_ssims)), axis_ssims
 
 
+def sobel_filter_3d(vol):
+    """Sobel gradient magnitude of a (D, H, W) torch tensor."""
+    v = vol.unsqueeze(0).unsqueeze(0)  # (1,1,D,H,W)
+    v = F.pad(v, (1, 1, 1, 1, 1, 1), mode="replicate")
+    smooth = torch.tensor([1, 2, 1], dtype=torch.float32, device=vol.device)
+    diff = torch.tensor([-1, 0, 1], dtype=torch.float32, device=vol.device)
+    # Kernel along X: smooth_z ⊗ smooth_y ⊗ diff_x
+    kx = (smooth[:, None, None] * smooth[None, :, None] * diff[None, None, :]).reshape(1, 1, 3, 3, 3)
+    # Kernel along Y: smooth_z ⊗ diff_y ⊗ smooth_x
+    ky = (smooth[:, None, None] * diff[None, :, None] * smooth[None, None, :]).reshape(1, 1, 3, 3, 3)
+    # Kernel along Z: diff_z ⊗ smooth_y ⊗ smooth_x
+    kz = (diff[:, None, None] * smooth[None, :, None] * smooth[None, None, :]).reshape(1, 1, 3, 3, 3)
+    gx = F.conv3d(v, kx)
+    gy = F.conv3d(v, ky)
+    gz = F.conv3d(v, kz)
+    return torch.sqrt(gx**2 + gy**2 + gz**2).squeeze()
+
+
+def _gauss_conv3d_separable(x, gauss_1d, pad):
+    """Apply separable 3D Gaussian smoothing using three 1D conv3d passes."""
+    ws = gauss_1d.shape[0]
+    kx = gauss_1d.reshape(1, 1, ws, 1, 1)
+    ky = gauss_1d.reshape(1, 1, 1, ws, 1)
+    kz = gauss_1d.reshape(1, 1, 1, 1, ws)
+    x = F.conv3d(x, kx, padding=(pad, 0, 0))
+    x = F.conv3d(x, ky, padding=(0, pad, 0))
+    x = F.conv3d(x, kz, padding=(0, 0, pad))
+    return x
+
+
+@torch.no_grad()
+def compute_volume_ssim_3d(pred, gt, window_size=11):
+    """True 3D SSIM using separable 3D Gaussian kernel."""
+    if isinstance(pred, np.ndarray):
+        pred = torch.from_numpy(pred)
+    if isinstance(gt, np.ndarray):
+        gt = torch.from_numpy(gt)
+    pred, gt = pred.float(), gt.float()
+
+    sigma = 1.5
+    coords = torch.arange(window_size, dtype=torch.float32, device=pred.device) - window_size // 2
+    gauss_1d = torch.exp(-coords**2 / (2 * sigma**2))
+    gauss_1d = gauss_1d / gauss_1d.sum()
+    pad = window_size // 2
+
+    p = pred.unsqueeze(0).unsqueeze(0)  # (1,1,D,H,W)
+    g = gt.unsqueeze(0).unsqueeze(0)
+
+    data_range = gt.max() - gt.min()
+    C1 = (0.01 * data_range)**2
+    C2 = (0.03 * data_range)**2
+
+    mu1 = _gauss_conv3d_separable(p, gauss_1d, pad)
+    mu2 = _gauss_conv3d_separable(g, gauss_1d, pad)
+    sigma1_sq = _gauss_conv3d_separable(p**2, gauss_1d, pad) - mu1**2
+    sigma2_sq = _gauss_conv3d_separable(g**2, gauss_1d, pad) - mu2**2
+    sigma12 = _gauss_conv3d_separable(p * g, gauss_1d, pad) - mu1 * mu2
+
+    ssim_map = ((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) / (
+        (mu1**2 + mu2**2 + C1) * (sigma1_sq + sigma2_sq + C2)
+    )
+    return ssim_map.mean().item()
+
+
 def log_diagnostics(model, writer, step):
     with torch.no_grad():
         _, cell_radius = radfoam.farthest_neighbor(
@@ -422,16 +486,22 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                                     compute_cell_density_slice(field["points"], a, c, 64, 1.0)
                                 )
                                 gt_slices.append(sample_gt_slice(gt_volume, a, c, 256, 1.0))
-                        log_fig = partial(writer.add_figure, f"slices/{experiment_name}", global_step=i)
                         log_fig_il = partial(writer.add_figure, f"slices_interleaved/{experiment_name}", global_step=i)
+                        log_fig_sobel = partial(writer.add_figure, f"slices_sobel/{experiment_name}", global_step=i)
                         metrics = visualize_slices(
                             d_slices, idw_slices, cd_slices,
-                            gt_slices=gt_slices, writer_fn=log_fig,
+                            gt_slices=gt_slices,
                             writer_fn_interleaved=log_fig_il,
+                            writer_fn_sobel=log_fig_sobel,
                         )
                         if metrics is not None:
                             for key, val in metrics.items():
-                                tag = f"slice_{key.split('_')[1]}/{key.split('_')[0]}"
+                                parts = key.split('_')
+                                if len(parts) == 2:
+                                    tag = f"slice_{parts[1]}/{parts[0]}"
+                                else:
+                                    # e.g. sobel_raw_psnr -> slice_psnr/sobel_raw
+                                    tag = f"slice_{parts[-1]}/{'_'.join(parts[:-1])}"
                                 writer.add_scalar(tag, val, i)
 
                         # IDW diagnostic for a single Z=0 slice
@@ -601,17 +671,22 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 )
                 gt_slices_final.append(sample_gt_slice(gt_volume, a, c, 256, 1.0))
 
-        log_fig = partial(writer.add_figure, f"slices/{experiment_name}", global_step=pipeline_args.iterations)
         log_fig_il = partial(writer.add_figure, f"slices_interleaved/{experiment_name}", global_step=pipeline_args.iterations)
+        log_fig_sobel = partial(writer.add_figure, f"slices_sobel/{experiment_name}", global_step=pipeline_args.iterations)
         slice_metrics = visualize_slices(
             density_slices, idw_slices, cell_density_slices,
-            gt_slices=gt_slices_final, writer_fn=log_fig,
+            gt_slices=gt_slices_final,
             writer_fn_interleaved=log_fig_il,
+            writer_fn_sobel=log_fig_sobel,
             out_path=f"{out_dir}/vis.jpg",
         )
         if slice_metrics is not None:
             for key, val in slice_metrics.items():
-                tag = f"slice_{key.split('_')[1]}/{key.split('_')[0]}"
+                parts = key.split('_')
+                if len(parts) == 2:
+                    tag = f"slice_{parts[1]}/{parts[0]}"
+                else:
+                    tag = f"slice_{parts[-1]}/{'_'.join(parts[:-1])}"
                 writer.add_scalar(tag, val, pipeline_args.iterations)
             with open(f"{out_dir}/metrics.txt", "a") as f:
                 for key, val in slice_metrics.items():
@@ -664,6 +739,40 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 for ax_i, ax_name in enumerate(["X", "Y", "Z"]):
                     f.write(f"Vol Raw SSIM_{ax_name}: {raw_ssim_ax[ax_i]:.6f}\n")
                     f.write(f"Vol IDW SSIM_{ax_name}: {idw_ssim_ax[ax_i]:.6f}\n")
+
+            # Sobel-filtered volume metrics
+            gt_sobel_vol = sobel_filter_3d(vol_gt_t)
+            raw_sobel_vol = sobel_filter_3d(raw_vol_t)
+            idw_sobel_vol = sobel_filter_3d(idw_vol_t)
+
+            sobel_raw_psnr_3d = compute_volume_psnr(raw_sobel_vol, gt_sobel_vol)
+            sobel_raw_ssim_3d, _ = compute_volume_ssim(raw_sobel_vol, gt_sobel_vol)
+            sobel_idw_psnr_3d = compute_volume_psnr(idw_sobel_vol, gt_sobel_vol)
+            sobel_idw_ssim_3d, _ = compute_volume_ssim(idw_sobel_vol, gt_sobel_vol)
+
+            # True 3D SSIM
+            raw_ssim3d = compute_volume_ssim_3d(raw_vol_t, vol_gt_t)
+            idw_ssim3d = compute_volume_ssim_3d(idw_vol_t, vol_gt_t)
+
+            print(f"Vol Raw  Sobel PSNR: {sobel_raw_psnr_3d:.4f}, Sobel SSIM: {sobel_raw_ssim_3d:.6f}")
+            print(f"Vol IDW  Sobel PSNR: {sobel_idw_psnr_3d:.4f}, Sobel SSIM: {sobel_idw_ssim_3d:.6f}")
+            print(f"Vol Raw  SSIM3D: {raw_ssim3d:.6f}")
+            print(f"Vol IDW  SSIM3D: {idw_ssim3d:.6f}")
+
+            writer.add_scalar("test/vol_raw_sobel_psnr", sobel_raw_psnr_3d, iters)
+            writer.add_scalar("test/vol_raw_sobel_ssim", sobel_raw_ssim_3d, iters)
+            writer.add_scalar("test/vol_idw_sobel_psnr", sobel_idw_psnr_3d, iters)
+            writer.add_scalar("test/vol_idw_sobel_ssim", sobel_idw_ssim_3d, iters)
+            writer.add_scalar("test/vol_raw_ssim3d", raw_ssim3d, iters)
+            writer.add_scalar("test/vol_idw_ssim3d", idw_ssim3d, iters)
+
+            with open(f"{out_dir}/metrics.txt", "a") as f:
+                f.write(f"Vol Raw Sobel PSNR: {sobel_raw_psnr_3d:.4f}\n")
+                f.write(f"Vol Raw Sobel SSIM: {sobel_raw_ssim_3d:.6f}\n")
+                f.write(f"Vol IDW Sobel PSNR: {sobel_idw_psnr_3d:.4f}\n")
+                f.write(f"Vol IDW Sobel SSIM: {sobel_idw_ssim_3d:.6f}\n")
+                f.write(f"Vol Raw SSIM3D: {raw_ssim3d:.6f}\n")
+                f.write(f"Vol IDW SSIM3D: {idw_ssim3d:.6f}\n")
 
             if pipeline_args.save_volume:
                 np.save(f"{out_dir}/volume_raw.npy", raw_vol)
