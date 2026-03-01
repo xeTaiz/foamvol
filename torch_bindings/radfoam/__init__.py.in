@@ -1,4 +1,5 @@
 import os
+import sys
 import warnings
 import ctypes
 
@@ -14,6 +15,7 @@ if torch_version_at_compile != torch_version_at_runtime:
         "unexpected behavior or crashes."
     )
 
+_glfw_available = False
 if @USE_PIP_GLFW@:
     try:
         import glfw
@@ -25,10 +27,18 @@ if @USE_PIP_GLFW@:
         handle = libdl.dlopen(libglfw_path.encode("utf-8"), RTLD_NOW | RTLD_GLOBAL)
         if handle is None:
             raise ImportError("failed to load libglfw.so")
+        _glfw_available = True
     except (ImportError, OSError):
         warnings.warn(
             "GLFW not available — the viewer will not work. "
             "Install glfw (`pip install glfw`) if you need the viewer."
         )
 
+if not _glfw_available:
+    _old_flags = sys.getdlopenflags()
+    sys.setdlopenflags(os.RTLD_GLOBAL | os.RTLD_LAZY)
+
 from .torch_bindings import *
+
+if not _glfw_available:
+    sys.setdlopenflags(_old_flags)
