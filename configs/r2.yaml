@@ -9,6 +9,7 @@ debug: False
 viewer: False
 save_volume: False
 interpolation_start: 7500
+interp_ramp: False
 interp_sigma_scale: 0.55
 interp_sigma_v: 0.2
 redundancy_threshold: 0.01
