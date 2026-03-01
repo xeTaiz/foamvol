@@ -15,6 +15,9 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 
+from skimage.measure import marching_cubes
+from scipy.spatial import KDTree
+
 from data_loader import DataHandler
 from configs import *
 from radfoam_model.scene import CTScene
@@ -219,6 +222,45 @@ def compute_volume_ssim_3d(pred, gt, window_size=11):
         (mu1**2 + mu2**2 + C1) * (sigma1_sq + sigma2_sq + C2)
     )
     return ssim_map.mean().item()
+
+
+@torch.no_grad()
+def compute_dice(pred, gt, thresholds=(0.1, 0.3, 0.5, 0.7, 0.9)):
+    if isinstance(pred, torch.Tensor):
+        pred = pred.cpu().numpy()
+    if isinstance(gt, torch.Tensor):
+        gt = gt.cpu().numpy()
+    dices = {}
+    for t in thresholds:
+        p, g = pred > t, gt > t
+        inter = (p & g).sum()
+        dices[t] = 2 * inter / (p.sum() + g.sum() + 1e-8)
+    return float(np.mean(list(dices.values()))), dices
+
+
+@torch.no_grad()
+def compute_surface_metrics(pred, gt, threshold=0.5, f_thresholds=(1.0, 2.0)):
+    if isinstance(pred, torch.Tensor):
+        pred = pred.cpu().numpy()
+    if isinstance(gt, torch.Tensor):
+        gt = gt.cpu().numpy()
+    try:
+        verts_p, _, _, _ = marching_cubes(pred, level=threshold)
+        verts_g, _, _, _ = marching_cubes(gt, level=threshold)
+    except ValueError:
+        return {"chamfer": float("inf"), **{f"f1_{d:.0f}v": 0.0 for d in f_thresholds}}
+    tree_p = KDTree(verts_p)
+    tree_g = KDTree(verts_g)
+    d_pred_to_gt, _ = tree_g.query(verts_p)
+    d_gt_to_pred, _ = tree_p.query(verts_g)
+    chamfer = 0.5 * (d_pred_to_gt.mean() + d_gt_to_pred.mean())
+    result = {"chamfer": float(chamfer)}
+    for d in f_thresholds:
+        prec = (d_pred_to_gt <= d).mean()
+        rec = (d_gt_to_pred <= d).mean()
+        f1 = 2 * prec * rec / (prec + rec + 1e-8)
+        result[f"f1_{d:.0f}v"] = float(f1)
+    return result
 
 
 def log_diagnostics(model, writer, step):
@@ -778,6 +820,36 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 f.write(f"Vol IDW Sobel SSIM: {sobel_idw_ssim_3d:.6f}\n")
                 f.write(f"Vol Raw SSIM3D: {raw_ssim3d:.6f}\n")
                 f.write(f"Vol IDW SSIM3D: {idw_ssim3d:.6f}\n")
+
+            # Geometric metrics
+            raw_dice, _ = compute_dice(raw_vol_t, vol_gt_t)
+            idw_dice, _ = compute_dice(idw_vol_t, vol_gt_t)
+            raw_surf = compute_surface_metrics(raw_vol_t, vol_gt_t)
+            idw_surf = compute_surface_metrics(idw_vol_t, vol_gt_t)
+
+            print(f"Vol Raw  Dice: {raw_dice:.6f}, CD: {raw_surf['chamfer']:.4f}v, "
+                  f"F1@1v: {raw_surf['f1_1v']:.4f}, F1@2v: {raw_surf['f1_2v']:.4f}")
+            print(f"Vol IDW  Dice: {idw_dice:.6f}, CD: {idw_surf['chamfer']:.4f}v, "
+                  f"F1@1v: {idw_surf['f1_1v']:.4f}, F1@2v: {idw_surf['f1_2v']:.4f}")
+
+            writer.add_scalar("test/vol_raw_dice", raw_dice, iters)
+            writer.add_scalar("test/vol_idw_dice", idw_dice, iters)
+            writer.add_scalar("test/vol_raw_chamfer", raw_surf["chamfer"], iters)
+            writer.add_scalar("test/vol_idw_chamfer", idw_surf["chamfer"], iters)
+            writer.add_scalar("test/vol_raw_f1_1v", raw_surf["f1_1v"], iters)
+            writer.add_scalar("test/vol_idw_f1_1v", idw_surf["f1_1v"], iters)
+            writer.add_scalar("test/vol_raw_f1_2v", raw_surf["f1_2v"], iters)
+            writer.add_scalar("test/vol_idw_f1_2v", idw_surf["f1_2v"], iters)
+
+            with open(f"{out_dir}/metrics.txt", "a") as f:
+                f.write(f"Vol Raw Dice: {raw_dice:.6f}\n")
+                f.write(f"Vol IDW Dice: {idw_dice:.6f}\n")
+                f.write(f"Vol Raw CD: {raw_surf['chamfer']:.4f}\n")
+                f.write(f"Vol IDW CD: {idw_surf['chamfer']:.4f}\n")
+                f.write(f"Vol Raw F1 1v: {raw_surf['f1_1v']:.4f}\n")
+                f.write(f"Vol IDW F1 1v: {idw_surf['f1_1v']:.4f}\n")
+                f.write(f"Vol Raw F1 2v: {raw_surf['f1_2v']:.4f}\n")
+                f.write(f"Vol IDW F1 2v: {idw_surf['f1_2v']:.4f}\n")
 
             if pipeline_args.save_volume:
                 np.save(f"{out_dir}/volume_raw.npy", raw_vol)
