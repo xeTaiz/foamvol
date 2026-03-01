@@ -521,7 +521,8 @@ class CTScene(torch.nn.Module):
 
     def prune_and_densify(
         self, point_error, point_contribution, upsample_factor=1.2,
-        contrast_fraction=0.5,
+        gradient_fraction=0.4, idw_fraction=0.3,
+        contrast_fraction=0.3, contrast_power=0.5,
         redundancy_threshold=0.0, redundancy_cap=0.0,
         sigma_scale=0.5, sigma_v=0.1,
     ):
@@ -559,9 +560,13 @@ class CTScene(torch.nn.Module):
             edge_vec = points[src] - points[tgt]
             edge_length = edge_vec.norm(dim=-1)
 
-            # Per-cell bilateral prediction error as interface score
+            # IDW-based weight (bilateral prediction error)
             cell_error = self.compute_redundancy_error(cell_radius, sigma_scale, sigma_v)
-            contrast_weight = (cell_error[src] + cell_error[tgt]) * edge_length
+            idw_weight = (cell_error[src] + cell_error[tgt]) * edge_length
+
+            # Explicit contrast weight (density difference across edge)
+            density_contrast = (activated[src] - activated[tgt]).abs()
+            explicit_contrast_weight = density_contrast.pow(contrast_power) * edge_length
 
             ######################## Pruning ########################
             low_contrib = point_contribution.squeeze() < 1e-2
@@ -572,6 +577,7 @@ class CTScene(torch.nn.Module):
             n_pruned_both = (low_contrib & tiny_radius).sum().item()
             n_redundant = 0
             n_added_gradient = 0
+            n_added_idw = 0
             n_added_contrast = 0
             n_filtered_dupes = 0
             n_basic_pruned = prune_mask.sum().item()
@@ -621,8 +627,9 @@ class CTScene(torch.nn.Module):
             )
 
             ################### Split budget ########################
-            num_contrast_points = int(contrast_fraction * num_new_points)
-            num_gradient_points = num_new_points - num_contrast_points
+            num_gradient_points = int(gradient_fraction * num_new_points)
+            num_idw_points = int(idw_fraction * num_new_points)
+            num_contrast_points = num_new_points - num_gradient_points - num_idw_points
 
             sampled_points_list = []
             sampled_inds_list = []
@@ -644,7 +651,11 @@ class CTScene(torch.nn.Module):
                     sampled_density_grad_list.append(self.density_grad[grad_inds])
                 n_added_gradient += num_gradient_points
 
-            # --- Contrast-based sampling (edge-based strategy) ---
+            # --- IDW-based sampling (bilateral prediction error × edge length) ---
+            if num_idw_points > 0:
+                n_added_idw += _sample_edges(idw_weight, num_idw_points, "idw")
+
+            # --- Explicit contrast sampling (|ρ_i - ρ_j|^p × edge length) ---
             if num_contrast_points > 0:
                 num_viable = (contrast_weight > 0).sum().item()
                 if num_viable == 0:
@@ -739,6 +750,7 @@ class CTScene(torch.nn.Module):
                 "pruned_both": n_pruned_both,
                 "pruned_redundancy": n_redundant,
                 "added_gradient": n_added_gradient,
+                "added_idw": n_added_idw,
                 "added_contrast": n_added_contrast,
                 "filtered_duplicates": n_filtered_dupes,
                 "points_after": self.primal_points.shape[0],
