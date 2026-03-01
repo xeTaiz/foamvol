@@ -24,7 +24,7 @@ from vis_foam import (load_density_field, field_from_model, query_density,
                       visualize_idw_diagnostics, supersample_slice,
                       make_slice_coords, compute_cell_density_slice,
                       visualize_slices, load_gt_volume, sample_gt_slice,
-                      voxelize_volumes)
+                      voxelize_volumes, log_density_histogram)
 import radfoam
 
 
@@ -390,19 +390,6 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     writer.add_scalar("train/psnr", train_metrics["psnr"], i)
                     writer.add_scalar("train/ssim", train_metrics["ssim"], i)
 
-                    writer.add_scalar(
-                        "lr/points_lr", model.xyz_scheduler_args(i), i
-                    )
-                    writer.add_scalar(
-                        "lr/density_lr", model.den_scheduler_args(i), i
-                    )
-                    if model.grad_scheduler_args is not None:
-                        writer.add_scalar(
-                            "lr/gradient_lr",
-                            model.grad_scheduler_args(i - model._gradient_start),
-                            i,
-                        )
-
                     if pipeline_args.interpolation_start >= 0 and i >= pipeline_args.densify_until:
                         ramp_length = max(1, pipeline_args.interpolation_start - pipeline_args.densify_until)
                         frac = min(1.0, (i - pipeline_args.densify_until) / ramp_length)
@@ -475,13 +462,17 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     < 0.9 * model.num_final_points
                 ):
                     point_error, point_contribution = model.collect_error_map(
-                        train_data_handler
+                        train_data_handler,
+                        contrast_alpha=pipeline_args.contrast_alpha,
                     )
                     densify_stats = model.prune_and_densify(
                         point_error,
                         point_contribution,
                         pipeline_args.densify_factor,
-                        pipeline_args.contrast_fraction,
+                        gradient_fraction=pipeline_args.gradient_fraction,
+                        idw_fraction=pipeline_args.idw_fraction,
+                        contrast_fraction=pipeline_args.contrast_fraction,
+                        contrast_power=pipeline_args.contrast_power,
                         redundancy_threshold=pipeline_args.redundancy_threshold,
                         redundancy_cap=pipeline_args.redundancy_cap,
                         sigma_scale=pipeline_args.interp_sigma_scale,
