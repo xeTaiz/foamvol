@@ -26,7 +26,8 @@ from vis_foam import (load_density_field, field_from_model, query_density,
                       sample_idw, sample_idw_diagnostic,
                       visualize_idw_diagnostics,
                       make_slice_coords, compute_cell_density_slice,
-                      visualize_slices, load_gt_volume, sample_gt_slice,
+                      visualize_slices, load_gt_volume, load_r2_volume,
+                      sample_gt_slice,
                       voxelize_volumes, log_density_histogram)
 import radfoam
 
@@ -175,7 +176,7 @@ def sobel_filter_3d(vol):
     gx = F.conv3d(v, kx)
     gy = F.conv3d(v, ky)
     gz = F.conv3d(v, kz)
-    return torch.log1p(2.0 * torch.sqrt(gx**2 + gy**2 + gz**2)).clamp(0, 1).squeeze()
+    return torch.log1p(1.0 * torch.sqrt(gx**2 + gy**2 + gz**2)).clamp(0, 1).squeeze()
 
 
 def _gauss_conv3d_separable(x, gauss_1d, pad):
@@ -343,6 +344,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     gt_volume = load_gt_volume(dataset_args.data_path, dataset_args.dataset)
     if gt_volume is not None:
         print(f"Loaded GT volume: shape={gt_volume.shape}")
+
+    r2_volume = load_r2_volume(dataset_args.data_path)
+    if r2_volume is not None:
+        print(f"Loaded R2 volume: shape={r2_volume.shape}")
 
     def eval_views(data_handler, ray_batch_fetcher, proj_batch_fetcher):
         rays = data_handler.rays
@@ -522,6 +527,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         idw_slices = []
                         cd_slices = []
                         gt_slices = []
+                        r2_slices = []
                         for a in axes:
                             for c in slice_coords:
                                 coords_2d = make_slice_coords(a, c, 256, 1.0)
@@ -532,11 +538,13 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                                     compute_cell_density_slice(field["points"], a, c, 64, 1.0)
                                 )
                                 gt_slices.append(sample_gt_slice(gt_volume, a, c, 256, 1.0))
+                                r2_slices.append(sample_gt_slice(r2_volume, a, c, 256, 1.0))
                         log_fig_il = partial(writer.add_figure, f"slices_interleaved/{experiment_name}", global_step=i)
                         log_fig_sobel = partial(writer.add_figure, f"slices_sobel/{experiment_name}", global_step=i)
                         metrics = visualize_slices(
                             d_slices, idw_slices, cd_slices,
                             gt_slices=gt_slices,
+                            r2_slices=r2_slices if r2_volume is not None else None,
                             writer_fn_interleaved=log_fig_il,
                             writer_fn_sobel=log_fig_sobel,
                         )
@@ -707,6 +715,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         idw_slices = []
         cell_density_slices = []
         gt_slices_final = []
+        r2_slices_final = []
         for a in axes:
             for c in coords:
                 coords_2d = make_slice_coords(a, c, 256, 1.0)
@@ -717,12 +726,14 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     compute_cell_density_slice(field["points"], a, c, 64, 1.0)
                 )
                 gt_slices_final.append(sample_gt_slice(gt_volume, a, c, 256, 1.0))
+                r2_slices_final.append(sample_gt_slice(r2_volume, a, c, 256, 1.0))
 
         log_fig_il = partial(writer.add_figure, f"slices_interleaved/{experiment_name}", global_step=pipeline_args.iterations)
         log_fig_sobel = partial(writer.add_figure, f"slices_sobel/{experiment_name}", global_step=pipeline_args.iterations)
         slice_metrics = visualize_slices(
             density_slices, idw_slices, cell_density_slices,
             gt_slices=gt_slices_final,
+            r2_slices=r2_slices_final if r2_volume is not None else None,
             writer_fn_interleaved=log_fig_il,
             writer_fn_sobel=log_fig_sobel,
             out_path=f"{out_dir}/vis.jpg",
@@ -850,6 +861,55 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 f.write(f"Vol IDW F1 1v: {idw_surf['f1_1v']:.4f}\n")
                 f.write(f"Vol Raw F1 2v: {raw_surf['f1_2v']:.4f}\n")
                 f.write(f"Vol IDW F1 2v: {idw_surf['f1_2v']:.4f}\n")
+
+            # R2-Gaussian volume metrics
+            if r2_volume is not None:
+                r2_vol_t = torch.from_numpy(r2_volume).float().cuda()
+
+                r2_psnr_3d = compute_volume_psnr(r2_vol_t, vol_gt_t)
+                r2_ssim_3d, r2_ssim_ax = compute_volume_ssim(r2_vol_t, vol_gt_t)
+
+                r2_sobel_vol = sobel_filter_3d(r2_vol_t)
+                sobel_r2_psnr_3d = compute_volume_psnr(r2_sobel_vol, gt_sobel_vol)
+                sobel_r2_ssim_3d, _ = compute_volume_ssim(r2_sobel_vol, gt_sobel_vol)
+
+                r2_ssim3d = compute_volume_ssim_3d(r2_vol_t, vol_gt_t)
+
+                r2_dice, _ = compute_dice(r2_vol_t, vol_gt_t)
+                r2_surf = compute_surface_metrics(r2_vol_t, vol_gt_t)
+
+                print(f"Vol R2   PSNR: {r2_psnr_3d:.4f}, SSIM: {r2_ssim_3d:.6f}")
+                print(f"Vol R2   Sobel PSNR: {sobel_r2_psnr_3d:.4f}, Sobel SSIM: {sobel_r2_ssim_3d:.6f}")
+                print(f"Vol R2   SSIM3D: {r2_ssim3d:.6f}")
+                print(f"Vol R2   Dice: {r2_dice:.6f}, CD: {r2_surf['chamfer']:.4f}v, "
+                      f"F1@1v: {r2_surf['f1_1v']:.4f}, F1@2v: {r2_surf['f1_2v']:.4f}")
+
+                writer.add_scalar("test/vol_r2_psnr", r2_psnr_3d, iters)
+                writer.add_scalar("test/vol_r2_ssim", r2_ssim_3d, iters)
+                for ax_i, ax_name in enumerate(["x", "y", "z"]):
+                    writer.add_scalar(f"test/vol_r2_ssim_{ax_name}", r2_ssim_ax[ax_i], iters)
+                writer.add_scalar("test/vol_r2_sobel_psnr", sobel_r2_psnr_3d, iters)
+                writer.add_scalar("test/vol_r2_sobel_ssim", sobel_r2_ssim_3d, iters)
+                writer.add_scalar("test/vol_r2_ssim3d", r2_ssim3d, iters)
+                writer.add_scalar("test/vol_r2_dice", r2_dice, iters)
+                writer.add_scalar("test/vol_r2_chamfer", r2_surf["chamfer"], iters)
+                writer.add_scalar("test/vol_r2_f1_1v", r2_surf["f1_1v"], iters)
+                writer.add_scalar("test/vol_r2_f1_2v", r2_surf["f1_2v"], iters)
+
+                with open(f"{out_dir}/metrics.txt", "a") as f:
+                    f.write(f"Vol R2 PSNR: {r2_psnr_3d:.4f}\n")
+                    f.write(f"Vol R2 SSIM: {r2_ssim_3d:.6f}\n")
+                    for ax_i, ax_name in enumerate(["X", "Y", "Z"]):
+                        f.write(f"Vol R2 SSIM_{ax_name}: {r2_ssim_ax[ax_i]:.6f}\n")
+                    f.write(f"Vol R2 Sobel PSNR: {sobel_r2_psnr_3d:.4f}\n")
+                    f.write(f"Vol R2 Sobel SSIM: {sobel_r2_ssim_3d:.6f}\n")
+                    f.write(f"Vol R2 SSIM3D: {r2_ssim3d:.6f}\n")
+                    f.write(f"Vol R2 Dice: {r2_dice:.6f}\n")
+                    f.write(f"Vol R2 CD: {r2_surf['chamfer']:.4f}\n")
+                    f.write(f"Vol R2 F1 1v: {r2_surf['f1_1v']:.4f}\n")
+                    f.write(f"Vol R2 F1 2v: {r2_surf['f1_2v']:.4f}\n")
+
+                del r2_vol_t, r2_sobel_vol
 
             if pipeline_args.save_volume:
                 np.save(f"{out_dir}/volume_raw.npy", raw_vol)

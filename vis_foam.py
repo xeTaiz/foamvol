@@ -547,6 +547,22 @@ def load_gt_volume(data_path, dataset_type):
     return None
 
 
+def load_r2_volume(data_path):
+    """Load R2-Gaussian prediction volume if available.
+
+    Args:
+        data_path: path to the dataset directory
+
+    Returns:
+        (G,G,G) numpy array, or None if not found.
+    """
+    import os
+    vol_path = os.path.join(data_path, "vol_r2.npy")
+    if os.path.exists(vol_path):
+        return np.load(vol_path)
+    return None
+
+
 def voxelize_volumes(field, resolution, extent, sigma, sigma_v):
     """Voxelize the field into two 3D volumes in one pass.
 
@@ -681,12 +697,12 @@ def sobel_filter_2d(img):
                            dtype=torch.float32).reshape(1, 1, 3, 3)
     gx = F.conv2d(t, sobel_x)
     gy = F.conv2d(t, sobel_y)
-    mag = torch.log1p(2.0 * torch.sqrt(gx**2 + gy**2)).clamp(0, 1).squeeze().numpy()
+    mag = torch.log1p(1.0 * torch.sqrt(gx**2 + gy**2)).clamp(0, 1).squeeze().numpy()
     return mag
 
 
 def visualize_slices(density_slices, idw_slices, cell_density_slices,
-                     gt_slices=None, vmax=1.0, writer_fn=None,
+                     gt_slices=None, r2_slices=None, vmax=1.0, writer_fn=None,
                      writer_fn_interleaved=None, writer_fn_sobel=None,
                      out_path=None, title=None):
     """Plot density slices. 3x9 without GT, 6x9 with GT comparison.
@@ -722,15 +738,22 @@ def visualize_slices(density_slices, idw_slices, cell_density_slices,
     nrows = 6 if has_gt else 3
     fig, axs = plt.subplots(nrows, 9, figsize=(27, nrows * 3))
 
+    # Check if R2 slices are available
+    has_r2 = (r2_slices is not None
+              and any(s is not None for s in r2_slices))
+
     # Collect per-slice metrics
     raw_psnrs, raw_ssims = [], []
     idw_psnrs, idw_ssims = [], []
     blend_psnrs, blend_ssims = [], []
+    r2_psnrs, r2_ssims = [], []
     sobel_raw_psnrs, sobel_raw_ssims = [], []
     sobel_idw_psnrs, sobel_idw_ssims = [], []
     sobel_blend_psnrs, sobel_blend_ssims = [], []
+    sobel_r2_psnrs, sobel_r2_ssims = [], []
     # Store Sobel-filtered images for visualization
-    sobel_raw_imgs, sobel_idw_imgs, sobel_gt_imgs, sobel_blend_imgs = [], [], [], []
+    sobel_raw_imgs, sobel_idw_imgs, sobel_gt_imgs = [], [], []
+    sobel_blend_imgs, sobel_r2_imgs = [], []
 
     for row in range(3):
         for col in range(3):
@@ -751,17 +774,29 @@ def visualize_slices(density_slices, idw_slices, cell_density_slices,
             ax.set_title(lbl, fontsize=8)
             ax.axis("off")
 
-            # --- Row 0-2: IDW interpolated (middle 3 cols) ---
+            # --- Row 0-2: R2 or IDW (middle 3 cols) ---
             ax = axs[row, col + 3]
-            ax.imshow(idw_slices[idx].T, origin="lower", cmap="gray",
-                      vmin=0, vmax=vmax)
-            lbl = f"IDW {axes_labels[row]}={coords[col]:.1f}"
-            if gt is not None:
-                p = compute_slice_psnr(idw_slices[idx], gt)
-                s = compute_slice_ssim(idw_slices[idx], gt)
-                idw_psnrs.append(p)
-                idw_ssims.append(s)
-                lbl += f" P={p:.1f} S={s:.2f}"
+            r2_slice = r2_slices[idx] if has_r2 else None
+            if r2_slice is not None:
+                ax.imshow(r2_slice.T, origin="lower", cmap="gray",
+                          vmin=0, vmax=vmax)
+                lbl = f"R2 {axes_labels[row]}={coords[col]:.1f}"
+                if gt is not None:
+                    p = compute_slice_psnr(r2_slice, gt)
+                    s = compute_slice_ssim(r2_slice, gt)
+                    r2_psnrs.append(p)
+                    r2_ssims.append(s)
+                    lbl += f" P={p:.1f} S={s:.2f}"
+            else:
+                ax.imshow(idw_slices[idx].T, origin="lower", cmap="gray",
+                          vmin=0, vmax=vmax)
+                lbl = f"IDW {axes_labels[row]}={coords[col]:.1f}"
+                if gt is not None:
+                    p = compute_slice_psnr(idw_slices[idx], gt)
+                    s = compute_slice_ssim(idw_slices[idx], gt)
+                    idw_psnrs.append(p)
+                    idw_ssims.append(s)
+                    lbl += f" P={p:.1f} S={s:.2f}"
             ax.set_title(lbl, fontsize=8)
             ax.axis("off")
 
@@ -789,25 +824,40 @@ def visualize_slices(density_slices, idw_slices, cell_density_slices,
                              fontsize=8)
                 ax.axis("off")
 
-                # --- Row 3-5: Blended 50/50 (middle 3 cols) ---
+                # --- Row 3-5: IDW or Blend (middle 3 cols) ---
                 ax = axs[row + 3, col + 3]
-                blend = 0.5 * density_slices[idx] + 0.5 * idw_slices[idx]
-                ax.imshow(blend.T, origin="lower", cmap="gray",
+                if has_r2:
+                    # When R2 is in top row, show IDW here
+                    mid_img = idw_slices[idx]
+                    lbl = f"IDW {axes_labels[row]}={coords[col]:.1f}"
+                    if gt is not None:
+                        p = compute_slice_psnr(mid_img, gt)
+                        s = compute_slice_ssim(mid_img, gt)
+                        idw_psnrs.append(p)
+                        idw_ssims.append(s)
+                        lbl += f" P={p:.1f} S={s:.2f}"
+                else:
+                    # Fallback: blend
+                    mid_img = 0.5 * density_slices[idx] + 0.5 * idw_slices[idx]
+                    lbl = f"blend {axes_labels[row]}={coords[col]:.1f}"
+                    if gt is not None:
+                        p = compute_slice_psnr(mid_img, gt)
+                        s = compute_slice_ssim(mid_img, gt)
+                        blend_psnrs.append(p)
+                        blend_ssims.append(s)
+                        lbl += f" P={p:.1f} S={s:.2f}"
+                ax.imshow(mid_img.T, origin="lower", cmap="gray",
                           vmin=0, vmax=vmax)
-                lbl = f"blend {axes_labels[row]}={coords[col]:.1f}"
-                if gt is not None:
-                    p = compute_slice_psnr(blend, gt)
-                    s = compute_slice_ssim(blend, gt)
-                    blend_psnrs.append(p)
-                    blend_ssims.append(s)
-                    lbl += f" P={p:.1f} S={s:.2f}"
                 ax.set_title(lbl, fontsize=8)
                 ax.axis("off")
 
-                # --- Row 3-5: Difference GT - raw (right 3 cols) ---
+                # --- Row 3-5: Difference GT-IDW or GT-raw (right 3 cols) ---
                 ax = axs[row + 3, col + 6]
                 if gt is not None:
-                    diff = gt - density_slices[idx]
+                    if has_r2:
+                        diff = gt - idw_slices[idx]
+                    else:
+                        diff = gt - density_slices[idx]
                     abs_max = max(np.abs(diff).max(), 1e-6)
                     ax.imshow(diff.T, origin="lower", cmap="bwr",
                               vmin=-abs_max, vmax=abs_max)
@@ -820,17 +870,24 @@ def visualize_slices(density_slices, idw_slices, cell_density_slices,
                     gt_sobel = sobel_filter_2d(gt)
                     raw_sobel = sobel_filter_2d(density_slices[idx])
                     idw_sobel = sobel_filter_2d(idw_slices[idx])
-                    blend_sobel = sobel_filter_2d(blend)
                     sobel_raw_psnrs.append(compute_slice_psnr(raw_sobel, gt_sobel))
                     sobel_raw_ssims.append(compute_slice_ssim(raw_sobel, gt_sobel))
                     sobel_idw_psnrs.append(compute_slice_psnr(idw_sobel, gt_sobel))
                     sobel_idw_ssims.append(compute_slice_ssim(idw_sobel, gt_sobel))
-                    sobel_blend_psnrs.append(compute_slice_psnr(blend_sobel, gt_sobel))
-                    sobel_blend_ssims.append(compute_slice_ssim(blend_sobel, gt_sobel))
                     sobel_raw_imgs.append(raw_sobel)
                     sobel_idw_imgs.append(idw_sobel)
                     sobel_gt_imgs.append(gt_sobel)
-                    sobel_blend_imgs.append(blend_sobel)
+                    if has_r2 and r2_slices[idx] is not None:
+                        r2_sobel = sobel_filter_2d(r2_slices[idx])
+                        sobel_r2_psnrs.append(compute_slice_psnr(r2_sobel, gt_sobel))
+                        sobel_r2_ssims.append(compute_slice_ssim(r2_sobel, gt_sobel))
+                        sobel_r2_imgs.append(r2_sobel)
+                    else:
+                        blend = 0.5 * density_slices[idx] + 0.5 * idw_slices[idx]
+                        blend_sobel = sobel_filter_2d(blend)
+                        sobel_blend_psnrs.append(compute_slice_psnr(blend_sobel, gt_sobel))
+                        sobel_blend_ssims.append(compute_slice_ssim(blend_sobel, gt_sobel))
+                        sobel_blend_imgs.append(blend_sobel)
 
     if title:
         fig.suptitle(title, fontsize=14)
@@ -873,7 +930,8 @@ def visualize_slices(density_slices, idw_slices, cell_density_slices,
         plt.close(fig2)
 
     # Build Sobel-filtered visualization (interleaved layout: grouped by slice)
-    # Each 2×3 tile block = one slice: top row = Raw/IDW/Blend, bottom = GT/DiffRaw/DiffIDW
+    # With R2: top = Raw/R2/DiffRaw-GT, bottom = GT/IDW/DiffIDW-GT
+    # Without R2: top = Raw/IDW/Blend, bottom = GT/DiffRaw/DiffIDW
     if writer_fn_sobel is not None and sobel_gt_imgs:
         sobel_vmax = max(
             max((s.max() for s in sobel_gt_imgs), default=1.0),
@@ -888,56 +946,107 @@ def visualize_slices(density_slices, idw_slices, cell_density_slices,
                 r0 = a * 2
                 c0 = ci * 3
 
-                # Top row of block: Sobel Raw, Sobel IDW, Sobel Blend
-                ax = saxs[r0, c0]
-                ax.imshow(sobel_raw_imgs[si].T, origin="lower", cmap="gray",
-                          vmin=0, vmax=sobel_vmax)
-                p, s = sobel_raw_psnrs[si], sobel_raw_ssims[si]
-                ax.set_title(f"SRaw {axes_labels[a]}={coords[ci]:.1f}"
-                             f" P={p:.1f} S={s:.2f}", fontsize=7)
-                ax.axis("off")
+                if has_r2 and sobel_r2_imgs:
+                    # Top row: Sobel Raw, Sobel R2, Diff Raw-GT
+                    ax = saxs[r0, c0]
+                    ax.imshow(sobel_raw_imgs[si].T, origin="lower", cmap="gray",
+                              vmin=0, vmax=sobel_vmax)
+                    p, s = sobel_raw_psnrs[si], sobel_raw_ssims[si]
+                    ax.set_title(f"SRaw {axes_labels[a]}={coords[ci]:.1f}"
+                                 f" P={p:.1f} S={s:.2f}", fontsize=7)
+                    ax.axis("off")
 
-                ax = saxs[r0, c0 + 1]
-                ax.imshow(sobel_idw_imgs[si].T, origin="lower", cmap="gray",
-                          vmin=0, vmax=sobel_vmax)
-                p, s = sobel_idw_psnrs[si], sobel_idw_ssims[si]
-                ax.set_title(f"SIDW {axes_labels[a]}={coords[ci]:.1f}"
-                             f" P={p:.1f} S={s:.2f}", fontsize=7)
-                ax.axis("off")
+                    ax = saxs[r0, c0 + 1]
+                    ax.imshow(sobel_r2_imgs[si].T, origin="lower", cmap="gray",
+                              vmin=0, vmax=sobel_vmax)
+                    p, s = sobel_r2_psnrs[si], sobel_r2_ssims[si]
+                    ax.set_title(f"SR2 {axes_labels[a]}={coords[ci]:.1f}"
+                                 f" P={p:.1f} S={s:.2f}", fontsize=7)
+                    ax.axis("off")
 
-                ax = saxs[r0, c0 + 2]
-                ax.imshow(sobel_blend_imgs[si].T, origin="lower", cmap="gray",
-                          vmin=0, vmax=sobel_vmax)
-                p, s = sobel_blend_psnrs[si], sobel_blend_ssims[si]
-                ax.set_title(f"SBlend {axes_labels[a]}={coords[ci]:.1f}"
-                             f" P={p:.1f} S={s:.2f}", fontsize=7)
-                ax.axis("off")
+                    diff_raw = sobel_raw_imgs[si] - sobel_gt_imgs[si]
+                    abs_max_r = max(np.abs(diff_raw).max(), 1e-6)
+                    ax = saxs[r0, c0 + 2]
+                    ax.imshow(diff_raw.T, origin="lower", cmap="bwr",
+                              vmin=-abs_max_r, vmax=abs_max_r)
+                    ax.set_title(f"SDiff Raw {axes_labels[a]}={coords[ci]:.1f}",
+                                 fontsize=7)
+                    ax.axis("off")
 
-                # Bottom row of block: Sobel GT, Diff Raw-GT, Diff IDW-GT
-                ax = saxs[r0 + 1, c0]
-                ax.imshow(sobel_gt_imgs[si].T, origin="lower", cmap="gray",
-                          vmin=0, vmax=sobel_vmax)
-                ax.set_title(f"SGT {axes_labels[a]}={coords[ci]:.1f}",
-                             fontsize=7)
-                ax.axis("off")
+                    # Bottom row: Sobel GT, Sobel IDW, Diff IDW-GT
+                    ax = saxs[r0 + 1, c0]
+                    ax.imshow(sobel_gt_imgs[si].T, origin="lower", cmap="gray",
+                              vmin=0, vmax=sobel_vmax)
+                    ax.set_title(f"SGT {axes_labels[a]}={coords[ci]:.1f}",
+                                 fontsize=7)
+                    ax.axis("off")
 
-                diff_raw = sobel_raw_imgs[si] - sobel_gt_imgs[si]
-                abs_max_r = max(np.abs(diff_raw).max(), 1e-6)
-                ax = saxs[r0 + 1, c0 + 1]
-                ax.imshow(diff_raw.T, origin="lower", cmap="bwr",
-                          vmin=-abs_max_r, vmax=abs_max_r)
-                ax.set_title(f"SDiff Raw {axes_labels[a]}={coords[ci]:.1f}",
-                             fontsize=7)
-                ax.axis("off")
+                    ax = saxs[r0 + 1, c0 + 1]
+                    ax.imshow(sobel_idw_imgs[si].T, origin="lower", cmap="gray",
+                              vmin=0, vmax=sobel_vmax)
+                    p, s = sobel_idw_psnrs[si], sobel_idw_ssims[si]
+                    ax.set_title(f"SIDW {axes_labels[a]}={coords[ci]:.1f}"
+                                 f" P={p:.1f} S={s:.2f}", fontsize=7)
+                    ax.axis("off")
 
-                diff_idw = sobel_idw_imgs[si] - sobel_gt_imgs[si]
-                abs_max_i = max(np.abs(diff_idw).max(), 1e-6)
-                ax = saxs[r0 + 1, c0 + 2]
-                ax.imshow(diff_idw.T, origin="lower", cmap="bwr",
-                          vmin=-abs_max_i, vmax=abs_max_i)
-                ax.set_title(f"SDiff IDW {axes_labels[a]}={coords[ci]:.1f}",
-                             fontsize=7)
-                ax.axis("off")
+                    diff_idw = sobel_idw_imgs[si] - sobel_gt_imgs[si]
+                    abs_max_i = max(np.abs(diff_idw).max(), 1e-6)
+                    ax = saxs[r0 + 1, c0 + 2]
+                    ax.imshow(diff_idw.T, origin="lower", cmap="bwr",
+                              vmin=-abs_max_i, vmax=abs_max_i)
+                    ax.set_title(f"SDiff IDW {axes_labels[a]}={coords[ci]:.1f}",
+                                 fontsize=7)
+                    ax.axis("off")
+                else:
+                    # Fallback: top = Raw/IDW/Blend, bottom = GT/DiffRaw/DiffIDW
+                    ax = saxs[r0, c0]
+                    ax.imshow(sobel_raw_imgs[si].T, origin="lower", cmap="gray",
+                              vmin=0, vmax=sobel_vmax)
+                    p, s = sobel_raw_psnrs[si], sobel_raw_ssims[si]
+                    ax.set_title(f"SRaw {axes_labels[a]}={coords[ci]:.1f}"
+                                 f" P={p:.1f} S={s:.2f}", fontsize=7)
+                    ax.axis("off")
+
+                    ax = saxs[r0, c0 + 1]
+                    ax.imshow(sobel_idw_imgs[si].T, origin="lower", cmap="gray",
+                              vmin=0, vmax=sobel_vmax)
+                    p, s = sobel_idw_psnrs[si], sobel_idw_ssims[si]
+                    ax.set_title(f"SIDW {axes_labels[a]}={coords[ci]:.1f}"
+                                 f" P={p:.1f} S={s:.2f}", fontsize=7)
+                    ax.axis("off")
+
+                    ax = saxs[r0, c0 + 2]
+                    ax.imshow(sobel_blend_imgs[si].T, origin="lower", cmap="gray",
+                              vmin=0, vmax=sobel_vmax)
+                    p, s = sobel_blend_psnrs[si], sobel_blend_ssims[si]
+                    ax.set_title(f"SBlend {axes_labels[a]}={coords[ci]:.1f}"
+                                 f" P={p:.1f} S={s:.2f}", fontsize=7)
+                    ax.axis("off")
+
+                    ax = saxs[r0 + 1, c0]
+                    ax.imshow(sobel_gt_imgs[si].T, origin="lower", cmap="gray",
+                              vmin=0, vmax=sobel_vmax)
+                    ax.set_title(f"SGT {axes_labels[a]}={coords[ci]:.1f}",
+                                 fontsize=7)
+                    ax.axis("off")
+
+                    diff_raw = sobel_raw_imgs[si] - sobel_gt_imgs[si]
+                    abs_max_r = max(np.abs(diff_raw).max(), 1e-6)
+                    ax = saxs[r0 + 1, c0 + 1]
+                    ax.imshow(diff_raw.T, origin="lower", cmap="bwr",
+                              vmin=-abs_max_r, vmax=abs_max_r)
+                    ax.set_title(f"SDiff Raw {axes_labels[a]}={coords[ci]:.1f}",
+                                 fontsize=7)
+                    ax.axis("off")
+
+                    diff_idw = sobel_idw_imgs[si] - sobel_gt_imgs[si]
+                    abs_max_i = max(np.abs(diff_idw).max(), 1e-6)
+                    ax = saxs[r0 + 1, c0 + 2]
+                    ax.imshow(diff_idw.T, origin="lower", cmap="bwr",
+                              vmin=-abs_max_i, vmax=abs_max_i)
+                    ax.set_title(f"SDiff IDW {axes_labels[a]}={coords[ci]:.1f}",
+                                 fontsize=7)
+                    ax.axis("off")
 
                 si += 1
 
@@ -952,16 +1061,20 @@ def visualize_slices(density_slices, idw_slices, cell_density_slices,
         metrics = {
             "raw_psnr": np.mean(raw_psnrs),
             "raw_ssim": np.mean(raw_ssims),
-            "idw_psnr": np.mean(idw_psnrs),
-            "idw_ssim": np.mean(idw_ssims),
-            "blend_psnr": np.mean(blend_psnrs),
-            "blend_ssim": np.mean(blend_ssims),
         }
+        if idw_psnrs:
+            metrics["idw_psnr"] = np.mean(idw_psnrs)
+            metrics["idw_ssim"] = np.mean(idw_ssims)
+        if blend_psnrs:
+            metrics["blend_psnr"] = np.mean(blend_psnrs)
+            metrics["blend_ssim"] = np.mean(blend_ssims)
         if sobel_raw_psnrs:
             metrics["sobel_raw_psnr"] = np.mean(sobel_raw_psnrs)
             metrics["sobel_raw_ssim"] = np.mean(sobel_raw_ssims)
+        if sobel_idw_psnrs:
             metrics["sobel_idw_psnr"] = np.mean(sobel_idw_psnrs)
             metrics["sobel_idw_ssim"] = np.mean(sobel_idw_ssims)
+        if sobel_blend_psnrs:
             metrics["sobel_blend_psnr"] = np.mean(sobel_blend_psnrs)
             metrics["sobel_blend_ssim"] = np.mean(sobel_blend_ssims)
         return metrics
