@@ -326,7 +326,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         if not getattr(model, '_interpolation_mode', False):
                             model.set_interpolation_mode(True)
                             print(f"Full interpolation mode at iter {i}")
-                    elif i >= pipeline_args.densify_until:
+                    elif pipeline_args.interp_ramp and i >= pipeline_args.densify_until:
                         # Linear ramp: fraction of steps that use interpolation
                         ramp_length = pipeline_args.interpolation_start - pipeline_args.densify_until
                         frac = (i - pipeline_args.densify_until) / ramp_length

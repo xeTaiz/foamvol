@@ -57,6 +57,7 @@ class PipelineParams(ParamGroup):
         self.per_cell_sigma = False
         self.per_neighbor_sigma = False
         self.redundancy_threshold = 0.01   # relative to max activated density
+        self.interp_ramp = False
         self.redundancy_cap = 0.05         # max fraction of cells removed per step
         self.rays_per_batch = 2_000_000
         super().__init__(parser, "Setting Pipeline parameters")
