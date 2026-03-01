@@ -269,7 +269,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     def train_loop(viewer):
         print("Training")
 
-        log_interval = max(1, pipeline_args.iterations // 200)    # 0.5%
+        log_interval = max(1, pipeline_args.iterations // 100)    # 1%
         diag_interval = max(1, pipeline_args.iterations // 20)    # 5%
 
         torch.cuda.synchronize()
@@ -293,11 +293,13 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         tv_loss = model.tv_border_regularization(
                             epsilon=optimizer_args.tv_epsilon,
                             area_weighted=optimizer_args.tv_area_weighted,
+                            on_raw=optimizer_args.tv_on_raw,
                         )
                     else:
                         tv_loss = model.tv_regularization(
                             epsilon=optimizer_args.tv_epsilon,
                             area_weighted=optimizer_args.tv_area_weighted,
+                            on_raw=optimizer_args.tv_on_raw,
                         )
                     tv_scale = 1.0
                     if optimizer_args.tv_anneal:
@@ -316,7 +318,14 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 event.synchronize()
                 ray_batch, proj_batch = next(data_iterator)
 
+                if optimizer_args.density_grad_clip > 0 and model.density.grad is not None:
+                    model.density.grad.clamp_(-optimizer_args.density_grad_clip, optimizer_args.density_grad_clip)
+
                 model.optimizer.step()
+
+                if i < pipeline_args.densify_until:
+                    model.density.data.clamp_(min=-1.0)
+
                 model.update_learning_rate(i)
 
                 # Interpolation interleaving schedule
@@ -349,6 +358,19 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                     if hasattr(model, '_triangulation_retries'):
                         writer.add_scalar("diagnostics/triangulation_retries", model._triangulation_retries, i)
+
+                    writer.add_scalar(
+                        "lr/points_lr", model.xyz_scheduler_args(i), i
+                    )
+                    writer.add_scalar(
+                        "lr/density_lr", model.den_scheduler_args(i), i
+                    )
+                    if model.grad_scheduler_args is not None:
+                        writer.add_scalar(
+                            "lr/gradient_lr",
+                            model.grad_scheduler_args(i - model._gradient_start),
+                            i,
+                        )
 
                     test_metrics = eval_views(
                         test_data_handler,
@@ -387,6 +409,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         writer.add_scalar("train/interp_fraction", frac, i)
 
                 if i % diag_interval == diag_interval - 1 and not pipeline_args.debug:
+                    log_density_histogram(model, writer, i)
                     log_diagnostics(model, writer, i)
                     with torch.no_grad():
                         field = field_from_model(model)
