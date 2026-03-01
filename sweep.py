@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """Hyperparameter sweep for CT reconstruction.
 
-Sweep 10: Point budgets, TV annealing, batch size, L1 loss.
-
-Baseline: r2fast.yaml (sigma_v=0.35, density_lr_final=1e-3, init_scale=1.05,
-          interp_sigma_scale=0.7).
+Sweep 12: Interpolation sharpness, contrast tuning, interp timing.
 
 Usage:
-    python sweep.py                           # all 15 runs
-    python sweep.py --runs A1-256k A2-512k    # specific runs for worker splitting
+    python sweep.py                           # all runs
+    python sweep.py --runs A1-ss10 B2-cp10    # specific runs
+    python sweep.py --worker 1 --of 4         # run 1st quarter
     python sweep.py --list                    # print run names
     python sweep.py --summarize               # collect results only
 """
@@ -23,7 +21,7 @@ import sys
 import yaml
 
 # ---------------------------------------------------------------------------
-# Baseline (from r2fast.yaml — sweep 9 winners applied)
+# Baseline (from r2fast.yaml)
 # ---------------------------------------------------------------------------
 
 BASELINE = {
@@ -32,69 +30,89 @@ BASELINE = {
     "densify_from": 1000,
     "densify_until": 6000,
     "densify_factor": 1.15,
-    "contrast_fraction": 0.5,
-    "loss_type": "l2",
+    "gradient_fraction": 0.4,
+    "idw_fraction": 0.3,
+    "contrast_fraction": 0.3,
+    "contrast_power": 0.5,
+    "contrast_alpha": 4.0,
+    "loss_type": "l1",
     "debug": False,
     "viewer": False,
     "save_volume": False,
     "interpolation_start": 9000,
+    "interp_ramp": False,
     "interp_sigma_scale": 0.7,
-    "interp_sigma_v": 0.35,
+    "interp_sigma_v": 0.2,
+    "per_cell_sigma": True,
+    "per_neighbor_sigma": True,
     "redundancy_threshold": 0.01,
     "redundancy_cap": 0.05,
+    "rays_per_batch": 1000000,
     # Model
-    "init_points": 32000,
-    "final_points": 128000,
+    "init_points": 64000,
+    "final_points": 512000,
     "activation_scale": 1.0,
     "init_scale": 1.05,
     "init_type": "random",
+    "init_density": 2.0,
+    "device": "cuda",
     # Optimization
     "points_lr_init": 2e-4,
     "points_lr_final": 5e-6,
     "density_lr_init": 5e-2,
-    "density_lr_final": 1e-3,
+    "density_lr_final": 1e-2,
     "freeze_points": 9500,
-    "tv_weight": 1e-4,
-    "tv_start": 5000,
+    "tv_on_raw": True,
+    "tv_anneal": False,
+    "tv_weight": 1e-3,
+    "tv_start": 0,
     "tv_epsilon": 1e-4,
     "tv_area_weighted": False,
+    "density_grad_clip": 10.0,
     "gradient_start": -1,
     # Dataset
     "dataset": "r2_gaussian",
     "data_path": "/mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
 }
 
-SWEEP_NAME = "sweep10"
+SWEEP_NAME = "sweep12"
 SWEEP_DIR = f"output/{SWEEP_NAME}"
 
 # ---------------------------------------------------------------------------
-# Sweep 10 runs
+# Sweep 12 runs
 # ---------------------------------------------------------------------------
 
-SWEEP10_RUNS = {
-    # Group A: Point budgets (extend densify_until for larger budgets)
-    "A1-256k":   {"init_points": 64000,  "final_points": 256000,  "densify_until": 7000, "freeze_points": 9500},
-    "A2-512k":   {"init_points": 128000, "final_points": 512000,  "densify_until": 7500, "freeze_points": 9500},
-    "A3-768k":   {"init_points": 192000, "final_points": 768000,  "densify_until": 8000, "freeze_points": 9500},
-    "A4-1M":     {"init_points": 256000, "final_points": 1000000, "densify_until": 8000, "freeze_points": 9500},
+SWEEP12_RUNS = {
+    # Group A: Blurrier interpolation sigmas
+    "A1-ss10": {"interp_sigma_scale": 1.0},
+    "A2-ss15": {"interp_sigma_scale": 1.5},
+    "A3-ss20": {"interp_sigma_scale": 2.0},
+    "A4-sv03": {"interp_sigma_v": 0.3},
+    "A5-sv05": {"interp_sigma_v": 0.5},
 
-    # Group B: Densification params at 512k
-    "B1-df110":  {"init_points": 128000, "final_points": 512000, "densify_until": 7500, "densify_factor": 1.10},
-    "B2-df120":  {"init_points": 128000, "final_points": 512000, "densify_until": 7500, "densify_factor": 1.20},
-    "B3-du8500": {"init_points": 128000, "final_points": 512000, "densify_until": 8500, "densify_factor": 1.15},
+    # Group B: Contrast power
+    "B1-cp025": {"contrast_power": 0.25},
+    "B2-cp10": {"contrast_power": 1.0},
+    "B3-cp20": {"contrast_power": 2.0},
 
-    # Group C: TV annealing
-    "C1-anneal":      {"tv_anneal": True},
-    "C2-anneal-512k": {"init_points": 128000, "final_points": 512000, "densify_until": 7500, "tv_anneal": True},
+    # Group C: Contrast alpha
+    "C1-ca0": {"contrast_alpha": 0.0},
+    "C2-ca1": {"contrast_alpha": 1.0},
+    "C3-ca2": {"contrast_alpha": 2.0},
+    "C4-ca8": {"contrast_alpha": 8.0},
 
-    # Group D: L1 loss
-    "D1-l1":      {"loss_type": "l1"},
-    "D2-l1-512k": {"init_points": 128000, "final_points": 512000, "densify_until": 7500, "loss_type": "l1"},
+    # Group D: Interpolation start timing
+    "D1-is8k": {"interpolation_start": 8000},
+    "D2-off": {"interpolation_start": -1},
 
-    # Group E: Batch size (rays_per_batch)
-    "E1-500k": {"rays_per_batch": 500000},
-    "E2-1M":   {"rays_per_batch": 1000000},
-    "E3-4M":   {"rays_per_batch": 4000000},
+    # Group E: Densification budget splits
+    "E1-idw015": {"idw_fraction": 0.15},
+    "E2-idw0": {"idw_fraction": 0.0},
+    "E3-con015": {"idw_fraction": 0.45},
+    "E4-con0": {"idw_fraction": 0.6},
+
+    # Group F: TV weight
+    "F1-tv1e4": {"tv_weight": 1e-4},
 
     # Reference
     "baseline": {},
@@ -196,15 +214,8 @@ def collect_summary(names, output_csv, sort_key="vol_idw_psnr"):
 
 
 def run_sweep(runs=None, summarize=False, worker=None, num_workers=None):
-    """Run all (or selected) sweep 10 experiments.
-
-    Args:
-        runs: Optional list of specific run IDs to execute.
-        summarize: If True, only collect summary from existing results.
-        worker: 1-indexed worker ID for splitting runs.
-        num_workers: Total number of workers.
-    """
-    all_names = list(SWEEP10_RUNS.keys())
+    """Run all (or selected) sweep 12 experiments."""
+    all_names = list(SWEEP12_RUNS.keys())
 
     if runs:
         selected = set(runs)
@@ -216,19 +227,17 @@ def run_sweep(runs=None, summarize=False, worker=None, num_workers=None):
         names = all_names
 
     if worker is not None and num_workers is not None:
-        # Split names into num_workers chunks, take the worker-th (1-indexed)
         chunks = [names[i::num_workers] for i in range(num_workers)]
         names = chunks[worker - 1]
-        print(f"Sweep 10: worker {worker}/{num_workers} — {len(names)} runs: {', '.join(names)}")
+        print(f"Sweep 12: worker {worker}/{num_workers} — {len(names)} runs: {', '.join(names)}")
     else:
-        print(f"Sweep 10: {len(names)}/{len(all_names)} runs selected")
+        print(f"Sweep 12: {len(names)}/{len(all_names)} runs selected")
 
     if not summarize:
         for name in names:
-            cfg = build_config(SWEEP10_RUNS[name])
+            cfg = build_config(SWEEP12_RUNS[name])
             run_experiment(name, cfg)
 
-    # Summary always covers all available results
     return collect_summary(all_names, os.path.join(SWEEP_DIR, "summary.csv"))
 
 
@@ -239,10 +248,10 @@ def run_sweep(runs=None, summarize=False, worker=None, num_workers=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CT reconstruction hyperparameter sweep (sweep 10)",
+        description="CT reconstruction hyperparameter sweep (sweep 12)",
         epilog="Examples:\n"
-               "  python sweep.py                           # all 15 runs\n"
-               "  python sweep.py --runs A1-256k A2-512k    # specific runs\n"
+               "  python sweep.py                           # all 20 runs\n"
+               "  python sweep.py --runs A1-ss10 B2-cp10    # specific runs\n"
                "  python sweep.py --worker 1 --of 4         # run 1st quarter\n"
                "  python sweep.py --list                    # show run names\n"
                "  python sweep.py --summarize               # just collect results\n",
@@ -266,9 +275,9 @@ def main():
         parser.error(f"--worker must be between 1 and {args.num_workers}")
 
     if args.list:
-        print(f"\n{len(SWEEP10_RUNS)} sweep 10 runs:")
-        for name in SWEEP10_RUNS:
-            overrides = SWEEP10_RUNS[name]
+        print(f"\n{len(SWEEP12_RUNS)} sweep 12 runs:")
+        for name in SWEEP12_RUNS:
+            overrides = SWEEP12_RUNS[name]
             desc = ", ".join(f"{k}={v}" for k, v in overrides.items()) if overrides else "(baseline)"
             print(f"  {name:16s}  {desc}")
         return
