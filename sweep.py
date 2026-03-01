@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Hyperparameter sweep for CT reconstruction.
 
-Sweep 12: Interpolation sharpness, contrast tuning, interp timing.
+Sweep 13: Interpolation (sigma_scale × sigma_v), contrast, densification.
+Baseline: 256k points, no TV regularization.
 
 Usage:
     python sweep.py                           # all runs
-    python sweep.py --runs A1-ss10 B2-cp10    # specific runs
+    python sweep.py --runs A1-ss10-sv03 B2-cp10  # specific runs
     python sweep.py --worker 1 --of 4         # run 1st quarter
     python sweep.py --list                    # print run names
     python sweep.py --summarize               # collect results only
@@ -50,7 +51,7 @@ BASELINE = {
     "rays_per_batch": 1000000,
     # Model
     "init_points": 64000,
-    "final_points": 512000,
+    "final_points": 256000,
     "activation_scale": 1.0,
     "init_scale": 1.05,
     "init_type": "random",
@@ -64,7 +65,7 @@ BASELINE = {
     "freeze_points": 9500,
     "tv_on_raw": True,
     "tv_anneal": False,
-    "tv_weight": 1e-3,
+    "tv_weight": 1e-2,
     "tv_start": 0,
     "tv_epsilon": 1e-4,
     "tv_area_weighted": False,
@@ -75,20 +76,21 @@ BASELINE = {
     "data_path": "/mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
 }
 
-SWEEP_NAME = "sweep12"
+SWEEP_NAME = "sweep13"
 SWEEP_DIR = f"output/{SWEEP_NAME}"
 
 # ---------------------------------------------------------------------------
-# Sweep 12 runs
+# Sweep 13 runs — 256k points, interpolation × contrast × densification
 # ---------------------------------------------------------------------------
 
-SWEEP12_RUNS = {
-    # Group A: Blurrier interpolation sigmas
-    "A1-ss10": {"interp_sigma_scale": 1.0},
-    "A2-ss15": {"interp_sigma_scale": 1.5},
-    "A3-ss20": {"interp_sigma_scale": 2.0},
-    "A4-sv03": {"interp_sigma_v": 0.3},
-    "A5-sv05": {"interp_sigma_v": 0.5},
+SWEEP13_RUNS = {
+    # Group A: sigma_scale × sigma_v grid (sweep 12 winners were ss=1.0 and sv=0.3/0.5)
+    "A1-ss10-sv02": {"interp_sigma_scale": 1.0},
+    "A2-ss10-sv03": {"interp_sigma_scale": 1.0, "interp_sigma_v": 0.3},
+    "A3-ss10-sv05": {"interp_sigma_scale": 1.0, "interp_sigma_v": 0.5},
+    "A4-ss07-sv03": {"interp_sigma_v": 0.3},
+    "A5-ss07-sv05": {"interp_sigma_v": 0.5},
+    "A6-ss15-sv03": {"interp_sigma_scale": 1.5, "interp_sigma_v": 0.3},
 
     # Group B: Contrast power
     "B1-cp025": {"contrast_power": 0.25},
@@ -96,23 +98,19 @@ SWEEP12_RUNS = {
     "B3-cp20": {"contrast_power": 2.0},
 
     # Group C: Contrast alpha
-    "C1-ca0": {"contrast_alpha": 0.0},
-    "C2-ca1": {"contrast_alpha": 1.0},
-    "C3-ca2": {"contrast_alpha": 2.0},
-    "C4-ca8": {"contrast_alpha": 8.0},
+    "C1-ca1": {"contrast_alpha": 1.0},
+    "C2-ca2": {"contrast_alpha": 2.0},
+    "C3-ca8": {"contrast_alpha": 8.0},
 
-    # Group D: Interpolation start timing
-    "D1-is8k": {"interpolation_start": 8000},
-    "D2-off": {"interpolation_start": -1},
+    # Group D: Densification budget splits (fractions must sum to 1.0 with gradient_fraction)
+    "D1-idw0": {"idw_fraction": 0.0, "contrast_fraction": 0.6},
+    "D2-idw05": {"idw_fraction": 0.5, "contrast_fraction": 0.1},
+    "D3-grad06": {"gradient_fraction": 0.6, "idw_fraction": 0.1},
+    "D4-grad02": {"gradient_fraction": 0.2, "idw_fraction": 0.5},
 
-    # Group E: Densification budget splits
-    "E1-idw015": {"idw_fraction": 0.15},
-    "E2-idw0": {"idw_fraction": 0.0},
-    "E3-con015": {"idw_fraction": 0.45},
-    "E4-con0": {"idw_fraction": 0.6},
-
-    # Group F: TV weight
-    "F1-tv1e4": {"tv_weight": 1e-4},
+    # Group E: Interpolation start timing
+    "E1-is8k": {"interpolation_start": 8000},
+    "E2-off": {"interpolation_start": -1},
 
     # Reference
     "baseline": {},
@@ -214,8 +212,8 @@ def collect_summary(names, output_csv, sort_key="vol_idw_psnr"):
 
 
 def run_sweep(runs=None, summarize=False, worker=None, num_workers=None):
-    """Run all (or selected) sweep 12 experiments."""
-    all_names = list(SWEEP12_RUNS.keys())
+    """Run all (or selected) sweep 13 experiments."""
+    all_names = list(SWEEP13_RUNS.keys())
 
     if runs:
         selected = set(runs)
@@ -235,7 +233,7 @@ def run_sweep(runs=None, summarize=False, worker=None, num_workers=None):
 
     if not summarize:
         for name in names:
-            cfg = build_config(SWEEP12_RUNS[name])
+            cfg = build_config(SWEEP13_RUNS[name])
             run_experiment(name, cfg)
 
     return collect_summary(all_names, os.path.join(SWEEP_DIR, "summary.csv"))
@@ -248,9 +246,9 @@ def run_sweep(runs=None, summarize=False, worker=None, num_workers=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CT reconstruction hyperparameter sweep (sweep 12)",
+        description="CT reconstruction hyperparameter sweep (sweep 13)",
         epilog="Examples:\n"
-               "  python sweep.py                           # all 20 runs\n"
+               "  python sweep.py                           # all runs\n"
                "  python sweep.py --runs A1-ss10 B2-cp10    # specific runs\n"
                "  python sweep.py --worker 1 --of 4         # run 1st quarter\n"
                "  python sweep.py --list                    # show run names\n"
@@ -275,9 +273,9 @@ def main():
         parser.error(f"--worker must be between 1 and {args.num_workers}")
 
     if args.list:
-        print(f"\n{len(SWEEP12_RUNS)} sweep 12 runs:")
-        for name in SWEEP12_RUNS:
-            overrides = SWEEP12_RUNS[name]
+        print(f"\n{len(SWEEP13_RUNS)} sweep 13 runs:")
+        for name in SWEEP13_RUNS:
+            overrides = SWEEP13_RUNS[name]
             desc = ", ".join(f"{k}={v}" for k, v in overrides.items()) if overrides else "(baseline)"
             print(f"  {name:16s}  {desc}")
         return
