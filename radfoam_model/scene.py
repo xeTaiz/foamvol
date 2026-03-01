@@ -55,7 +55,8 @@ class CTScene(torch.nn.Module):
         self.faces = None
 
         self.update_triangulation(rebuild=False)
-        density = torch.zeros(mg.size(0), 1, device=self.device, dtype=torch.float32)
+        init_val = self.init_density
+        density = torch.full((mg.size(0), 1), init_val, device=self.device, dtype=torch.float32)
         self.density = nn.Parameter(density[perm])
 
     def random_initialize(self):
@@ -159,7 +160,7 @@ class CTScene(torch.nn.Module):
     def get_primal_density(self):
         return self.activation_scale * F.softplus(self.density, beta=10)
 
-    def tv_regularization(self, epsilon=1e-3, area_weighted=False):
+    def tv_regularization(self, epsilon=1e-3, area_weighted=False, on_raw=False):
         """Charbonnier (smooth L1) TV loss over Voronoi neighbor edges."""
         if on_raw:
             density = self.density.squeeze()  # raw params, no activation
