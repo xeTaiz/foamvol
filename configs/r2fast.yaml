@@ -24,7 +24,7 @@ rays_per_batch: 1000000
 
 # Model
 init_points: 64000
-final_points: 512000
+final_points: 256000
 activation_scale: 1.0
 init_scale: 1.05
 init_type: random
@@ -39,8 +39,8 @@ density_lr_final: 1e-2 # 1e-3 eventually? this was better in some sweep
 freeze_points: 9500
 
 tv_on_raw: True
-tv_anneal: True
-tv_weight: 1e-3
+tv_anneal: False
+tv_weight: 1e-2
 tv_start: 0
 tv_epsilon: 1e-4
 tv_area_weighted: False
