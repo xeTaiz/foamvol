@@ -22,6 +22,7 @@ final_points: 128000
 activation_scale: 1.0
 init_scale: 1.05
 init_type: random
+init_density: 0.0
 device: cuda
 
 # Optimization
@@ -34,6 +35,7 @@ tv_weight: 1e-4
 tv_start: 8000
 tv_epsilon: 1e-4
 tv_area_weighted: False
+density_grad_clip: 1.0
 gradient_start: -1
 #
 # Dataset

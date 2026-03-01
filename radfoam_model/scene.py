@@ -26,6 +26,7 @@ class CTScene(torch.nn.Module):
         self.activation_scale = args.activation_scale
         self.init_scale = getattr(args, "init_scale", 1.1)
         self.init_type = getattr(args, "init_type", "random")
+        self.init_density = getattr(args, "init_density", 0.0)
 
         if self.init_type == "regular":
             self.regular_initialize()
@@ -72,8 +73,9 @@ class CTScene(torch.nn.Module):
 
         self.update_triangulation(rebuild=False)
 
-        density = torch.zeros(
-            self.num_init_points, 1, device=self.device, dtype=torch.float32
+        init_val = self.init_density
+        density = torch.full(
+            (self.num_init_points, 1), init_val, device=self.device, dtype=torch.float32
         )
         self.density = nn.Parameter(density[perm])
 
@@ -159,7 +161,10 @@ class CTScene(torch.nn.Module):
 
     def tv_regularization(self, epsilon=1e-3, area_weighted=False):
         """Charbonnier (smooth L1) TV loss over Voronoi neighbor edges."""
-        density = self.get_primal_density().squeeze()  # (N,)
+        if on_raw:
+            density = self.density.squeeze()  # raw params, no activation
+        else:
+            density = self.get_primal_density().squeeze()  # (N,)
         offsets = self.point_adjacency_offsets.long()
         adj = self.point_adjacency.long()
         N = density.shape[0]
@@ -186,9 +191,12 @@ class CTScene(torch.nn.Module):
 
         return edge_loss.mean()
 
-    def tv_border_regularization(self, epsilon=1e-3, area_weighted=False):
+    def tv_border_regularization(self, epsilon=1e-3, area_weighted=False, on_raw=False):
         """Charbonnier TV on density evaluated at Voronoi cell borders."""
-        mu_base = self.get_primal_density().squeeze()  # (N,) activated density
+        if on_raw:
+            mu_base = self.density.squeeze()  # raw params, no activation
+        else:
+            mu_base = self.get_primal_density().squeeze()  # (N,) activated density
         offsets = self.point_adjacency_offsets.long()
         adj = self.point_adjacency.long()
         N = mu_base.shape[0]
