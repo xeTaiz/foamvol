@@ -47,8 +47,8 @@ class PipelineParams(ParamGroup):
         self.densify_factor = 1.15
         self.gradient_fraction = 0.4
         self.idw_fraction = 0.3
-        self.contrast_fraction = 0.3
-        self.contrast_power = 0.5
+        self.entropy_fraction = 0.3
+        self.entropy_bins = 5
         self.contrast_alpha = 0.0
         self.loss_type = "l2"
         self.experiment_name = ""

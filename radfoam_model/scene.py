@@ -288,6 +288,51 @@ class CTScene(torch.nn.Module):
         interp = w_mu_sum / w_sum.clamp(min=1e-8)
         return (activated - interp).abs()
 
+    @torch.no_grad()
+    def compute_neighbor_entropy(self, n_bins=5):
+        """Per-cell Shannon entropy of neighbor density distribution.
+
+        High entropy = diverse neighborhood (edges, under-resolved).
+        Uses random bin offset so edges aligned with bin interiors
+        are caught across multiple calls.
+        """
+        activated = self.get_primal_density().squeeze()  # (N,)
+        offsets = self.point_adjacency_offsets.long()
+        adj = self.point_adjacency.long()
+        N = activated.shape[0]
+
+        counts = offsets[1:] - offsets[:-1]
+        source = torch.repeat_interleave(
+            torch.arange(N, device=activated.device), counts
+        )
+
+        # Random bin offset to avoid persistent alignment artifacts
+        bin_width = 1.0 / n_bins
+        offset = torch.rand(1, device=activated.device).item() * bin_width
+        boundaries = torch.arange(1, n_bins, device=activated.device).float() * bin_width + offset
+
+        # Bin neighbor densities
+        neighbor_bins = torch.bucketize(activated[adj].clamp(0, 1), boundaries)  # (E,) in [0, K-1]
+
+        # Count per (cell, bin) via scatter into (N, K) matrix
+        flat_idx = source * n_bins + neighbor_bins
+        bin_counts = torch.zeros(N * n_bins, device=activated.device)
+        bin_counts.scatter_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=torch.float32))
+        bin_counts = bin_counts.reshape(N, n_bins)
+
+        # Also count the cell itself
+        self_bins = torch.bucketize(activated.clamp(0, 1), boundaries)
+        self_idx = torch.arange(N, device=activated.device) * n_bins + self_bins
+        bin_counts.view(-1).scatter_add_(0, self_idx, torch.ones(N, device=activated.device))
+
+        # Shannon entropy: H = -Σ p_k log(p_k)
+        total = bin_counts.sum(dim=-1, keepdim=True)
+        p = bin_counts / total.clamp(min=1)
+        log_p = torch.log(p.clamp(min=1e-10))
+        entropy = -(p * log_p).sum(dim=-1)  # (N,)
+
+        return entropy
+
     @staticmethod
     def softplus_inv(x, beta=10):
         """Numerically stable inverse of softplus."""
@@ -327,12 +372,13 @@ class CTScene(torch.nn.Module):
         dmu = activated[source] - activated[adj]
         w = torch.exp(-d_sq / sigma_sq[source] - dmu * dmu / (sigma_v * sigma_v))
 
-        # Per-cell weighted average
-        w_sum = torch.zeros(N, device=points.device).scatter_add_(0, source, w)
-        w_mu = torch.zeros(N, device=points.device).scatter_add_(
+        # Per-cell weighted average (include self with weight 1:
+        # d_sq=0, dmu=0 → exp(0)=1, guarantees w_sum >= 1)
+        w_sum = torch.ones(N, device=points.device).scatter_add_(0, source, w)
+        w_mu = activated.clone().scatter_add_(
             0, source, w * activated[adj]
         )
-        filtered = w_mu / w_sum.clamp(min=1e-8)
+        filtered = w_mu / w_sum
 
         # Write back to raw parameter space
         self.density.data[:, 0] = self.softplus_inv(
@@ -591,7 +637,7 @@ class CTScene(torch.nn.Module):
     def prune_and_densify(
         self, point_error, point_contribution, upsample_factor=1.2,
         gradient_fraction=0.4, idw_fraction=0.3,
-        contrast_fraction=0.3, contrast_power=0.5,
+        entropy_fraction=0.3, entropy_bins=5,
         redundancy_threshold=0.0, redundancy_cap=0.0,
         sigma_scale=0.5, sigma_v=0.1,
     ):
@@ -633,9 +679,8 @@ class CTScene(torch.nn.Module):
             cell_error = self.compute_redundancy_error(cell_radius, sigma_scale, sigma_v)
             idw_weight = (cell_error[src] + cell_error[tgt]) * edge_length
 
-            # Explicit contrast weight (density difference across edge)
-            density_contrast = (activated[src] - activated[tgt]).abs()
-            explicit_contrast_weight = density_contrast.pow(contrast_power) * edge_length
+            # Per-cell neighbor entropy
+            cell_entropy = self.compute_neighbor_entropy(n_bins=entropy_bins)
 
             ######################## Pruning ########################
             low_contrib = point_contribution.squeeze() < 1e-2
@@ -647,7 +692,7 @@ class CTScene(torch.nn.Module):
             n_redundant = 0
             n_added_gradient = 0
             n_added_idw = 0
-            n_added_contrast = 0
+            n_added_entropy = 0
             n_filtered_dupes = 0
             n_basic_pruned = prune_mask.sum().item()
             if n_basic_pruned > 0:
@@ -698,7 +743,7 @@ class CTScene(torch.nn.Module):
             ################### Split budget ########################
             num_gradient_points = int(gradient_fraction * num_new_points)
             num_idw_points = int(idw_fraction * num_new_points)
-            num_contrast_points = num_new_points - num_gradient_points - num_idw_points
+            num_entropy_points = num_new_points - num_gradient_points - num_idw_points
 
             sampled_points_list = []
             sampled_inds_list = []
@@ -708,7 +753,7 @@ class CTScene(torch.nn.Module):
 
             def _sample_edges(weight, n_budget, counter_name):
                 """Sample points along edges weighted by `weight`. Returns count added."""
-                nonlocal n_added_idw, n_added_contrast
+                nonlocal n_added_idw
                 num_viable = (weight > 0).sum().item()
                 if num_viable == 0:
                     # Fallback: redirect budget to gradient strategy
@@ -767,9 +812,25 @@ class CTScene(torch.nn.Module):
             if num_idw_points > 0:
                 n_added_idw += _sample_edges(idw_weight, num_idw_points, "idw")
 
-            # --- Explicit contrast sampling (|ρ_i - ρ_j|^p × edge length) ---
-            if num_contrast_points > 0:
-                n_added_contrast += _sample_edges(explicit_contrast_weight, num_contrast_points, "contrast")
+            # --- Entropy-based sampling (neighbor density entropy × cell radius) ---
+            if num_entropy_points > 0:
+                entropy_weight = cell_entropy * cell_radius.squeeze()
+                num_viable = (entropy_weight > 0).sum().item()
+                if num_viable >= num_entropy_points:
+                    entropy_inds = torch.multinomial(
+                        entropy_weight, num_entropy_points, replacement=False,
+                    )
+                else:
+                    entropy_inds = torch.multinomial(
+                        primal_error_accum * cell_radius,
+                        num_entropy_points, replacement=False,
+                    )
+                sampled_points_list.append((points + perturbation)[entropy_inds])
+                sampled_inds_list.append(entropy_inds)
+                sampled_density_list.append(self.density[entropy_inds])
+                if has_density_grad:
+                    sampled_density_grad_list.append(self.density_grad[entropy_inds])
+                n_added_entropy = num_entropy_points
 
             sampled_inds = torch.cat(sampled_inds_list, dim=0)
             sampled_points = torch.cat(sampled_points_list, dim=0)
@@ -822,7 +883,7 @@ class CTScene(torch.nn.Module):
                 "pruned_redundancy": n_redundant,
                 "added_gradient": n_added_gradient,
                 "added_idw": n_added_idw,
-                "added_contrast": n_added_contrast,
+                "added_entropy": n_added_entropy,
                 "filtered_duplicates": n_filtered_dupes,
                 "points_after": self.primal_points.shape[0],
             }
