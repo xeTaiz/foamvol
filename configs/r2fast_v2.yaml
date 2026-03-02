@@ -5,8 +5,8 @@ densify_until: 6000
 densify_factor: 1.15
 gradient_fraction: 0.6
 idw_fraction: 0.1
-contrast_fraction: 0.3
-contrast_power: 0.5
+entropy_fraction: 0.3
+entropy_bins: 5
 contrast_alpha: 2.0
 loss_type: l1
 debug: False

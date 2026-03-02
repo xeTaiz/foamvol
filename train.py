@@ -538,6 +538,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 if i % diag_interval == diag_interval - 1 and not pipeline_args.debug:
                     log_density_histogram(model, writer, i)
                     log_diagnostics(model, writer, i)
+                    cell_entropy = model.compute_neighbor_entropy(n_bins=pipeline_args.entropy_bins)
+                    writer.add_histogram("diagnostics/cell_entropy", cell_entropy, i)
+                    writer.add_scalar("diagnostics/entropy_mean", cell_entropy.mean().item(), i)
+                    writer.add_scalar("diagnostics/entropy_max", cell_entropy.max().item(), i)
                     with torch.no_grad():
                         field = field_from_model(model)
                         _, cell_radius = radfoam.farthest_neighbor(
@@ -621,8 +625,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         pipeline_args.densify_factor,
                         gradient_fraction=pipeline_args.gradient_fraction,
                         idw_fraction=pipeline_args.idw_fraction,
-                        contrast_fraction=pipeline_args.contrast_fraction,
-                        contrast_power=pipeline_args.contrast_power,
+                        entropy_fraction=pipeline_args.entropy_fraction,
+                        entropy_bins=pipeline_args.entropy_bins,
                         redundancy_threshold=pipeline_args.redundancy_threshold,
                         redundancy_cap=pipeline_args.redundancy_cap,
                         sigma_scale=pipeline_args.interp_sigma_scale,
