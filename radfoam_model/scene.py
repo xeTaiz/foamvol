@@ -288,6 +288,57 @@ class CTScene(torch.nn.Module):
         interp = w_mu_sum / w_sum.clamp(min=1e-8)
         return (activated - interp).abs()
 
+    @staticmethod
+    def softplus_inv(x, beta=10):
+        """Numerically stable inverse of softplus."""
+        return torch.where(
+            beta * x > 20,
+            x,
+            torch.log(torch.expm1(beta * x)) / beta,
+        )
+
+    @torch.no_grad()
+    def apply_bilateral_filter(self, sigma_scale, sigma_v):
+        """Apply bilateral filter to cell densities in-place.
+
+        Uses per-cell radius so sigma adapts to local cell density:
+            sigma_i = sigma_scale * cell_radius_i
+        """
+        activated = self.get_primal_density().squeeze()  # (N,)
+        points = self.primal_points
+        offsets = self.point_adjacency_offsets.long()
+        adj = self.point_adjacency.long()
+        N = points.shape[0]
+
+        _, cell_radius = radfoam.farthest_neighbor(
+            points, self.point_adjacency, self.point_adjacency_offsets,
+        )
+        cr = cell_radius.squeeze()  # (N,)
+        # Per-cell spatial sigma: sigma_i = sigma_scale * cell_radius_i
+        sigma_sq = (sigma_scale * cr) ** 2  # (N,)
+
+        counts = offsets[1:] - offsets[:-1]
+        source = torch.repeat_interleave(
+            torch.arange(N, device=points.device), counts
+        )
+
+        # Bilateral weights: spatial (per-cell sigma) x value similarity
+        d_sq = (points[adj] - points[source]).pow(2).sum(dim=-1)
+        dmu = activated[source] - activated[adj]
+        w = torch.exp(-d_sq / sigma_sq[source] - dmu * dmu / (sigma_v * sigma_v))
+
+        # Per-cell weighted average
+        w_sum = torch.zeros(N, device=points.device).scatter_add_(0, source, w)
+        w_mu = torch.zeros(N, device=points.device).scatter_add_(
+            0, source, w * activated[adj]
+        )
+        filtered = w_mu / w_sum.clamp(min=1e-8)
+
+        # Write back to raw parameter space
+        self.density.data[:, 0] = self.softplus_inv(
+            filtered / self.activation_scale
+        )
+
     def set_interpolation_mode(self, enabled, sigma=None, sigma_v=None,
                                per_cell_sigma=None, per_neighbor_sigma=None):
         self._interpolation_mode = enabled

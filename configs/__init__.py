@@ -64,6 +64,13 @@ class PipelineParams(ParamGroup):
         self.interp_ramp = False
         self.redundancy_cap = 0.05         # max fraction of cells removed per step
         self.rays_per_batch = 2_000_000
+        self.bf_start = -1            # iteration to start (-1 = disabled)
+        self.bf_until = 6000          # iteration to stop
+        self.bf_period = 10           # apply every N steps
+        self.bf_sigma_init = 2.0      # initial spatial sigma (x per-cell radius)
+        self.bf_sigma_final = 0.3     # final spatial sigma
+        self.bf_sigma_v_init = 10.0   # initial value sigma (high = Gaussian blur)
+        self.bf_sigma_v_final = 0.1   # final value sigma (low = bilateral)
         super().__init__(parser, "Setting Pipeline parameters")
 
 

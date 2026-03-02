@@ -2,6 +2,7 @@ import os
 import uuid
 import yaml
 import gc
+import math
 from functools import partial
 import numpy as np
 import configargparse
@@ -438,6 +439,21 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 if i < pipeline_args.densify_until:
                     model.density.data.clamp_(min=-1.0)
 
+                # Bilateral filter: direct density smoothing
+                if (pipeline_args.bf_start >= 0
+                        and pipeline_args.bf_start <= i < pipeline_args.bf_until
+                        and i % pipeline_args.bf_period == 0):
+                    t = (i - pipeline_args.bf_start) / max(
+                        1, pipeline_args.bf_until - pipeline_args.bf_start - 1
+                    )
+                    bf_sigma = (pipeline_args.bf_sigma_init
+                                + t * (pipeline_args.bf_sigma_final - pipeline_args.bf_sigma_init))
+                    # Cosine anneal for sigma_v: stays high longer, then drops
+                    bf_sigma_v = (pipeline_args.bf_sigma_v_final
+                                  + 0.5 * (pipeline_args.bf_sigma_v_init - pipeline_args.bf_sigma_v_final)
+                                  * (1 + math.cos(math.pi * t)))
+                    model.apply_bilateral_filter(bf_sigma, bf_sigma_v)
+
                 model.update_learning_rate(i)
 
                 # Interpolation interleaving schedule
@@ -472,6 +488,16 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                     if hasattr(model, '_triangulation_retries'):
                         writer.add_scalar("diagnostics/triangulation_retries", model._triangulation_retries, i)
+
+                    if (pipeline_args.bf_start >= 0
+                            and pipeline_args.bf_start <= i < pipeline_args.bf_until):
+                        t = (i - pipeline_args.bf_start) / max(
+                            1, pipeline_args.bf_until - pipeline_args.bf_start - 1
+                        )
+                        writer.add_scalar("train/bf_sigma",
+                                          pipeline_args.bf_sigma_init + t * (pipeline_args.bf_sigma_final - pipeline_args.bf_sigma_init), i)
+                        writer.add_scalar("train/bf_sigma_v",
+                                          pipeline_args.bf_sigma_v_final + 0.5 * (pipeline_args.bf_sigma_v_init - pipeline_args.bf_sigma_v_final) * (1 + math.cos(math.pi * t)), i)
 
                     writer.add_scalar(
                         "lr/points_lr", model.xyz_scheduler_args(i), i
