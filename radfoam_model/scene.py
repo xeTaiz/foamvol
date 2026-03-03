@@ -343,9 +343,11 @@ class CTScene(torch.nn.Module):
         )
 
     @torch.no_grad()
-    def apply_bilateral_filter(self, sigma_scale, sigma_v):
+    def apply_bilateral_filter(self, sigma_scale, sigma_v, extent=1.0):
         """Apply bilateral filter to cell densities in-place.
 
+        Only filters cells within [-extent, extent]^3; cells outside
+        (and neighbors outside) are left untouched.
         Uses per-cell radius so sigma adapts to local cell density:
             sigma_i = sigma_scale * cell_radius_i
         """
@@ -354,6 +356,9 @@ class CTScene(torch.nn.Module):
         offsets = self.point_adjacency_offsets.long()
         adj = self.point_adjacency.long()
         N = points.shape[0]
+
+        # Mask: only cells inside the reconstruction volume
+        inside = (points.abs() <= extent).all(dim=-1)  # (N,)
 
         _, cell_radius = radfoam.farthest_neighbor(
             points, self.point_adjacency, self.point_adjacency_offsets,
@@ -367,10 +372,14 @@ class CTScene(torch.nn.Module):
             torch.arange(N, device=points.device), counts
         )
 
+        # Zero out edges where either endpoint is outside the volume
+        edge_valid = inside[source] & inside[adj]
+
         # Bilateral weights: spatial (per-cell sigma) x value similarity
         d_sq = (points[adj] - points[source]).pow(2).sum(dim=-1)
         dmu = activated[source] - activated[adj]
         w = torch.exp(-d_sq / sigma_sq[source] - dmu * dmu / (sigma_v * sigma_v))
+        w = w * edge_valid  # discard outside neighbors
 
         # Per-cell weighted average (include self with weight 1:
         # d_sq=0, dmu=0 → exp(0)=1, guarantees w_sum >= 1)
@@ -380,10 +389,9 @@ class CTScene(torch.nn.Module):
         )
         filtered = w_mu / w_sum
 
-        # Write back to raw parameter space
-        self.density.data[:, 0] = self.softplus_inv(
-            filtered / self.activation_scale
-        )
+        # Only write back cells inside the volume
+        inv = self.softplus_inv(filtered / self.activation_scale)
+        self.density.data[inside, 0] = inv[inside]
 
     def set_interpolation_mode(self, enabled, sigma=None, sigma_v=None,
                                per_cell_sigma=None, per_neighbor_sigma=None):

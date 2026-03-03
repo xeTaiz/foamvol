@@ -23,17 +23,17 @@ redundancy_cap: 0.05
 rays_per_batch: 1000000
 
 # Bilateral filter
-bf_start: 0
-bf_until: 6000
+bf_start: 5000
+bf_until: 9000
 bf_period: 10
 bf_sigma_init: 2.0
-bf_sigma_final: 0.3
-bf_sigma_v_init: 10.0
-bf_sigma_v_final: 0.1
+bf_sigma_final: 0.5
+bf_sigma_v_init: 3.0
+bf_sigma_v_final: 0.01
 
 # Model
 init_points: 64000
-final_points: 512000
+final_points: 256000
 activation_scale: 1.0
 init_scale: 1.05
 init_type: random
@@ -49,7 +49,7 @@ freeze_points: 9500
 
 tv_on_raw: True
 tv_anneal: False
-tv_weight: 1e-2
+tv_weight: 1e-3
 tv_start: 0
 tv_epsilon: 1e-4
 tv_area_weighted: False
