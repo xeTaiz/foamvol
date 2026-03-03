@@ -4,6 +4,7 @@
 /data
 /radfoam/
 /*output*
+/results
 old/
 
 *.egg-info
