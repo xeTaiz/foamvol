@@ -120,7 +120,11 @@ py::object trace_forward(Pipeline &self,
                          float idw_sigma_v,
                          bool per_cell_sigma,
                          bool per_neighbor_sigma,
-                         std::optional<torch::Tensor> cell_radius_in) {
+                         std::optional<torch::Tensor> cell_radius_in,
+                         bool gaussian_mode,
+                         std::optional<torch::Tensor> density_peak_in,
+                         std::optional<torch::Tensor> delta_raw_in,
+                         std::optional<torch::Tensor> cov_raw_in) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -172,6 +176,24 @@ py::object trace_forward(Pipeline &self,
         cell_radius = cell_radius_in.value().contiguous();
     }
 
+    bool has_density_peak = density_peak_in.has_value();
+    torch::Tensor density_peak;
+    if (has_density_peak) {
+        density_peak = density_peak_in.value().contiguous();
+    }
+
+    bool has_delta_raw = delta_raw_in.has_value();
+    torch::Tensor delta_raw_t;
+    if (has_delta_raw) {
+        delta_raw_t = delta_raw_in.value().contiguous();
+    }
+
+    bool has_cov_raw = cov_raw_in.has_value();
+    torch::Tensor cov_raw_t;
+    if (has_cov_raw) {
+        cov_raw_t = cov_raw_in.value().contiguous();
+    }
+
     TraceSettings settings = default_trace_settings();
     if (!max_intersections.is_none()) {
         settings.max_intersections = max_intersections.cast<uint32_t>();
@@ -182,6 +204,7 @@ py::object trace_forward(Pipeline &self,
     settings.idw_sigma_v = idw_sigma_v;
     settings.per_cell_sigma = per_cell_sigma;
     settings.per_neighbor_sigma = per_neighbor_sigma;
+    settings.gaussian_mode = gaussian_mode;
 
     std::vector<int64_t> output_shape;
     for (int i = 0; i < rays.dim() - 1; i++) {
@@ -232,6 +255,15 @@ py::object trace_forward(Pipeline &self,
             : nullptr,
         has_cell_radius
             ? reinterpret_cast<const float *>(cell_radius.data_ptr())
+            : nullptr,
+        has_density_peak
+            ? reinterpret_cast<const float *>(density_peak.data_ptr())
+            : nullptr,
+        has_delta_raw
+            ? reinterpret_cast<const float *>(delta_raw_t.data_ptr())
+            : nullptr,
+        has_cov_raw
+            ? reinterpret_cast<const float *>(cov_raw_t.data_ptr())
             : nullptr);
 
     py::dict output_dict;
@@ -262,7 +294,11 @@ py::object trace_backward(Pipeline &self,
                           float idw_sigma_v,
                           bool per_cell_sigma,
                           bool per_neighbor_sigma,
-                          std::optional<torch::Tensor> cell_radius_in) {
+                          std::optional<torch::Tensor> cell_radius_in,
+                          bool gaussian_mode,
+                          std::optional<torch::Tensor> density_peak_in,
+                          std::optional<torch::Tensor> delta_raw_in,
+                          std::optional<torch::Tensor> cov_raw_in) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -289,6 +325,24 @@ py::object trace_backward(Pipeline &self,
     torch::Tensor cell_radius;
     if (has_cell_radius) {
         cell_radius = cell_radius_in.value().contiguous();
+    }
+
+    bool has_density_peak = density_peak_in.has_value();
+    torch::Tensor density_peak;
+    if (has_density_peak) {
+        density_peak = density_peak_in.value().contiguous();
+    }
+
+    bool has_delta_raw = delta_raw_in.has_value();
+    torch::Tensor delta_raw_t;
+    if (has_delta_raw) {
+        delta_raw_t = delta_raw_in.value().contiguous();
+    }
+
+    bool has_cov_raw = cov_raw_in.has_value();
+    torch::Tensor cov_raw_t;
+    if (has_cov_raw) {
+        cov_raw_t = cov_raw_in.value().contiguous();
     }
 
     uint32_t num_points = points.size(0);
@@ -362,6 +416,7 @@ py::object trace_backward(Pipeline &self,
     settings.idw_sigma_v = idw_sigma_v;
     settings.per_cell_sigma = per_cell_sigma;
     settings.per_neighbor_sigma = per_neighbor_sigma;
+    settings.gaussian_mode = gaussian_mode;
 
     int64_t num_attr = attributes.size(0);
 
@@ -380,6 +435,20 @@ py::object trace_backward(Pipeline &self,
     if (has_density_grad) {
         density_grad_grad = torch::zeros(
             {(int64_t)num_points, 3},
+            torch::dtype(torch::kFloat32).device(rays.device()));
+    }
+
+    // Gaussian gradient tensors
+    torch::Tensor density_peak_grad_t, delta_raw_grad_t, cov_raw_grad_t;
+    if (gaussian_mode && has_density_peak) {
+        density_peak_grad_t = torch::zeros(
+            {(int64_t)num_points, 1},
+            torch::dtype(torch::kFloat32).device(rays.device()));
+        delta_raw_grad_t = torch::zeros(
+            {(int64_t)num_points, 3},
+            torch::dtype(torch::kFloat32).device(rays.device()));
+        cov_raw_grad_t = torch::zeros(
+            {(int64_t)num_points, 6},
             torch::dtype(torch::kFloat32).device(rays.device()));
     }
 
@@ -411,6 +480,24 @@ py::object trace_backward(Pipeline &self,
                      : nullptr,
         has_cell_radius
             ? reinterpret_cast<const float *>(cell_radius.data_ptr())
+            : nullptr,
+        has_density_peak
+            ? reinterpret_cast<const float *>(density_peak.data_ptr())
+            : nullptr,
+        has_delta_raw
+            ? reinterpret_cast<const float *>(delta_raw_t.data_ptr())
+            : nullptr,
+        has_cov_raw
+            ? reinterpret_cast<const float *>(cov_raw_t.data_ptr())
+            : nullptr,
+        (gaussian_mode && has_density_peak)
+            ? reinterpret_cast<float *>(density_peak_grad_t.data_ptr())
+            : nullptr,
+        (gaussian_mode && has_delta_raw)
+            ? reinterpret_cast<float *>(delta_raw_grad_t.data_ptr())
+            : nullptr,
+        (gaussian_mode && has_cov_raw)
+            ? reinterpret_cast<float *>(cov_raw_grad_t.data_ptr())
             : nullptr);
 
     py::dict output_dict;
@@ -419,6 +506,11 @@ py::object trace_backward(Pipeline &self,
     output_dict["attr_grad"] = attr_grad;
     if (has_density_grad) {
         output_dict["density_grad_grad"] = density_grad_grad;
+    }
+    if (gaussian_mode && has_density_peak) {
+        output_dict["density_peak_grad"] = density_peak_grad_t;
+        output_dict["delta_raw_grad"] = delta_raw_grad_t;
+        output_dict["cov_raw_grad"] = cov_raw_grad_t;
     }
     if (return_error) {
         output_dict["point_error"] = point_error;
@@ -490,7 +582,11 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("idw_sigma_v") = 0.1f,
              py::arg("per_cell_sigma") = false,
              py::arg("per_neighbor_sigma") = false,
-             py::arg("cell_radius") = py::none())
+             py::arg("cell_radius") = py::none(),
+             py::arg("gaussian_mode") = false,
+             py::arg("density_peak") = py::none(),
+             py::arg("delta_raw") = py::none(),
+             py::arg("cov_raw") = py::none())
         .def("trace_backward",
              trace_backward,
              py::arg("points"),
@@ -509,7 +605,11 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("idw_sigma_v") = 0.1f,
              py::arg("per_cell_sigma") = false,
              py::arg("per_neighbor_sigma") = false,
-             py::arg("cell_radius") = py::none());
+             py::arg("cell_radius") = py::none(),
+             py::arg("gaussian_mode") = false,
+             py::arg("density_peak") = py::none(),
+             py::arg("delta_raw") = py::none(),
+             py::arg("cov_raw") = py::none());
 
     module.def("create_ct_pipeline", create_ct_pipeline_binding);
 

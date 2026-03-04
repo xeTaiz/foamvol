@@ -230,6 +230,401 @@ __global__ void ct_backward(TraceSettings settings,
                          functor);
 }
 
+template <int block_size>
+__global__ void ct_gaussian_forward(TraceSettings settings,
+                                     const Vec3f *__restrict__ points,
+                                     const float *__restrict__ density,
+                                     const float *__restrict__ density_peak,
+                                     const float *__restrict__ delta_raw,
+                                     const float *__restrict__ cov_raw,
+                                     const float *__restrict__ cell_radius,
+                                     const uint32_t *__restrict__ point_adjacency,
+                                     const uint32_t *__restrict__ point_adjacency_offsets,
+                                     const Vec4h *__restrict__ adjacent_diff,
+                                     const Ray *__restrict__ rays,
+                                     uint32_t num_rays,
+                                     const uint32_t *__restrict__ start_point_index,
+                                     float *__restrict__ ray_projection,
+                                     uint32_t *__restrict__ num_intersections,
+                                     float *__restrict__ point_contribution) {
+
+    uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (thread_idx >= num_rays)
+        return;
+
+    Ray ray = rays[thread_idx];
+    ray.direction /= ray.direction.norm();
+
+    float projection = 0.0f;
+
+    constexpr float sp_beta = 10.0f;
+
+    auto functor = [&](uint32_t point_idx,
+                       float t_0,
+                       float t_1,
+                       const Vec3f &current_point,
+                       const Vec3f &next_point) {
+        float delta_t = fmaxf(t_1 - t_0, 0.0f);
+
+        // Base density (softplus activation)
+        float raw_b = density[point_idx];
+        float mu_base = (sp_beta * raw_b > 20.0f) ? raw_b
+                        : logf(1.0f + expf(sp_beta * raw_b)) / sp_beta;
+        float projection_base = mu_base * delta_t;
+
+        // Gaussian peak
+        float raw_p = density_peak[point_idx];
+        float mu_peak = (sp_beta * raw_p > 20.0f) ? raw_p
+                        : logf(1.0f + expf(sp_beta * raw_p)) / sp_beta;
+
+        // Center offset: c_off = current_point + cell_r * tanh(delta_raw)
+        float cell_r = cell_radius[point_idx];
+        const float *dr = delta_raw + point_idx * 3;
+        Vec3f c_off = current_point + cell_r * Vec3f(tanhf(dr[0]), tanhf(dr[1]), tanhf(dr[2]));
+        Vec3f c_vec = ray.origin - c_off;  // vector from Gaussian center to ray origin
+
+        // Cholesky: L (lower triangular, diagonal via softplus)
+        const float *Lr = cov_raw + point_idx * 6;
+        float L00 = (sp_beta * Lr[0] > 20.0f) ? Lr[0] : logf(1.0f + expf(sp_beta * Lr[0])) / sp_beta;
+        float L10 = Lr[1];
+        float L11 = (sp_beta * Lr[2] > 20.0f) ? Lr[2] : logf(1.0f + expf(sp_beta * Lr[2])) / sp_beta;
+        float L20 = Lr[3];
+        float L21 = Lr[4];
+        float L22 = (sp_beta * Lr[5] > 20.0f) ? Lr[5] : logf(1.0f + expf(sp_beta * Lr[5])) / sp_beta;
+
+        // Forward substitution: y = L^{-1} d, z = L^{-1} c_vec
+        float y0 = ray.direction[0] / L00;
+        float y1 = (ray.direction[1] - L10 * y0) / L11;
+        float y2 = (ray.direction[2] - L20 * y0 - L21 * y1) / L22;
+
+        float z0 = c_vec[0] / L00;
+        float z1 = (c_vec[1] - L10 * z0) / L11;
+        float z2 = (c_vec[2] - L20 * z0 - L21 * z1) / L22;
+
+        float A = y0 * y0 + y1 * y1 + y2 * y2;
+        float B = 2.0f * (z0 * y0 + z1 * y1 + z2 * y2);
+        float C_val = z0 * z0 + z1 * z1 + z2 * z2;
+
+        A = fmaxf(A, 1e-8f);
+
+        float t_peak = -B / (2.0f * A);
+        float d_eff_sq = fmaxf(C_val - B * B / (4.0f * A), 0.0f);
+
+        float sqrt_half_A = sqrtf(0.5f * A);
+        float arg_hi = (t_1 - t_peak) * sqrt_half_A;
+        float arg_lo = (t_0 - t_peak) * sqrt_half_A;
+        float erf_hi = erff(arg_hi);
+        float erf_lo = erff(arg_lo);
+        float erf_diff = erf_hi - erf_lo;
+
+        float envelope = mu_peak * expf(-0.5f * d_eff_sq);
+        float scale = sqrtf(M_PIf / (2.0f * A));
+        float projection_gauss = envelope * scale * erf_diff;
+
+        projection += projection_base + projection_gauss;
+
+        if (point_contribution) {
+            atomicAdd(point_contribution + point_idx, delta_t);
+        }
+
+        return true;
+    };
+
+    uint32_t start_point = start_point_index[thread_idx];
+
+    uint32_t n = trace<block_size, 4>(ray,
+                                      points,
+                                      point_adjacency,
+                                      point_adjacency_offsets,
+                                      adjacent_diff,
+                                      start_point,
+                                      settings.max_intersections,
+                                      functor);
+
+    ray_projection[thread_idx] = projection;
+
+    if (num_intersections)
+        num_intersections[thread_idx] = n;
+}
+
+template <int block_size>
+__global__ void ct_gaussian_backward(TraceSettings settings,
+                                      const Vec3f *__restrict__ points,
+                                      const float *__restrict__ density,
+                                      const float *__restrict__ density_peak,
+                                      const float *__restrict__ delta_raw,
+                                      const float *__restrict__ cov_raw,
+                                      const float *__restrict__ cell_radius,
+                                      const uint32_t *__restrict__ point_adjacency,
+                                      const uint32_t *__restrict__ point_adjacency_offsets,
+                                      const Vec4h *__restrict__ adjacent_diff,
+                                      const Ray *__restrict__ rays,
+                                      uint32_t num_rays,
+                                      const uint32_t *__restrict__ start_point_index,
+                                      const float *__restrict__ ray_projection_grad,
+                                      const float *__restrict__ ray_error,
+                                      Vec3f *__restrict__ points_grad,
+                                      float *__restrict__ density_scalar_grad,
+                                      float *__restrict__ density_peak_grad,
+                                      float *__restrict__ delta_raw_grad,
+                                      float *__restrict__ cov_raw_grad,
+                                      float *__restrict__ point_error) {
+
+    uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (thread_idx >= num_rays)
+        return;
+
+    Ray ray = rays[thread_idx];
+    ray.direction /= ray.direction.norm();
+
+    float dL_dprojection = ray_projection_grad[thread_idx];
+
+    float error;
+    if (ray_error) {
+        error = ray_error[thread_idx];
+    }
+
+    uint32_t prev_point_idx = UINT32_MAX;
+    Vec3f prev_point = Vec3f::Zero();
+    Vec3f prev_point_grad = Vec3f::Zero();
+
+    Vec3f current_point_grad = Vec3f::Zero();
+    Vec3f next_point_grad = Vec3f::Zero();
+
+    constexpr float sp_beta = 10.0f;
+    constexpr float two_over_sqrt_pi = 2.0f / 1.7724538509f; // 2/sqrt(pi)
+
+    auto functor = [&](uint32_t point_idx,
+                       float t_0,
+                       float t_1,
+                       const Vec3f &current_point,
+                       const Vec3f &next_point) {
+        float delta_t = fmaxf(t_1 - t_0, 0.0f);
+
+        if (point_error) {
+            float weight = delta_t;
+            atomicAdd(point_error + point_idx, weight * error);
+        }
+
+        // ===== Recompute forward quantities =====
+        float raw_b = density[point_idx];
+        float mu_base = (sp_beta * raw_b > 20.0f) ? raw_b
+                        : logf(1.0f + expf(sp_beta * raw_b)) / sp_beta;
+
+        float raw_p = density_peak[point_idx];
+        float mu_peak = (sp_beta * raw_p > 20.0f) ? raw_p
+                        : logf(1.0f + expf(sp_beta * raw_p)) / sp_beta;
+
+        float cell_r = cell_radius[point_idx];
+        const float *dr = delta_raw + point_idx * 3;
+        float tanh_dr0 = tanhf(dr[0]), tanh_dr1 = tanhf(dr[1]), tanh_dr2 = tanhf(dr[2]);
+        Vec3f c_off = current_point + cell_r * Vec3f(tanh_dr0, tanh_dr1, tanh_dr2);
+        Vec3f c_vec = ray.origin - c_off;
+
+        const float *Lr = cov_raw + point_idx * 6;
+        float L00 = (sp_beta * Lr[0] > 20.0f) ? Lr[0] : logf(1.0f + expf(sp_beta * Lr[0])) / sp_beta;
+        float L10 = Lr[1];
+        float L11 = (sp_beta * Lr[2] > 20.0f) ? Lr[2] : logf(1.0f + expf(sp_beta * Lr[2])) / sp_beta;
+        float L20 = Lr[3];
+        float L21 = Lr[4];
+        float L22 = (sp_beta * Lr[5] > 20.0f) ? Lr[5] : logf(1.0f + expf(sp_beta * Lr[5])) / sp_beta;
+
+        float y0 = ray.direction[0] / L00;
+        float y1 = (ray.direction[1] - L10 * y0) / L11;
+        float y2 = (ray.direction[2] - L20 * y0 - L21 * y1) / L22;
+
+        float z0 = c_vec[0] / L00;
+        float z1 = (c_vec[1] - L10 * z0) / L11;
+        float z2 = (c_vec[2] - L20 * z0 - L21 * z1) / L22;
+
+        float A = y0 * y0 + y1 * y1 + y2 * y2;
+        float B = 2.0f * (z0 * y0 + z1 * y1 + z2 * y2);
+        float C_val = z0 * z0 + z1 * z1 + z2 * z2;
+        A = fmaxf(A, 1e-8f);
+
+        float t_peak = -B / (2.0f * A);
+        float d_eff_sq = fmaxf(C_val - B * B / (4.0f * A), 0.0f);
+
+        float sqrt_half_A = sqrtf(0.5f * A);
+        float arg_hi = (t_1 - t_peak) * sqrt_half_A;
+        float arg_lo = (t_0 - t_peak) * sqrt_half_A;
+        float erf_hi = erff(arg_hi);
+        float erf_lo = erff(arg_lo);
+        float erf_diff = erf_hi - erf_lo;
+
+        float exp_deff = expf(-0.5f * d_eff_sq);
+        float envelope = mu_peak * exp_deff;
+        float scale = sqrtf(M_PIf / (2.0f * A));
+        float I_gauss = envelope * scale * erf_diff;
+
+        // ===== Base density backward =====
+        float d_softplus_base = 1.0f / (1.0f + expf(-sp_beta * raw_b));
+        atomicAdd(density_scalar_grad + point_idx, dL_dprojection * delta_t * d_softplus_base);
+
+        // ===== Gaussian backward =====
+        // I_gauss = envelope * scale * erf_diff
+        float dL_d_envelope = dL_dprojection * scale * erf_diff;
+        float dL_d_scale = dL_dprojection * envelope * erf_diff;
+        float dL_d_erf_diff = dL_dprojection * envelope * scale;
+
+        // erf_diff = erf(arg_hi) - erf(arg_lo)
+        float derf_hi = two_over_sqrt_pi * expf(-arg_hi * arg_hi);
+        float derf_lo = two_over_sqrt_pi * expf(-arg_lo * arg_lo);
+        float dL_d_arg_hi = dL_d_erf_diff * derf_hi;
+        float dL_d_arg_lo = -dL_d_erf_diff * derf_lo;
+
+        // arg = (t - t_peak) * sqrt_half_A
+        float dL_d_t_peak = -sqrt_half_A * (dL_d_arg_hi + dL_d_arg_lo);
+        float dL_d_sha = dL_d_arg_hi * (t_1 - t_peak) + dL_d_arg_lo * (t_0 - t_peak);
+
+        // scale = sqrt(pi) / (2 * sqrt_half_A)  =>  d(scale)/d(sha) = -scale/sha
+        dL_d_sha += dL_d_scale * (-scale / fmaxf(sqrt_half_A, 1e-12f));
+
+        // sqrt_half_A = sqrt(A/2)  =>  d(sha)/dA = 1/(4*sha)
+        float dL_dA = dL_d_sha / fmaxf(4.0f * sqrt_half_A, 1e-12f);
+
+        // t_peak = -B/(2A)
+        float inv2A = 1.0f / (2.0f * A);
+        float dL_dB = dL_d_t_peak * (-inv2A);
+        dL_dA += dL_d_t_peak * B * inv2A / A;  // B/(2A^2)
+
+        // envelope = mu_peak * exp(-d_eff_sq/2)
+        float dL_d_mu_peak = dL_d_envelope * exp_deff;
+        float dL_d_d_eff_sq = -0.5f * dL_d_envelope * envelope;
+
+        // d_eff_sq = C_val - B^2/(4A)
+        float dL_dC = dL_d_d_eff_sq;
+        dL_dB += dL_d_d_eff_sq * (-B * inv2A);  // -B/(2A)
+        dL_dA += dL_d_d_eff_sq * B * B / (4.0f * A * A);
+
+        // A = y.y, B = 2(z.y), C = z.z
+        float dL_dy0 = dL_dA * 2.0f * y0 + dL_dB * 2.0f * z0;
+        float dL_dy1 = dL_dA * 2.0f * y1 + dL_dB * 2.0f * z1;
+        float dL_dy2 = dL_dA * 2.0f * y2 + dL_dB * 2.0f * z2;
+
+        float dL_dz0 = dL_dB * 2.0f * y0 + dL_dC * 2.0f * z0;
+        float dL_dz1 = dL_dB * 2.0f * y1 + dL_dC * 2.0f * z1;
+        float dL_dz2 = dL_dB * 2.0f * y2 + dL_dC * 2.0f * z2;
+
+        // Initialize L gradient accumulators
+        float dL_dL00 = 0.0f, dL_dL10 = 0.0f, dL_dL11 = 0.0f;
+        float dL_dL20 = 0.0f, dL_dL21 = 0.0f, dL_dL22 = 0.0f;
+
+        // Backprop through y = L^{-1} d  (reverse order)
+        // y2 = (d2 - L20*y0 - L21*y1) / L22
+        dL_dL22 += dL_dy2 * (-y2 / L22);
+        dL_dL20 += dL_dy2 * (-y0 / L22);
+        dL_dL21 += dL_dy2 * (-y1 / L22);
+        dL_dy0 += dL_dy2 * (-L20 / L22);
+        dL_dy1 += dL_dy2 * (-L21 / L22);
+        // y1 = (d1 - L10*y0) / L11
+        dL_dL11 += dL_dy1 * (-y1 / L11);
+        dL_dL10 += dL_dy1 * (-y0 / L11);
+        dL_dy0 += dL_dy1 * (-L10 / L11);
+        // y0 = d0 / L00
+        dL_dL00 += dL_dy0 * (-y0 / L00);
+
+        // Backprop through z = L^{-1} c_vec  (reverse order)
+        // z2 = (c2 - L20*z0 - L21*z1) / L22
+        dL_dL22 += dL_dz2 * (-z2 / L22);
+        dL_dL20 += dL_dz2 * (-z0 / L22);
+        dL_dL21 += dL_dz2 * (-z1 / L22);
+        float dL_dc2 = dL_dz2 / L22;
+        dL_dz0 += dL_dz2 * (-L20 / L22);
+        dL_dz1 += dL_dz2 * (-L21 / L22);
+        // z1 = (c1 - L10*z0) / L11
+        dL_dL11 += dL_dz1 * (-z1 / L11);
+        dL_dL10 += dL_dz1 * (-z0 / L11);
+        float dL_dc1 = dL_dz1 / L11;
+        dL_dz0 += dL_dz1 * (-L10 / L11);
+        // z0 = c0 / L00
+        dL_dL00 += dL_dz0 * (-z0 / L00);
+        float dL_dc0 = dL_dz0 / L00;
+
+        // ===== Write gradients =====
+
+        // raw_peak gradient (through softplus)
+        float d_softplus_peak = 1.0f / (1.0f + expf(-sp_beta * raw_p));
+        atomicAdd(density_peak_grad + point_idx, dL_d_mu_peak * d_softplus_peak);
+
+        // cov_raw gradient (L_raw): diagonal entries chain through softplus
+        float d_sp_L00 = 1.0f / (1.0f + expf(-sp_beta * Lr[0]));
+        float d_sp_L11 = 1.0f / (1.0f + expf(-sp_beta * Lr[2]));
+        float d_sp_L22 = 1.0f / (1.0f + expf(-sp_beta * Lr[5]));
+        atomicAdd(cov_raw_grad + point_idx * 6 + 0, dL_dL00 * d_sp_L00);
+        atomicAdd(cov_raw_grad + point_idx * 6 + 1, dL_dL10);
+        atomicAdd(cov_raw_grad + point_idx * 6 + 2, dL_dL11 * d_sp_L11);
+        atomicAdd(cov_raw_grad + point_idx * 6 + 3, dL_dL20);
+        atomicAdd(cov_raw_grad + point_idx * 6 + 4, dL_dL21);
+        atomicAdd(cov_raw_grad + point_idx * 6 + 5, dL_dL22 * d_sp_L22);
+
+        // delta_raw gradient: c_off = current_point + cell_r * tanh(dr)
+        // c_vec = origin - c_off  =>  dL/dc_off = -dL/dc
+        // dL/d(dr[i]) = -dL/dc[i] * cell_r * sech^2(dr[i])
+        Vec3f dL_dc(dL_dc0, dL_dc1, dL_dc2);
+        float sech2_0 = 1.0f - tanh_dr0 * tanh_dr0;
+        float sech2_1 = 1.0f - tanh_dr1 * tanh_dr1;
+        float sech2_2 = 1.0f - tanh_dr2 * tanh_dr2;
+        atomicAdd(delta_raw_grad + point_idx * 3 + 0, -dL_dc0 * cell_r * sech2_0);
+        atomicAdd(delta_raw_grad + point_idx * 3 + 1, -dL_dc1 * cell_r * sech2_1);
+        atomicAdd(delta_raw_grad + point_idx * 3 + 2, -dL_dc2 * cell_r * sech2_2);
+
+        // Position gradient from Gaussian: dL/d(current_point) += -dL/dc
+        // (c_off = current_point + ..., c_vec = origin - c_off)
+        current_point_grad += Vec3f(-dL_dc0, -dL_dc1, -dL_dc2);
+
+        // ===== Cell intersection position gradients (same as existing) =====
+        float mu = mu_base;  // use base density for intersection grads
+        float dL_ddelta_t = dL_dprojection * mu;
+        float dL_dt0 = -dL_ddelta_t;
+        float dL_dt1 = dL_ddelta_t;
+
+        Vec3f dt0_dprev_point;
+        if (prev_point_idx != UINT32_MAX) {
+            dt0_dprev_point =
+                cell_intersection_grad(prev_point, current_point, ray);
+        } else {
+            dt0_dprev_point = Vec3f::Zero();
+        }
+
+        Vec3f dt1_dcurrent_point =
+            cell_intersection_grad(current_point, next_point, ray);
+        Vec3f dt0_dcurrent_point =
+            cell_intersection_grad(current_point, prev_point, ray);
+
+        Vec3f dt1_dnext_point =
+            cell_intersection_grad(next_point, current_point, ray);
+
+        prev_point_grad += dL_dt0 * dt0_dprev_point;
+        current_point_grad +=
+            dL_dt0 * dt0_dcurrent_point + dL_dt1 * dt1_dcurrent_point;
+        next_point_grad += dL_dt1 * dt1_dnext_point;
+
+        if (prev_point_idx != UINT32_MAX) {
+            atomic_add_vec(points_grad + prev_point_idx, prev_point_grad);
+        }
+        prev_point = current_point;
+        prev_point_idx = point_idx;
+        prev_point_grad = current_point_grad;
+
+        current_point_grad = next_point_grad;
+        next_point_grad = Vec3f::Zero();
+
+        return true;
+    };
+
+    uint32_t start_point = start_point_index[thread_idx];
+
+    trace<block_size, 2>(ray,
+                         points,
+                         point_adjacency,
+                         point_adjacency_offsets,
+                         adjacent_diff,
+                         start_point,
+                         settings.max_intersections,
+                         functor);
+}
+
 __global__ void precompute_activated_density(
     const float *__restrict__ density,
     float *__restrict__ activated,
@@ -812,7 +1207,10 @@ class CUDADensityPipeline : public Pipeline {
                        float *ray_projection,
                        uint32_t *num_intersections,
                        float *point_contribution,
-                       const float *cell_radius = nullptr) override {
+                       const float *cell_radius = nullptr,
+                       const float *density_peak = nullptr,
+                       const float *delta_raw = nullptr,
+                       const float *cov_raw = nullptr) override {
 
         CUDAArray<Vec4h> adjacent_diff(point_adjacency_size + 32);
         prefetch_adjacent_diff(reinterpret_cast<const Vec3f *>(points),
@@ -825,7 +1223,28 @@ class CUDADensityPipeline : public Pipeline {
                                nullptr);
 
         constexpr uint32_t block_size = 128;
-        if (settings.interpolation_mode) {
+        if (settings.gaussian_mode && density_peak && delta_raw && cov_raw && cell_radius) {
+            launch_kernel_1d<block_size>(
+                ct_gaussian_forward<block_size>,
+                num_rays,
+                nullptr,
+                settings,
+                points,
+                density,
+                density_peak,
+                delta_raw,
+                cov_raw,
+                cell_radius,
+                point_adjacency,
+                point_adjacency_offsets,
+                adjacent_diff.begin(),
+                rays,
+                num_rays,
+                start_point_index,
+                ray_projection,
+                num_intersections,
+                point_contribution);
+        } else if (settings.interpolation_mode) {
             CUDAArray<float> activated(num_points);
             launch_kernel_1d<256>(precompute_activated_density,
                                   num_points,
@@ -890,7 +1309,13 @@ class CUDADensityPipeline : public Pipeline {
                         float *density_scalar_grad,
                         Vec3f *density_grad_grad,
                         float *point_error,
-                        const float *cell_radius = nullptr) override {
+                        const float *cell_radius = nullptr,
+                        const float *density_peak = nullptr,
+                        const float *delta_raw = nullptr,
+                        const float *cov_raw = nullptr,
+                        float *density_peak_grad = nullptr,
+                        float *delta_raw_grad = nullptr,
+                        float *cov_raw_grad = nullptr) override {
 
         CUDAArray<Vec4h> adjacent_diff(point_adjacency_size + 32);
         prefetch_adjacent_diff(reinterpret_cast<const Vec3f *>(points),
@@ -903,7 +1328,33 @@ class CUDADensityPipeline : public Pipeline {
                                nullptr);
 
         constexpr uint32_t block_size = 128;
-        if (settings.interpolation_mode) {
+        if (settings.gaussian_mode && density_peak && delta_raw && cov_raw && cell_radius) {
+            launch_kernel_1d<block_size>(
+                ct_gaussian_backward<block_size>,
+                num_rays,
+                nullptr,
+                settings,
+                points,
+                density,
+                density_peak,
+                delta_raw,
+                cov_raw,
+                cell_radius,
+                point_adjacency,
+                point_adjacency_offsets,
+                adjacent_diff.begin(),
+                rays,
+                num_rays,
+                start_point_index,
+                ray_projection_grad,
+                ray_error,
+                points_grad,
+                density_scalar_grad,
+                density_peak_grad,
+                delta_raw_grad,
+                cov_raw_grad,
+                point_error);
+        } else if (settings.interpolation_mode) {
             CUDAArray<float> activated(num_points);
             CUDAArray<float> dsigmoid_buf(num_points);
             launch_kernel_1d<256>(precompute_activated_density,

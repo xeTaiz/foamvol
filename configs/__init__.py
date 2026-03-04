@@ -109,6 +109,15 @@ class OptimizationParams(ParamGroup):
         self.tv_anneal = False
         self.tv_on_raw = False
         self.density_grad_clip = 1.0
+        self.gaussian_start = -1
+        self.freeze_base_at_gaussian = False
+        self.joint_finetune_start = -1
+        self.peak_lr_init = 1e-2
+        self.peak_lr_final = 1e-3
+        self.offset_lr_init = 1e-3
+        self.offset_lr_final = 1e-4
+        self.cov_lr_init = 1e-2
+        self.cov_lr_final = 1e-3
         super().__init__(parser, "Setting Optimization parameters")
 
 
