@@ -16,6 +16,7 @@ struct TraceSettings {
     float idw_sigma_v = 0.1f;
     bool per_cell_sigma = false;
     bool per_neighbor_sigma = false;
+    bool gaussian_mode = false;
 };
 
 inline TraceSettings default_trace_settings() {
@@ -95,7 +96,10 @@ class Pipeline {
                                float *ray_projection,
                                uint32_t *num_intersections,
                                float *point_contribution,
-                               const float *cell_radius = nullptr) = 0;
+                               const float *cell_radius = nullptr,
+                               const float *density_peak = nullptr,
+                               const float *delta_raw = nullptr,
+                               const float *cov_raw = nullptr) = 0;
 
     virtual void trace_backward(const TraceSettings &settings,
                                 uint32_t num_points,
@@ -114,7 +118,13 @@ class Pipeline {
                                 float *density_scalar_grad,
                                 Vec3f *density_grad_grad,
                                 float *point_error,
-                                const float *cell_radius = nullptr) = 0;
+                                const float *cell_radius = nullptr,
+                                const float *density_peak = nullptr,
+                                const float *delta_raw = nullptr,
+                                const float *cov_raw = nullptr,
+                                float *density_peak_grad = nullptr,
+                                float *delta_raw_grad = nullptr,
+                                float *cov_raw_grad = nullptr) = 0;
 
     // Stub for viewer compatibility — CT pipeline does not implement this
     virtual void trace_visualization(const TraceSettings &settings,

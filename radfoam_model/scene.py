@@ -129,6 +129,12 @@ class CTScene(torch.nn.Module):
         self.density = optimizable_tensors["density"]
         if "density_grad" in optimizable_tensors:
             self.density_grad = optimizable_tensors["density_grad"]
+        if "density_peak" in optimizable_tensors:
+            self.density_peak = optimizable_tensors["density_peak"]
+        if "delta_raw" in optimizable_tensors:
+            self.delta_raw = optimizable_tensors["delta_raw"]
+        if "cov_raw" in optimizable_tensors:
+            self.cov_raw = optimizable_tensors["cov_raw"]
 
     def update_triangulation(self, rebuild=True, incremental=False):
         if not self.primal_points.isfinite().all():
@@ -412,8 +418,13 @@ class CTScene(torch.nn.Module):
         point_adjacency_offsets = self.point_adjacency_offsets
         density_grad = getattr(self, "density_grad", None)
         gradient_max_slope = getattr(self, "_gradient_max_slope", 5.0)
+        density_peak = getattr(self, "density_peak", None)
+        delta_raw = getattr(self, "delta_raw", None)
+        cov_raw = getattr(self, "cov_raw", None)
 
-        return points, density, point_adjacency, point_adjacency_offsets, density_grad, gradient_max_slope
+        return (points, density, point_adjacency, point_adjacency_offsets,
+                density_grad, gradient_max_slope,
+                density_peak, delta_raw, cov_raw)
 
     @torch.no_grad()
     def _get_cell_radius(self):
@@ -443,23 +454,30 @@ class CTScene(torch.nn.Module):
         start_point=None,
         return_contribution=False,
     ):
-        points, density, point_adjacency, point_adjacency_offsets, density_grad, gradient_max_slope = (
-            self.get_trace_data()
-        )
+        (points, density, point_adjacency, point_adjacency_offsets,
+         density_grad, gradient_max_slope,
+         density_peak, delta_raw, cov_raw) = self.get_trace_data()
 
         interpolation_mode = getattr(self, "_interpolation_mode", False)
         idw_sigma = getattr(self, "_idw_sigma", 0.01)
         idw_sigma_v = getattr(self, "_idw_sigma_v", 0.1)
         per_cell_sigma = getattr(self, "_per_cell_sigma", False)
         per_neighbor_sigma = getattr(self, "_per_neighbor_sigma", False)
+        gaussian_mode = getattr(self, "_gaussian_active", False)
 
-        # Compute cell_radius on demand when adaptive sigma is active
+        # Compute cell_radius on demand when adaptive sigma or gaussian mode is active
         cell_radius = None
         if interpolation_mode and (per_cell_sigma or per_neighbor_sigma):
+            cell_radius = self._get_cell_radius()
+        if gaussian_mode and density_peak is not None:
             cell_radius = self._get_cell_radius()
 
         # When interpolation is active, suppress the linear gradient feature
         if interpolation_mode:
+            density_grad = None
+
+        # When gaussian mode is active, suppress the linear gradient feature
+        if gaussian_mode:
             density_grad = None
 
         if start_point is None:
@@ -483,6 +501,10 @@ class CTScene(torch.nn.Module):
             per_cell_sigma,
             per_neighbor_sigma,
             cell_radius,
+            gaussian_mode,
+            density_peak,
+            delta_raw,
+            cov_raw,
         )
 
     def declare_optimizer(self, args, warmup, max_iterations):
@@ -538,6 +560,61 @@ class CTScene(torch.nn.Module):
               f"(warmup={args.gradient_warmup}, freeze_points={args.gradient_freeze_points}, "
               f"max_slope={args.gradient_max_slope})")
 
+    def initialize_gaussian(self, args):
+        N = self.primal_points.shape[0]
+        cell_r = self._get_cell_radius()  # (N,)
+        raw_diag = self.softplus_inv(cell_r)  # sigma ~ cell_radius
+
+        self.density_peak = nn.Parameter(
+            torch.zeros(N, 1, device=self.device, dtype=torch.float32)
+        )
+        self.delta_raw = nn.Parameter(
+            torch.zeros(N, 3, device=self.device, dtype=torch.float32)
+        )
+        cov = torch.zeros(N, 6, device=self.device, dtype=torch.float32)
+        cov[:, 0] = raw_diag
+        cov[:, 2] = raw_diag
+        cov[:, 5] = raw_diag
+        self.cov_raw = nn.Parameter(cov)
+
+        self.optimizer.add_param_group({
+            "params": self.density_peak,
+            "lr": args.peak_lr_init,
+            "name": "density_peak",
+        })
+        self.optimizer.add_param_group({
+            "params": self.delta_raw,
+            "lr": args.offset_lr_init,
+            "name": "delta_raw",
+        })
+        self.optimizer.add_param_group({
+            "params": self.cov_raw,
+            "lr": args.cov_lr_init,
+            "name": "cov_raw",
+        })
+
+        self.peak_scheduler_args = get_cosine_lr_func(
+            lr_init=args.peak_lr_init,
+            lr_final=args.peak_lr_final,
+            max_steps=self._max_iterations - args.gaussian_start,
+        )
+        self.offset_scheduler_args = get_cosine_lr_func(
+            lr_init=args.offset_lr_init,
+            lr_final=args.offset_lr_final,
+            max_steps=self._max_iterations - args.gaussian_start,
+        )
+        self.cov_scheduler_args = get_cosine_lr_func(
+            lr_init=args.cov_lr_init,
+            lr_final=args.cov_lr_final,
+            max_steps=self._max_iterations - args.gaussian_start,
+        )
+        self._gaussian_start = args.gaussian_start
+        self._gaussian_active = True
+
+        print(f"Initialized Gaussian params: {N} cells "
+              f"(peak_lr={args.peak_lr_init}, offset_lr={args.offset_lr_init}, "
+              f"cov_lr={args.cov_lr_init})")
+
     def update_learning_rate(self, iteration):
         # Freeze positions while density gradients stabilize
         freeze_for_grad = (
@@ -557,6 +634,24 @@ class CTScene(torch.nn.Module):
                 if self.grad_scheduler_args is not None:
                     lr = self.grad_scheduler_args(
                         iteration - self._gradient_start
+                    )
+                    param_group["lr"] = lr
+            elif param_group["name"] == "density_peak":
+                if hasattr(self, "peak_scheduler_args"):
+                    lr = self.peak_scheduler_args(
+                        iteration - self._gaussian_start
+                    )
+                    param_group["lr"] = lr
+            elif param_group["name"] == "delta_raw":
+                if hasattr(self, "offset_scheduler_args"):
+                    lr = self.offset_scheduler_args(
+                        iteration - self._gaussian_start
+                    )
+                    param_group["lr"] = lr
+            elif param_group["name"] == "cov_raw":
+                if hasattr(self, "cov_scheduler_args"):
+                    lr = self.cov_scheduler_args(
+                        iteration - self._gaussian_start
                     )
                     param_group["lr"] = lr
 
@@ -589,6 +684,12 @@ class CTScene(torch.nn.Module):
         self.density = optimizable_tensors["density"]
         if "density_grad" in optimizable_tensors:
             self.density_grad = optimizable_tensors["density_grad"]
+        if "density_peak" in optimizable_tensors:
+            self.density_peak = optimizable_tensors["density_peak"]
+        if "delta_raw" in optimizable_tensors:
+            self.delta_raw = optimizable_tensors["delta_raw"]
+        if "cov_raw" in optimizable_tensors:
+            self.cov_raw = optimizable_tensors["cov_raw"]
 
     def cat_tensors_to_optimizer(self, new_params):
         optimizable_tensors = {}
@@ -641,6 +742,12 @@ class CTScene(torch.nn.Module):
         self.density = optimizable_tensors["density"]
         if "density_grad" in optimizable_tensors:
             self.density_grad = optimizable_tensors["density_grad"]
+        if "density_peak" in optimizable_tensors:
+            self.density_peak = optimizable_tensors["density_peak"]
+        if "delta_raw" in optimizable_tensors:
+            self.delta_raw = optimizable_tensors["delta_raw"]
+        if "cov_raw" in optimizable_tensors:
+            self.cov_raw = optimizable_tensors["cov_raw"]
 
     def prune_and_densify(
         self, point_error, point_contribution, upsample_factor=1.2,
@@ -654,7 +761,7 @@ class CTScene(torch.nn.Module):
             num_new_points = int((upsample_factor - 1) * num_curr_points)
 
             primal_error_accum = point_error.clip(min=0).squeeze()
-            points, _, point_adjacency, point_adjacency_offsets, _, _ = (
+            points, _, point_adjacency, point_adjacency_offsets, *_ = (
                 self.get_trace_data()
             )
             ################### Farthest neighbor ###################
@@ -757,7 +864,27 @@ class CTScene(torch.nn.Module):
             sampled_inds_list = []
             sampled_density_list = []
             sampled_density_grad_list = []
+            sampled_density_peak_list = []
+            sampled_delta_raw_list = []
+            sampled_cov_raw_list = []
             has_density_grad = hasattr(self, "density_grad") and self.density_grad is not None
+            has_gaussian = hasattr(self, "density_peak") and self.density_peak is not None
+
+            def _append_gaussian_for_inds(inds, n):
+                """Append Gaussian params for sampled indices (zeros for new cells)."""
+                if has_gaussian:
+                    sampled_density_peak_list.append(
+                        torch.zeros(n, 1, device=self.device))
+                    sampled_delta_raw_list.append(
+                        torch.zeros(n, 3, device=self.device))
+                    # Init cov diagonal from parent cell radius
+                    cr_new = cell_radius[inds].squeeze()
+                    cov_new = torch.zeros(n, 6, device=self.device)
+                    raw_diag = self.softplus_inv(cr_new)
+                    cov_new[:, 0] = raw_diag
+                    cov_new[:, 2] = raw_diag
+                    cov_new[:, 5] = raw_diag
+                    sampled_cov_raw_list.append(cov_new)
 
             def _sample_edges(weight, n_budget, counter_name):
                 """Sample points along edges weighted by `weight`. Returns count added."""
@@ -775,6 +902,7 @@ class CTScene(torch.nn.Module):
                     sampled_density_list.append(self.density[extra_inds])
                     if has_density_grad:
                         sampled_density_grad_list.append(self.density_grad[extra_inds])
+                    _append_gaussian_for_inds(extra_inds, n_budget)
                     return 0  # added to gradient fallback, not this strategy
                 n_sample = min(n_budget, num_viable)
                 edge_inds = torch.multinomial(
@@ -800,6 +928,7 @@ class CTScene(torch.nn.Module):
                     sampled_density_grad_list.append(
                         torch.zeros(n_sample, 3, device=self.device)
                     )
+                _append_gaussian_for_inds(src[edge_inds], n_sample)
                 return n_sample
 
             # --- Gradient-based sampling (position error × cell radius) ---
@@ -814,6 +943,7 @@ class CTScene(torch.nn.Module):
                 sampled_density_list.append(self.density[grad_inds])
                 if has_density_grad:
                     sampled_density_grad_list.append(self.density_grad[grad_inds])
+                _append_gaussian_for_inds(grad_inds, num_gradient_points)
                 n_added_gradient += num_gradient_points
 
             # --- IDW-based sampling (bilateral prediction error × edge length) ---
@@ -838,6 +968,7 @@ class CTScene(torch.nn.Module):
                 sampled_density_list.append(self.density[entropy_inds])
                 if has_density_grad:
                     sampled_density_grad_list.append(self.density_grad[entropy_inds])
+                _append_gaussian_for_inds(entropy_inds, num_entropy_points)
                 n_added_entropy = num_entropy_points
 
             sampled_inds = torch.cat(sampled_inds_list, dim=0)
@@ -853,6 +984,11 @@ class CTScene(torch.nn.Module):
             min_sep = 0.05 * cell_radius[sampled_inds].squeeze()
             keep_mask = nn_dists > min_sep
 
+            if has_gaussian:
+                sampled_peak = torch.cat(sampled_density_peak_list, dim=0)
+                sampled_dr = torch.cat(sampled_delta_raw_list, dim=0)
+                sampled_cov = torch.cat(sampled_cov_raw_list, dim=0)
+
             n_filtered_dupes = (~keep_mask).sum().item()
             if n_filtered_dupes > 0:
                 print(f"Filtered {n_filtered_dupes}/{sampled_points.shape[0]} new points (too close to existing)")
@@ -861,6 +997,10 @@ class CTScene(torch.nn.Module):
                 sampled_density = sampled_density[keep_mask]
                 if has_density_grad:
                     sampled_dg = sampled_dg[keep_mask]
+                if has_gaussian:
+                    sampled_peak = sampled_peak[keep_mask]
+                    sampled_dr = sampled_dr[keep_mask]
+                    sampled_cov = sampled_cov[keep_mask]
 
             new_params = {
                 "primal_points": sampled_points,
@@ -868,6 +1008,10 @@ class CTScene(torch.nn.Module):
             }
             if has_density_grad:
                 new_params["density_grad"] = sampled_dg
+            if has_gaussian:
+                new_params["density_peak"] = sampled_peak
+                new_params["delta_raw"] = sampled_dr
+                new_params["cov_raw"] = sampled_cov
 
             prune_mask = torch.cat(
                 (
@@ -900,7 +1044,7 @@ class CTScene(torch.nn.Module):
         """Standalone prune pass: remove cells with negligible contribution or tiny radius."""
         _, point_contribution = self.collect_error_map(data_handler)
         with torch.no_grad():
-            points, _, point_adjacency, point_adjacency_offsets, _, _ = self.get_trace_data()
+            points, _, point_adjacency, point_adjacency_offsets, *_ = self.get_trace_data()
             _, cell_radius = radfoam.farthest_neighbor(
                 points, point_adjacency, point_adjacency_offsets,
             )
@@ -917,7 +1061,7 @@ class CTScene(torch.nn.Module):
     def collect_error_map(self, data_handler, contrast_alpha=0.0):
         rays, projections = data_handler.rays, data_handler.projections
 
-        points, _, _, _, _, _ = self.get_trace_data()
+        points, *_ = self.get_trace_data()
         start_points = self.get_starting_point(
             rays[:, 0, 0].cuda(), points, self.aabb_tree
         )
@@ -1025,6 +1169,10 @@ class CTScene(torch.nn.Module):
         if hasattr(self, "density_grad") and self.density_grad is not None:
             scene_data["density_grad"] = self.density_grad.detach().float().cpu()
             scene_data["gradient_max_slope"] = getattr(self, "_gradient_max_slope", 5.0)
+        if hasattr(self, "density_peak") and self.density_peak is not None:
+            scene_data["density_peak"] = self.density_peak.detach().float().cpu()
+            scene_data["delta_raw"] = self.delta_raw.detach().float().cpu()
+            scene_data["cov_raw"] = self.cov_raw.detach().float().cpu()
         torch.save(scene_data, pt_path)
 
     def load_pt(self, pt_path):
@@ -1038,6 +1186,18 @@ class CTScene(torch.nn.Module):
                 scene_data["density_grad"].to(self.device)
             )
             self._gradient_max_slope = scene_data.get("gradient_max_slope", 5.0)
+
+        if "density_peak" in scene_data:
+            self.density_peak = nn.Parameter(
+                scene_data["density_peak"].to(self.device)
+            )
+            self.delta_raw = nn.Parameter(
+                scene_data["delta_raw"].to(self.device)
+            )
+            self.cov_raw = nn.Parameter(
+                scene_data["cov_raw"].to(self.device)
+            )
+            self._gaussian_active = True
 
         self.point_adjacency = scene_data["adjacency"].to(self.device).to(
             torch.uint32)

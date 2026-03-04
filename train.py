@@ -352,7 +352,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
     def eval_views(data_handler, ray_batch_fetcher, proj_batch_fetcher):
         rays = data_handler.rays
-        points, _, _, _, _, _ = model.get_trace_data()
+        points, *_ = model.get_trace_data()
         start_points = model.get_starting_point(
             rays[:, 0, 0].cuda(), points, model.aabb_tree
         )
@@ -511,6 +511,19 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                             model.grad_scheduler_args(i - model._gradient_start),
                             i,
                         )
+                    if hasattr(model, 'peak_scheduler_args'):
+                        writer.add_scalar(
+                            "lr/peak_lr",
+                            model.peak_scheduler_args(i - model._gaussian_start),
+                            i,
+                        )
+                    if getattr(model, '_gaussian_active', False) and hasattr(model, 'density_peak'):
+                        import torch.nn.functional as _F
+                        mu_peak = _F.softplus(model.density_peak, beta=10)
+                        writer.add_scalar("gaussian/mu_peak_mean", mu_peak.mean().item(), i)
+                        writer.add_scalar("gaussian/mu_peak_max", mu_peak.max().item(), i)
+                        offset_mag = (model.delta_raw.detach().tanh()).norm(dim=-1)
+                        writer.add_scalar("gaussian/offset_mag_mean", offset_mag.mean().item(), i)
 
                     test_metrics = eval_views(
                         test_data_handler,
@@ -690,6 +703,24 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     and i == optimizer_args.gradient_start
                 ):
                     model.initialize_gradients(optimizer_args)
+
+                # Gaussian mode schedule
+                if (
+                    optimizer_args.gaussian_start >= 0
+                    and i == optimizer_args.gaussian_start
+                ):
+                    model.initialize_gaussian(optimizer_args)
+                    if optimizer_args.freeze_base_at_gaussian:
+                        model.density.requires_grad_(False)
+                        print(f"Froze base density at iter {i}")
+
+                if (
+                    optimizer_args.joint_finetune_start >= 0
+                    and i == optimizer_args.joint_finetune_start
+                    and getattr(model, '_gaussian_active', False)
+                ):
+                    model.density.requires_grad_(True)
+                    print(f"Unfroze base density for joint fine-tuning at iter {i}")
 
                 if i == optimizer_args.freeze_points:
                     model.update_triangulation(incremental=False)

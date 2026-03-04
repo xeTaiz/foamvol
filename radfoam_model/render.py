@@ -27,6 +27,10 @@ class TraceRays(torch.autograd.Function):
         _per_cell_sigma=False,
         _per_neighbor_sigma=False,
         _cell_radius=None,
+        _gaussian_mode=False,
+        _density_peak=None,
+        _delta_raw=None,
+        _cov_raw=None,
     ):
         ctx.rays = rays
         ctx.start_point = start_point
@@ -43,8 +47,14 @@ class TraceRays(torch.autograd.Function):
         ctx.per_cell_sigma = _per_cell_sigma
         ctx.per_neighbor_sigma = _per_neighbor_sigma
         ctx.cell_radius = _cell_radius
+        ctx.gaussian_mode = _gaussian_mode
+        ctx.has_gaussian = _density_peak is not None
         if ctx.has_density_grad:
             ctx.density_grad = _density_grad
+        if ctx.has_gaussian:
+            ctx.density_peak = _density_peak
+            ctx.delta_raw = _delta_raw
+            ctx.cov_raw = _cov_raw
 
         results = pipeline.trace_forward(
             _points,
@@ -62,6 +72,10 @@ class TraceRays(torch.autograd.Function):
             per_cell_sigma=_per_cell_sigma,
             per_neighbor_sigma=_per_neighbor_sigma,
             cell_radius=_cell_radius,
+            gaussian_mode=_gaussian_mode,
+            density_peak=_density_peak,
+            delta_raw=_delta_raw,
+            cov_raw=_cov_raw,
         )
 
         errbox = ErrorBox()
@@ -102,6 +116,11 @@ class TraceRays(torch.autograd.Function):
         per_cell_sigma = ctx.per_cell_sigma
         per_neighbor_sigma = ctx.per_neighbor_sigma
         cell_radius = ctx.cell_radius
+        gaussian_mode = ctx.gaussian_mode
+        has_gaussian = ctx.has_gaussian
+        _density_peak = ctx.density_peak if has_gaussian else None
+        _delta_raw = ctx.delta_raw if has_gaussian else None
+        _cov_raw = ctx.cov_raw if has_gaussian else None
 
         results = pipeline.trace_backward(
             _points,
@@ -120,16 +139,29 @@ class TraceRays(torch.autograd.Function):
             per_cell_sigma=per_cell_sigma,
             per_neighbor_sigma=per_neighbor_sigma,
             cell_radius=cell_radius,
+            gaussian_mode=gaussian_mode,
+            density_peak=_density_peak,
+            delta_raw=_delta_raw,
+            cov_raw=_cov_raw,
         )
         points_grad = results["points_grad"]
         attr_grad = results["attr_grad"]
         density_grad_grad = results.get("density_grad_grad", None)
+        density_peak_grad = results.get("density_peak_grad", None)
+        delta_raw_grad = results.get("delta_raw_grad", None)
+        cov_raw_grad = results.get("cov_raw_grad", None)
         ctx.errbox.point_error = results.get("point_error", None)
 
         points_grad[~points_grad.isfinite()] = 0
         attr_grad[~attr_grad.isfinite()] = 0
         if density_grad_grad is not None:
             density_grad_grad[~density_grad_grad.isfinite()] = 0
+        if density_peak_grad is not None:
+            density_peak_grad[~density_peak_grad.isfinite()] = 0
+        if delta_raw_grad is not None:
+            delta_raw_grad[~delta_raw_grad.isfinite()] = 0
+        if cov_raw_grad is not None:
+            cov_raw_grad[~cov_raw_grad.isfinite()] = 0
 
         del (
             ctx.rays,
@@ -147,9 +179,13 @@ class TraceRays(torch.autograd.Function):
             ctx.per_cell_sigma,
             ctx.per_neighbor_sigma,
             ctx.cell_radius,
+            ctx.gaussian_mode,
+            ctx.has_gaussian,
         )
         if has_density_grad:
             del ctx.density_grad
+        if has_gaussian:
+            del ctx.density_peak, ctx.delta_raw, ctx.cov_raw
 
         return (
             None,  # pipeline
@@ -168,4 +204,8 @@ class TraceRays(torch.autograd.Function):
             None,  # _per_cell_sigma
             None,  # _per_neighbor_sigma
             None,  # _cell_radius
+            None,  # _gaussian_mode
+            density_peak_grad,  # _density_peak
+            delta_raw_grad,  # _delta_raw
+            cov_raw_grad,  # _cov_raw
         )
