@@ -1,5 +1,36 @@
-# Pipeline (r2fast + sweep13 winners: C2 contrast_alpha=2.0, D3 grad-heavy splits)
+# Training
 iterations: 10000
+rays_per_batch: 1000000
+init_points: 64000
+final_points: 256000
+activation_scale: 1.0
+init_scale: 1.05
+init_type: random
+init_density: 2.0
+device: cuda
+debug: False
+viewer: False
+save_volume: False
+dataset: r2_gaussian
+data_path: /mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone
+
+# Optimization
+loss_type: l1
+points_lr_init: 2e-4
+points_lr_final: 5e-6
+density_lr_init: 5e-2
+density_lr_final: 1e-2
+freeze_points: 9500
+density_grad_clip: 10.0
+tv_weight: 1e-2
+tv_start: 0
+tv_epsilon: 1e-4
+tv_area_weighted: False
+tv_border: False
+tv_anneal: False
+tv_on_raw: True
+
+# Densification (sweep13 winners: C2 contrast_alpha=2.0, D3 grad-heavy splits)
 densify_from: 1000
 densify_until: 6000
 densify_factor: 1.15
@@ -8,46 +39,41 @@ idw_fraction: 0.1
 entropy_fraction: 0.3
 entropy_bins: 5
 contrast_alpha: 2.0
-loss_type: l1
-debug: False
-viewer: False
-save_volume: False
+redundancy_threshold: 0.01
+redundancy_cap: 0.05
+targeted_fraction: 0.0
+targeted_start: -1
+
+# Interpolation
 interpolation_start: 9000
 interp_ramp: False
 interp_sigma_scale: 0.7
 interp_sigma_v: 0.2
 per_cell_sigma: True
 per_neighbor_sigma: True
-redundancy_threshold: 0.01
-redundancy_cap: 0.05
-rays_per_batch: 1000000
+bf_start: -1
+bf_until: 6000
+bf_period: 10
+bf_sigma_init: 2.0
+bf_sigma_final: 0.3
+bf_sigma_v_init: 10.0
+bf_sigma_v_final: 0.1
 
-# Model
-init_points: 64000
-final_points: 256000
-activation_scale: 1.0
-init_scale: 1.05
-init_type: random
-init_density: 2.0
-device: cuda
+# Gaussians
+gaussian_start: -1
+freeze_base_at_gaussian: False
+joint_finetune_start: -1
+peak_lr_init: 1e-2
+peak_lr_final: 1e-3
+offset_lr_init: 1e-3
+offset_lr_final: 1e-4
+cov_lr_init: 1e-2
+cov_lr_final: 1e-3
 
-# Optimization
-points_lr_init: 2e-4
-points_lr_final: 5e-6
-density_lr_init: 5e-2
-density_lr_final: 1e-2
-freeze_points: 9500
-
-tv_on_raw: True
-tv_anneal: False
-tv_weight: 1e-2
-tv_start: 0
-tv_epsilon: 1e-4
-tv_area_weighted: False
-
-density_grad_clip: 10.0
+# Linear Gradient
 gradient_start: -1
-
-# Dataset
-dataset: r2_gaussian
-data_path: /mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone
+gradient_lr_init: 1e-2
+gradient_lr_final: 1e-3
+gradient_warmup: 500
+gradient_max_slope: 5.0
+gradient_freeze_points: 500
