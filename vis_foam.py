@@ -476,6 +476,65 @@ def make_slice_coords(axis, coord, resolution, extent):
     return coords
 
 
+def compute_voronoi_edges(field, axis, coord, resolution, extent):
+    """Compute Voronoi cell borders for a 2D slice.
+
+    Returns:
+        (resolution, resolution) bool array — True at border pixels.
+    """
+    coords = make_slice_coords(axis, coord, resolution, extent)
+    coords_flat = torch.from_numpy(coords).reshape(-1, 3).to(field["device"])
+
+    # NN lookup in batches to avoid OOM at high resolution
+    cell_map = torch.empty(coords_flat.shape[0], dtype=torch.int64,
+                           device=field["device"])
+    batch_size = 4_000_000
+    for start in range(0, coords_flat.shape[0], batch_size):
+        end = min(start + batch_size, coords_flat.shape[0])
+        cell_map[start:end] = radfoam.nn(
+            field["points"], field["aabb_tree"], coords_flat[start:end]
+        ).long()
+    cell_map = cell_map.reshape(resolution, resolution)
+
+    # Detect borders: pixel differs from any 4-connected neighbor
+    border = torch.zeros(resolution, resolution, dtype=torch.bool,
+                         device=cell_map.device)
+    border[:-1, :] |= (cell_map[:-1, :] != cell_map[1:, :])
+    border[1:, :]  |= (cell_map[1:, :] != cell_map[:-1, :])
+    border[:, :-1] |= (cell_map[:, :-1] != cell_map[:, 1:])
+    border[:, 1:]  |= (cell_map[:, 1:] != cell_map[:, :-1])
+
+    return border.cpu().numpy()
+
+
+def visualize_cell_heatmap(cell_density_slices, writer_fn=None):
+    """Render cell heatmaps as a separate 3x3 figure.
+
+    Args:
+        cell_density_slices: list of 9 (res, res) arrays (3 axes x 3 coords)
+        writer_fn: optional callable(fig) for TensorBoard
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axs = plt.subplots(3, 3, figsize=(9, 9))
+    axes_labels = ["X", "Y", "Z"]
+    coords = [-0.2, 0.0, 0.2]
+    for row in range(3):
+        for col in range(3):
+            idx = row * 3 + col
+            ax = axs[row, col]
+            ax.imshow(cell_density_slices[idx].T, origin="lower", cmap="hot")
+            ax.set_title(f"{axes_labels[row]}={coords[col]:.1f}", fontsize=8)
+            ax.axis("off")
+    fig.suptitle("Cell Density Heatmap", fontsize=12)
+    fig.tight_layout()
+    if writer_fn:
+        writer_fn(fig)
+    plt.close(fig)
+
+
 def compute_cell_density_slice(points, axis, coord, resolution, extent,
                                slab_thickness=None, device="cuda"):
     """Count cell centers per pixel bin in a thin slab around a slice.
@@ -704,7 +763,7 @@ def sobel_filter_2d(img):
 def visualize_slices(density_slices, idw_slices, cell_density_slices,
                      gt_slices=None, r2_slices=None, vmax=1.0, writer_fn=None,
                      writer_fn_interleaved=None, writer_fn_sobel=None,
-                     out_path=None, title=None):
+                     out_path=None, title=None, voronoi_edges=None):
     """Plot density slices. 3x9 without GT, 6x9 with GT comparison.
 
     Also produces an interleaved view (grouped by slice instead of by
@@ -722,6 +781,7 @@ def visualize_slices(density_slices, idw_slices, cell_density_slices,
         writer_fn_sobel: optional callable(fig) for TensorBoard (Sobel-filtered view)
         out_path: optional file path for saving
         title: optional figure title
+        voronoi_edges: optional list of 9 (res, res) bool arrays for Voronoi borders
 
     Returns:
         dict of average metrics if GT available, else None.
@@ -800,17 +860,15 @@ def visualize_slices(density_slices, idw_slices, cell_density_slices,
             ax.set_title(lbl, fontsize=8)
             ax.axis("off")
 
-            # --- Row 0-2: Cell density overlay (right 3 cols) ---
+            # --- Row 0-2: Density + Voronoi borders (right 3 cols) ---
             ax = axs[row, col + 6]
-            cd = cell_density_slices[idx]
-            cd_res = cd.shape[0]
-            ds_t = torch.from_numpy(density_slices[idx]).unsqueeze(0).unsqueeze(0)
-            ds = F.avg_pool2d(ds_t, kernel_size=ds_t.shape[-1] // cd_res).squeeze().numpy()
-            ax.imshow(ds.T, origin="lower", cmap="gray",
+            ax.imshow(density_slices[idx].T, origin="lower", cmap="gray",
                       vmin=0, vmax=vmax)
-            ax.imshow(cd.T, origin="lower",
-                      cmap="hot", alpha=0.5)
-            ax.set_title(f"cells {axes_labels[row]}={coords[col]:.1f}",
+            if voronoi_edges is not None and voronoi_edges[idx] is not None:
+                edge_rgba = np.zeros((*voronoi_edges[idx].shape, 4))
+                edge_rgba[voronoi_edges[idx], :] = [1, 0.3, 0, 0.7]  # orange, 70% opacity
+                ax.imshow(edge_rgba.transpose(1, 0, 2), origin="lower")
+            ax.set_title(f"borders {axes_labels[row]}={coords[col]:.1f}",
                          fontsize=8)
             ax.axis("off")
 
