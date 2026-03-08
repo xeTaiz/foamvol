@@ -27,6 +27,7 @@ from vis_foam import (load_density_field, field_from_model, query_density,
                       sample_idw, sample_idw_diagnostic,
                       visualize_idw_diagnostics,
                       make_slice_coords, compute_cell_density_slice,
+                      compute_voronoi_edges, visualize_cell_heatmap,
                       visualize_slices, load_gt_volume, load_r2_volume,
                       sample_gt_slice,
                       voxelize_volumes, log_density_histogram)
@@ -381,8 +382,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     def train_loop(viewer):
         print("Training")
 
-        log_interval = max(1, pipeline_args.iterations // 10)    # 10%
-        diag_interval = max(1, pipeline_args.iterations // 5)    # 20%
+        log_interval = max(1, pipeline_args.iterations // 20)    # 5%
+        diag_interval = max(1, pipeline_args.iterations // 10)    # 10%
 
         torch.cuda.synchronize()
 
@@ -582,6 +583,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                                 )
                                 gt_slices.append(sample_gt_slice(gt_volume, a, c, 256, 1.0))
                                 r2_slices.append(sample_gt_slice(r2_volume, a, c, 256, 1.0))
+                                ve_slices.append(compute_voronoi_edges(field, a, c, 256, 1.0))
                         log_fig_il = partial(writer.add_figure, f"slices_interleaved/{experiment_name}", global_step=i)
                         log_fig_sobel = partial(writer.add_figure, f"slices_sobel/{experiment_name}", global_step=i)
                         metrics = visualize_slices(
@@ -590,6 +592,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                             r2_slices=r2_slices if r2_volume is not None else None,
                             writer_fn_interleaved=log_fig_il,
                             writer_fn_sobel=log_fig_sobel,
+                            voronoi_edges=ve_slices,
                         )
                         if metrics is not None:
                             for key, val in metrics.items():
@@ -600,6 +603,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                                     # e.g. sobel_raw_psnr -> slice_psnr/sobel_raw
                                     tag = f"slice_{parts[-1]}/{'_'.join(parts[:-1])}"
                                 writer.add_scalar(tag, val, i)
+
+                        # Separate cell heatmap figure
+                        log_fig_hm = partial(writer.add_figure, f"cell_heatmap/{experiment_name}", global_step=i)
+                        visualize_cell_heatmap(cd_slices, writer_fn=log_fig_hm)
 
                         # IDW diagnostic for a single Z=0 slice
                         diag_coords = make_slice_coords(axis=2, coord=0.0, resolution=256, extent=1.0)
@@ -777,6 +784,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         cell_density_slices = []
         gt_slices_final = []
         r2_slices_final = []
+        ve_slices_final = []
         for a in axes:
             for c in coords:
                 coords_2d = make_slice_coords(a, c, 256, 1.0)
@@ -788,6 +796,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 )
                 gt_slices_final.append(sample_gt_slice(gt_volume, a, c, 256, 1.0))
                 r2_slices_final.append(sample_gt_slice(r2_volume, a, c, 256, 1.0))
+                ve_slices_final.append(compute_voronoi_edges(field, a, c, 256, 1.0))
 
         log_fig_il = partial(writer.add_figure, f"slices_interleaved/{experiment_name}", global_step=pipeline_args.iterations)
         log_fig_sobel = partial(writer.add_figure, f"slices_sobel/{experiment_name}", global_step=pipeline_args.iterations)
@@ -798,7 +807,12 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
             writer_fn_interleaved=log_fig_il,
             writer_fn_sobel=log_fig_sobel,
             out_path=f"{out_dir}/vis.jpg",
+            voronoi_edges=ve_slices_final,
         )
+
+        # Separate cell heatmap figure (final)
+        log_fig_hm = partial(writer.add_figure, f"cell_heatmap/{experiment_name}", global_step=pipeline_args.iterations)
+        visualize_cell_heatmap(cell_density_slices, writer_fn=log_fig_hm)
         if slice_metrics is not None:
             for key, val in slice_metrics.items():
                 parts = key.split('_')
