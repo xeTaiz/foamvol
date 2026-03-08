@@ -71,6 +71,8 @@ class PipelineParams(ParamGroup):
         self.bf_sigma_final = 0.3     # final spatial sigma
         self.bf_sigma_v_init = 10.0   # initial value sigma (high = Gaussian blur)
         self.bf_sigma_v_final = 0.1   # final value sigma (low = bilateral)
+        self.targeted_fraction = 0.0  # 0 = disabled, 0.2 = 20% targeted rays
+        self.targeted_start = -1      # iteration to start (-1 = same as densify_from)
         super().__init__(parser, "Setting Pipeline parameters")
 
 
