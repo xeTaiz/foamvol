@@ -23,7 +23,8 @@ __global__ void ct_forward(TraceSettings settings,
                            const uint32_t *__restrict__ start_point_index,
                            float *__restrict__ ray_projection,
                            uint32_t *__restrict__ num_intersections,
-                           float *__restrict__ point_contribution) {
+                           float *__restrict__ point_contribution,
+                           uint32_t *__restrict__ point_hit_count) {
 
     uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (thread_idx >= num_rays)
@@ -65,6 +66,9 @@ __global__ void ct_forward(TraceSettings settings,
 
         if (point_contribution) {
             atomicAdd(point_contribution + point_idx, delta_t);
+        }
+        if (point_hit_count) {
+            atomicAdd(point_hit_count + point_idx, 1u);
         }
 
         return true; // no early termination for CT
@@ -246,7 +250,8 @@ __global__ void ct_gaussian_forward(TraceSettings settings,
                                      const uint32_t *__restrict__ start_point_index,
                                      float *__restrict__ ray_projection,
                                      uint32_t *__restrict__ num_intersections,
-                                     float *__restrict__ point_contribution) {
+                                     float *__restrict__ point_contribution,
+                                     uint32_t *__restrict__ point_hit_count) {
 
     uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (thread_idx >= num_rays)
@@ -325,6 +330,9 @@ __global__ void ct_gaussian_forward(TraceSettings settings,
 
         if (point_contribution) {
             atomicAdd(point_contribution + point_idx, delta_t);
+        }
+        if (point_hit_count) {
+            atomicAdd(point_hit_count + point_idx, 1u);
         }
 
         return true;
@@ -656,7 +664,8 @@ __global__ void ct_interp_forward(TraceSettings settings,
                                    const uint32_t *__restrict__ start_point_index,
                                    float *__restrict__ ray_projection,
                                    uint32_t *__restrict__ num_intersections,
-                                   float *__restrict__ point_contribution) {
+                                   float *__restrict__ point_contribution,
+                                   uint32_t *__restrict__ point_hit_count) {
 
     uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (thread_idx >= num_rays)
@@ -746,6 +755,9 @@ __global__ void ct_interp_forward(TraceSettings settings,
 
         if (point_contribution) {
             atomicAdd(point_contribution + point_idx, delta_t);
+        }
+        if (point_hit_count) {
+            atomicAdd(point_hit_count + point_idx, 1u);
         }
 
         return true;
@@ -1207,6 +1219,7 @@ class CUDADensityPipeline : public Pipeline {
                        float *ray_projection,
                        uint32_t *num_intersections,
                        float *point_contribution,
+                       uint32_t *point_hit_count = nullptr,
                        const float *cell_radius = nullptr,
                        const float *density_peak = nullptr,
                        const float *delta_raw = nullptr,
@@ -1243,7 +1256,8 @@ class CUDADensityPipeline : public Pipeline {
                 start_point_index,
                 ray_projection,
                 num_intersections,
-                point_contribution);
+                point_contribution,
+                point_hit_count);
         } else if (settings.interpolation_mode) {
             CUDAArray<float> activated(num_points);
             launch_kernel_1d<256>(precompute_activated_density,
@@ -1270,7 +1284,8 @@ class CUDADensityPipeline : public Pipeline {
                 start_point_index,
                 ray_projection,
                 num_intersections,
-                point_contribution);
+                point_contribution,
+                point_hit_count);
         } else {
             launch_kernel_1d<block_size>(
                 ct_forward<block_size>,
@@ -1288,7 +1303,8 @@ class CUDADensityPipeline : public Pipeline {
                 start_point_index,
                 ray_projection,
                 num_intersections,
-                point_contribution);
+                point_contribution,
+                point_hit_count);
         }
     }
 
