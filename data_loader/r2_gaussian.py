@@ -128,3 +128,9 @@ class R2GaussianDataset:
         self.beam_type = "cone"
         # Angular extent of one pixel (radians) for jitter: atan(1/f) ~ 1/f
         self.pixel_ang_size = (1.0 / fx, 1.0 / fy)
+        self.fx = fx
+        self.fy = fy
+        # Store per-view c2w matrices
+        self.c2ws = torch.from_numpy(
+            np.stack([angle2pose(DSO, a) for a in angles], axis=0)
+        ).float()  # (N, 4, 4)
