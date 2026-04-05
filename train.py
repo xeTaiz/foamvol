@@ -574,6 +574,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         cd_slices = []
                         gt_slices = []
                         r2_slices = []
+                        ve_slices = []
                         for a in axes:
                             for c in slice_coords:
                                 coords_2d = make_slice_coords(a, c, 256, 1.0)
@@ -758,6 +759,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         train_data_handler,
                         contrast_alpha=pipeline_args.contrast_alpha,
                     )
+
                     densify_stats = model.prune_and_densify(
                         point_error,
                         point_contribution,
@@ -779,6 +781,23 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     model.update_triangulation(incremental=False)
                     triangulation_update_period = 1
                     gc.collect()
+
+                    # Rebuild targeted sampling pool (radius is fresh from update_triangulation)
+                    targeted_start = pipeline_args.targeted_start
+                    if targeted_start < 0:
+                        targeted_start = pipeline_args.densify_from
+                    if (pipeline_args.targeted_fraction > 0
+                            and i >= targeted_start):
+                        cell_weights = model.compute_cell_importance()
+                        if cell_weights.sum() > 0:
+                            points_t, *_ = model.get_trace_data()
+                            train_data_handler.update_targeting(
+                                cell_weights, points_t.detach(),
+                                model._cached_cell_radius.detach(),
+                                pipeline_args.targeted_fraction,
+                            )
+                            data_iterator = train_data_handler.get_targeted_iter()
+                            ray_batch, proj_batch = next(data_iterator)
 
                     # Linear growth
                     iters_since_densification = 0
