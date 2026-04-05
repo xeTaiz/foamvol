@@ -96,6 +96,7 @@ class Pipeline {
                                float *ray_projection,
                                uint32_t *num_intersections,
                                float *point_contribution,
+                               uint32_t *point_hit_count = nullptr,
                                const float *cell_radius = nullptr,
                                const float *density_peak = nullptr,
                                const float *delta_raw = nullptr,

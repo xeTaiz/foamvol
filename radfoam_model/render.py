@@ -84,6 +84,7 @@ class TraceRays(torch.autograd.Function):
         return (
             results["projection"],
             results.get("contribution", None),
+            results.get("hit_count", None),
             results["num_intersections"],
             errbox,
         )
@@ -93,10 +94,12 @@ class TraceRays(torch.autograd.Function):
         ctx,
         grad_projection,
         grad_contribution,
+        grad_hit_count,
         grad_num_intersections,
         errbox_grad,
     ):
         del grad_contribution
+        del grad_hit_count
         del grad_num_intersections
         del errbox_grad
 

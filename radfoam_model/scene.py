@@ -181,6 +181,12 @@ class CTScene(torch.nn.Module):
             self.triangulation.point_adjacency_offsets()
         )
 
+        # Cache cell radius for starvation tracking (cheap here, avoids per-iter recompute)
+        _, cr = radfoam.farthest_neighbor(
+            self.primal_points, self.point_adjacency, self.point_adjacency_offsets,
+        )
+        self._cached_cell_radius = cr.squeeze()
+
     def get_primal_density(self):
         return self.activation_scale * F.softplus(self.density, beta=10)
 
@@ -436,6 +442,53 @@ class CTScene(torch.nn.Module):
         )
         return cell_radius.squeeze()
 
+    @torch.no_grad()
+    def update_starvation_count(self):
+        """Update per-cell starvation counter and record completed episodes.
+
+        When a starving cell (count > 0) gets re-visited (nonzero gradient),
+        its starvation length and cell radius (from cache) are recorded.
+        """
+        N = self.primal_points.shape[0]
+        if not hasattr(self, '_starvation_count'):
+            self._starvation_count = torch.zeros(N, dtype=torch.int32, device=self.device)
+        if not hasattr(self, '_starvation_lifetimes'):
+            self._starvation_lifetimes = []  # list of (lengths, radii) tuples
+
+        hit = self.density.grad.squeeze().abs() > 0
+
+        # Record completed starvation episodes with radius snapshot
+        revisited = hit & (self._starvation_count > 0)
+        if revisited.any():
+            indices = revisited.nonzero(as_tuple=True)[0]
+            self._starvation_lifetimes.append((
+                self._starvation_count[indices].clone(),
+                self._cached_cell_radius[indices].clone(),
+            ))
+
+        self._starvation_count[hit] = 0
+        self._starvation_count[~hit] += 1
+
+    @torch.no_grad()
+    def compute_cell_importance(self):
+        """Per-cell sampling weight based on inverse cross-section (1/r²).
+
+        Small cells have small cross-section → low probability of random ray
+        intersection → need more targeted sampling. Weight ∝ 1/r².
+        """
+        r = self._cached_cell_radius  # (N,) — updated at every triangulation rebuild
+        weights = 1.0 / (r * r + 1e-12)
+
+        # Zero out cells outside the reconstruction volume (|coord| > 1)
+        inside = (self.primal_points.abs() <= 1.0).all(dim=-1)
+        weights = weights * inside.float()
+
+        # Normalize to probability distribution
+        total = weights.sum()
+        if total > 0:
+            weights = weights / total
+        return weights
+
     def get_starting_point(self, rays, points, aabb_tree):
         with torch.no_grad():
             camera_origins = rays[..., :3]
@@ -690,6 +743,8 @@ class CTScene(torch.nn.Module):
             self.delta_raw = optimizable_tensors["delta_raw"]
         if "cov_raw" in optimizable_tensors:
             self.cov_raw = optimizable_tensors["cov_raw"]
+        if hasattr(self, '_starvation_count'):
+            self._starvation_count = self._starvation_count[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, new_params):
         optimizable_tensors = {}
@@ -737,6 +792,7 @@ class CTScene(torch.nn.Module):
         return optimizable_tensors
 
     def densification_postfix(self, new_params):
+        n_new = new_params["primal_points"].shape[0]
         optimizable_tensors = self.cat_tensors_to_optimizer(new_params)
         self.primal_points = optimizable_tensors["primal_points"]
         self.density = optimizable_tensors["density"]
@@ -748,6 +804,11 @@ class CTScene(torch.nn.Module):
             self.delta_raw = optimizable_tensors["delta_raw"]
         if "cov_raw" in optimizable_tensors:
             self.cov_raw = optimizable_tensors["cov_raw"]
+        if hasattr(self, '_starvation_count'):
+            self._starvation_count = torch.cat([
+                self._starvation_count,
+                torch.zeros(n_new, dtype=torch.int32, device=self.device),
+            ])
 
     def prune_and_densify(
         self, point_error, point_contribution, upsample_factor=1.2,
@@ -1083,7 +1144,7 @@ class CTScene(torch.nn.Module):
             ray_batch = ray_batch_fetcher.next()
             proj_batch = proj_batch_fetcher.next()
 
-            proj_output, contribution, _, errbox = self.forward(
+            proj_output, contribution, _, _, errbox = self.forward(
                 ray_batch, start_points[i], return_contribution=True
             )
 

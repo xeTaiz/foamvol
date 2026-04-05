@@ -226,10 +226,14 @@ py::object trace_forward(Pipeline &self,
                          .device(rays.device()));
 
     torch::Tensor output_contribution;
+    torch::Tensor output_hit_count;
     if (return_contribution) {
         output_contribution = torch::zeros(
             {num_points, 1},
             torch::dtype(torch::kFloat32).device(rays.device()));
+        output_hit_count = torch::zeros(
+            {num_points, 1},
+            torch::dtype(scalar_to_type_meta(ScalarType::UInt32)).device(rays.device()));
     }
 
     set_default_stream();
@@ -253,6 +257,9 @@ py::object trace_forward(Pipeline &self,
         return_contribution
             ? reinterpret_cast<float *>(output_contribution.data_ptr())
             : nullptr,
+        return_contribution
+            ? reinterpret_cast<uint32_t *>(output_hit_count.data_ptr())
+            : nullptr,
         has_cell_radius
             ? reinterpret_cast<const float *>(cell_radius.data_ptr())
             : nullptr,
@@ -271,6 +278,7 @@ py::object trace_forward(Pipeline &self,
     output_dict["projection"] = output_projection;
     if (return_contribution) {
         output_dict["contribution"] = output_contribution;
+        output_dict["hit_count"] = output_hit_count;
     }
     output_dict["num_intersections"] = num_intersections;
 

@@ -365,7 +365,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
             for i in range(rays.shape[0]):
                 ray_batch = ray_batch_fetcher.next()[0]
                 proj_batch = proj_batch_fetcher.next()[0]
-                proj_output, _, _, _ = model(ray_batch, start_points[i])
+                proj_output, _, _, _, _ = model(ray_batch, start_points[i])
 
                 mse = ((proj_output - proj_batch) ** 2).mean()
                 rmse_list.append(torch.sqrt(mse).item())
@@ -398,7 +398,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         _loss_cpu = None
         with tqdm.trange(pipeline_args.iterations) as train:
             for i in train:
-                proj_output, _, _, _ = model(ray_batch)
+                return_diag = (i % diag_interval == diag_interval - 1 and not pipeline_args.debug)
+                proj_output, contribution, hit_count, _, _ = model(ray_batch, return_contribution=return_diag)
 
                 loss = loss_fn(proj_output, proj_batch)
 
@@ -436,6 +437,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     model.density.grad.clamp_(-optimizer_args.density_grad_clip, optimizer_args.density_grad_clip)
 
                 model.optimizer.step()
+                model.update_starvation_count()
 
                 if i < pipeline_args.densify_until:
                     model.density.data.clamp_(min=-1.0)
@@ -619,12 +621,129 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         writer.add_scalar("diagnostics/idw_mean_cell_weight", diag["cell_weight"].mean(), i)
                         writer.add_scalar("diagnostics/idw_mean_neighbor_count", diag["neighbor_count"].mean(), i)
 
+                        # Starvation diagnostics
+                        if hasattr(model, '_starvation_count'):
+                            import matplotlib
+                            matplotlib.use("Agg")
+                            import matplotlib.pyplot as plt
+
+                            writer.add_histogram("diagnostics/starvation_count",
+                                                 model._starvation_count, i)
+
+                            # Completed starvation episodes since last log
+                            if hasattr(model, '_starvation_lifetimes') and model._starvation_lifetimes:
+                                all_lengths = torch.cat([t[0] for t in model._starvation_lifetimes])
+                                all_radii = torch.cat([t[1] for t in model._starvation_lifetimes])
+                                lengths_float = all_lengths.float()
+                                max_len = int(all_lengths.max().item())
+                                bins = torch.arange(0, max_len + 2, dtype=torch.float32) - 0.5
+                                writer.add_histogram("diagnostics/starvation_lifetimes", lengths_float, i, bins=bins)
+                                writer.add_scalar("diagnostics/starvation_lifetime_mean", all_lengths.float().mean().item(), i)
+                                writer.add_scalar("diagnostics/starvation_lifetime_median", all_lengths.float().median().item(), i)
+                                writer.add_scalar("diagnostics/starvation_lifetime_max", all_lengths.max().item(), i)
+                                writer.add_scalar("diagnostics/starvation_lifetime_count", all_lengths.shape[0], i)
+                                writer.add_scalar("diagnostics/starvation_lifetime_p95",
+                                                   torch.quantile(lengths_float, 0.95).item(), i)
+                                writer.add_scalar("diagnostics/starvation_lifetime_p99",
+                                                   torch.quantile(lengths_float, 0.99).item(), i)
+                                long_count = (all_lengths > 10).sum().item()
+                                writer.add_scalar("diagnostics/starvation_lifetime_long_count", long_count, i)
+
+                                # Lifetime vs cell radius
+                                log_r_lt = torch.log10(all_radii.clamp(min=1e-6))
+                                lt_bin_edges = torch.linspace(log_r_lt.min(), log_r_lt.max(), 21)
+                                lt_bin_means = []
+                                lt_bin_centers = []
+                                for b in range(20):
+                                    mask = (log_r_lt >= lt_bin_edges[b]) & (log_r_lt < lt_bin_edges[b + 1])
+                                    if mask.any():
+                                        lt_bin_means.append(all_lengths[mask].float().mean().item())
+                                        lt_bin_centers.append(((lt_bin_edges[b] + lt_bin_edges[b + 1]) / 2).item())
+                                if lt_bin_centers:
+                                    fig_lt, ax_lt = plt.subplots(figsize=(6, 4))
+                                    bw_lt = (lt_bin_centers[1] - lt_bin_centers[0]) * 0.9 if len(lt_bin_centers) > 1 else 0.1
+                                    ax_lt.bar(lt_bin_centers, lt_bin_means, width=bw_lt)
+                                    ax_lt.set_xlabel("log10(cell_radius)")
+                                    ax_lt.set_ylabel("mean starvation lifetime")
+                                    ax_lt.set_title("Starvation Lifetime vs Cell Radius")
+                                    writer.add_figure(f"diagnostics/starvation_lifetime_vs_radius/{experiment_name}", fig_lt, i)
+                                    plt.close(fig_lt)
+
+                                model._starvation_lifetimes.clear()
+
+                            # Current starvation vs cell radius
+                            starvation = model._starvation_count.float()
+                            log_r = torch.log10(cell_radius.clamp(min=1e-6))
+                            n_bins = 20
+                            bin_edges = torch.linspace(log_r.min(), log_r.max(), n_bins + 1)
+                            bin_means = []
+                            bin_centers = []
+                            for b in range(n_bins):
+                                mask = (log_r >= bin_edges[b]) & (log_r < bin_edges[b + 1])
+                                if mask.any():
+                                    bin_means.append(starvation[mask].mean().item())
+                                    bin_centers.append(((bin_edges[b] + bin_edges[b + 1]) / 2).item())
+                            if bin_centers:
+                                fig_sv, ax_sv = plt.subplots(figsize=(6, 4))
+                                bw = (bin_centers[1] - bin_centers[0]) * 0.9 if len(bin_centers) > 1 else 0.1
+                                ax_sv.bar(bin_centers, bin_means, width=bw)
+                                ax_sv.set_xlabel("log10(cell_radius)")
+                                ax_sv.set_ylabel("mean starvation count")
+                                ax_sv.set_title("Starvation vs Cell Radius")
+                                writer.add_figure(f"diagnostics/starvation_vs_radius/{experiment_name}", fig_sv, i)
+                                plt.close(fig_sv)
+
+                        # Rays-per-cell diagnostics
+                        if hit_count is not None:
+                            import matplotlib
+                            matplotlib.use("Agg")
+                            import matplotlib.pyplot as plt
+
+                            hc = hit_count.squeeze().float()  # [N]
+                            writer.add_histogram("diagnostics/rays_per_cell", hc, i)
+                            writer.add_scalar("diagnostics/rays_per_cell_mean", hc.mean().item(), i)
+                            writer.add_scalar("diagnostics/rays_per_cell_median", hc.median().item(), i)
+                            writer.add_scalar("diagnostics/rays_per_cell_zero_frac",
+                                               (hc == 0).float().mean().item(), i)
+
+                            # Rays-per-cell vs cell radius (binned bar chart)
+                            log_r_hc = torch.log10(cell_radius.clamp(min=1e-6))
+                            hc_bin_edges = torch.linspace(log_r_hc.min(), log_r_hc.max(), 21)
+                            hc_bin_means = []
+                            hc_bin_centers = []
+                            for b in range(20):
+                                mask = (log_r_hc >= hc_bin_edges[b]) & (log_r_hc < hc_bin_edges[b + 1])
+                                if mask.any():
+                                    hc_bin_means.append(hc[mask].mean().item())
+                                    hc_bin_centers.append(((hc_bin_edges[b] + hc_bin_edges[b + 1]) / 2).item())
+                            if hc_bin_centers:
+                                fig_hc, ax_hc = plt.subplots(figsize=(6, 4))
+                                bw_hc = (hc_bin_centers[1] - hc_bin_centers[0]) * 0.9 if len(hc_bin_centers) > 1 else 0.1
+                                ax_hc.bar(hc_bin_centers, hc_bin_means, width=bw_hc)
+                                ax_hc.set_xlabel("log10(cell_radius)")
+                                ax_hc.set_ylabel("mean rays per cell")
+                                ax_hc.set_title("Rays Per Cell vs Cell Radius")
+                                writer.add_figure(f"diagnostics/rays_per_cell_vs_radius/{experiment_name}", fig_hc, i)
+                                plt.close(fig_hc)
+
                 if iters_since_update >= triangulation_update_period:
                     model.update_triangulation(incremental=True)
                     iters_since_update = 0
 
                     if triangulation_update_period < 100:
                         triangulation_update_period += 2
+
+                    # Refresh targeting state if active (radius changed)
+                    if (hasattr(train_data_handler, '_target_weights')
+                            and pipeline_args.targeted_fraction > 0):
+                        cell_weights = model.compute_cell_importance()
+                        if cell_weights.sum() > 0:
+                            points_t, *_ = model.get_trace_data()
+                            train_data_handler.update_targeting(
+                                cell_weights, points_t.detach(),
+                                model._cached_cell_radius.detach(),
+                                pipeline_args.targeted_fraction,
+                            )
 
                 iters_since_update += 1
                 if i + 1 >= pipeline_args.densify_from:
