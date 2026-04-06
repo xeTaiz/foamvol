@@ -29,7 +29,7 @@ from vis_foam import (load_density_field, field_from_model, query_density,
                       make_slice_coords, compute_cell_density_slice,
                       compute_voronoi_edges, visualize_cell_heatmap,
                       visualize_slices, load_gt_volume, load_r2_volume,
-                      sample_gt_slice,
+                      sample_gt_slice, render_volume_drr,
                       voxelize_volumes, log_density_histogram)
 import radfoam
 
@@ -366,7 +366,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     if r2_volume is not None:
         print(f"Loaded R2 volume: shape={r2_volume.shape}")
 
-    def eval_views(data_handler, ray_batch_fetcher, proj_batch_fetcher):
+    def eval_views(data_handler, ray_batch_fetcher, proj_batch_fetcher,
+                   return_images=False):
         rays = data_handler.rays
         points, *_ = model.get_trace_data()
         start_points = model.get_starting_point(
@@ -376,6 +377,9 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         rmse_list = []
         psnr_list = []
         ssim_list = []
+        pred_imgs = []
+        gt_imgs = []
+        ray_list = []
         with torch.no_grad():
             for i in range(rays.shape[0]):
                 ray_batch = ray_batch_fetcher.next()[0]
@@ -386,13 +390,372 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 rmse_list.append(torch.sqrt(mse).item())
                 psnr_list.append(compute_psnr(proj_output, proj_batch))
                 ssim_list.append(compute_ssim(proj_output, proj_batch))
+                if return_images:
+                    pred_imgs.append(proj_output.squeeze(-1).cpu().numpy())
+                    gt_imgs.append(proj_batch.squeeze(-1).cpu().numpy())
+                    ray_list.append(ray_batch.cpu().numpy())
                 torch.cuda.synchronize()
 
-        return {
+        result = {
             "rmse": sum(rmse_list) / len(rmse_list),
             "psnr": sum(psnr_list) / len(psnr_list),
             "ssim": sum(ssim_list) / len(ssim_list),
         }
+        if return_images:
+            result["pred_imgs"] = pred_imgs
+            result["gt_imgs"] = gt_imgs
+            result["rays"] = ray_list
+        return result
+
+    def log_basic(step, loss_val=None, tv_loss_val=None, tv_scale_val=None):
+        """Log eval metrics, LR, point count. Called at step 0, log_interval, final."""
+        test_metrics = eval_views(
+            test_data_handler,
+            test_ray_batch_fetcher,
+            test_proj_batch_fetcher,
+        )
+        writer.add_scalar("test/rmse", test_metrics["rmse"], step)
+        writer.add_scalar("test/psnr", test_metrics["psnr"], step)
+        writer.add_scalar("test/ssim", test_metrics["ssim"], step)
+
+        train_metrics = eval_views(
+            train_data_handler,
+            train_ray_batch_fetcher,
+            train_proj_batch_fetcher,
+        )
+        writer.add_scalar("train/rmse", train_metrics["rmse"], step)
+        writer.add_scalar("train/psnr", train_metrics["psnr"], step)
+        writer.add_scalar("train/ssim", train_metrics["ssim"], step)
+
+        num_points = model.primal_points.shape[0]
+        writer.add_scalar("train/num_points", num_points, step)
+
+        if loss_val is not None:
+            writer.add_scalar("train/loss", loss_val, step)
+        if tv_loss_val is not None and optimizer_args.tv_weight > 0:
+            writer.add_scalar("train/tv_loss", tv_loss_val, step)
+            if optimizer_args.tv_anneal and tv_scale_val is not None:
+                writer.add_scalar("train/tv_scale", tv_scale_val, step)
+
+        if hasattr(model, '_triangulation_retries'):
+            writer.add_scalar("diagnostics/triangulation_retries", model._triangulation_retries, step)
+
+        if (pipeline_args.bf_start >= 0
+                and pipeline_args.bf_start <= step < pipeline_args.bf_until):
+            t = (step - pipeline_args.bf_start) / max(
+                1, pipeline_args.bf_until - pipeline_args.bf_start - 1
+            )
+            writer.add_scalar("train/bf_sigma",
+                              pipeline_args.bf_sigma_init + t * (pipeline_args.bf_sigma_final - pipeline_args.bf_sigma_init), step)
+            writer.add_scalar("train/bf_sigma_v",
+                              pipeline_args.bf_sigma_v_final + 0.5 * (pipeline_args.bf_sigma_v_init - pipeline_args.bf_sigma_v_final) * (1 + math.cos(math.pi * t)), step)
+
+        writer.add_scalar("lr/points_lr", model.xyz_scheduler_args(step), step)
+        writer.add_scalar("lr/density_lr", model.den_scheduler_args(step), step)
+        if model.grad_scheduler_args is not None:
+            writer.add_scalar("lr/gradient_lr",
+                              model.grad_scheduler_args(step - model._gradient_start), step)
+        if hasattr(model, 'peak_scheduler_args'):
+            writer.add_scalar("lr/peak_lr",
+                              model.peak_scheduler_args(step - model._gaussian_start), step)
+        if getattr(model, '_gaussian_active', False) and hasattr(model, 'density_peak'):
+            import torch.nn.functional as _F
+            mu_peak = _F.softplus(model.density_peak, beta=10)
+            writer.add_scalar("gaussian/mu_peak_mean", mu_peak.mean().item(), step)
+            writer.add_scalar("gaussian/mu_peak_max", mu_peak.max().item(), step)
+            offset_mag = (model.delta_raw.detach().tanh()).norm(dim=-1)
+            writer.add_scalar("gaussian/offset_mag_mean", offset_mag.mean().item(), step)
+
+        if pipeline_args.interpolation_start >= 0 and step >= pipeline_args.densify_until:
+            ramp_length = max(1, pipeline_args.interpolation_start - pipeline_args.densify_until)
+            frac = min(1.0, (step - pipeline_args.densify_until) / ramp_length)
+            writer.add_scalar("train/interp_fraction", frac, step)
+
+        print(f"Step {step}: test PSNR={test_metrics['psnr']:.2f}, "
+              f"train PSNR={train_metrics['psnr']:.2f}, "
+              f"points={num_points}")
+        return test_metrics, train_metrics
+
+    def log_diag(step, hit_count=None):
+        """Log slice visualizations, diagnostics, error comparison. Called at step 0, diag_interval, final."""
+        log_density_histogram(model, writer, step)
+        log_diagnostics(model, writer, step)
+        cell_entropy = model.compute_neighbor_entropy(n_bins=pipeline_args.entropy_bins)
+        writer.add_histogram("diagnostics/cell_entropy", cell_entropy, step)
+        writer.add_scalar("diagnostics/entropy_mean", cell_entropy.mean().item(), step)
+        writer.add_scalar("diagnostics/entropy_max", cell_entropy.max().item(), step)
+
+        with torch.no_grad():
+            field = field_from_model(model)
+            _, cell_radius = radfoam.farthest_neighbor(
+                model.primal_points,
+                model.point_adjacency,
+                model.point_adjacency_offsets,
+            )
+            sigma = pipeline_args.interp_sigma_scale * cell_radius.median().item()
+            sigma_v = pipeline_args.interp_sigma_v
+
+            # Slice visualizations
+            axes = [0, 1, 2]
+            slice_coords = [-0.2, 0.0, 0.2]
+            d_slices, idw_slices, cd_slices = [], [], []
+            gt_slices, r2_slices_list, ve_slices = [], [], []
+            for a in axes:
+                for c in slice_coords:
+                    coords_2d = make_slice_coords(a, c, 256, 1.0)
+                    d_slices.append(query_density(field, coords_2d))
+                    idw_slices.append(sample_idw(field, coords_2d,
+                                                 sigma=sigma, sigma_v=sigma_v))
+                    cd_slices.append(
+                        compute_cell_density_slice(field["points"], a, c, 64, 1.0)
+                    )
+                    gt_slices.append(sample_gt_slice(gt_volume, a, c, 256, 1.0))
+                    r2_slices_list.append(sample_gt_slice(r2_volume, a, c, 256, 1.0))
+                    ve_slices.append(compute_voronoi_edges(field, a, c, 256, 1.0))
+
+            log_fig_il = partial(writer.add_figure, f"slices_interleaved/{experiment_name}", global_step=step)
+            log_fig_sobel = partial(writer.add_figure, f"slices_sobel/{experiment_name}", global_step=step)
+            metrics = visualize_slices(
+                d_slices, idw_slices, cd_slices,
+                gt_slices=gt_slices,
+                r2_slices=r2_slices_list if r2_volume is not None else None,
+                writer_fn_interleaved=log_fig_il,
+                writer_fn_sobel=log_fig_sobel,
+                voronoi_edges=ve_slices,
+            )
+            if metrics is not None:
+                for key, val in metrics.items():
+                    parts = key.split('_')
+                    if len(parts) == 2:
+                        tag = f"slice_{parts[1]}/{parts[0]}"
+                    else:
+                        tag = f"slice_{parts[-1]}/{'_'.join(parts[:-1])}"
+                    writer.add_scalar(tag, val, step)
+
+            # Cell heatmap
+            log_fig_hm = partial(writer.add_figure, f"cell_heatmap/{experiment_name}", global_step=step)
+            visualize_cell_heatmap(cd_slices, writer_fn=log_fig_hm)
+
+            # IDW diagnostics
+            diag_coords = make_slice_coords(axis=2, coord=0.0, resolution=256, extent=1.0)
+            diag = sample_idw_diagnostic(field, diag_coords,
+                                         sigma=sigma, sigma_v=sigma_v)
+            diag_writer = partial(writer.add_figure, f"idw_diagnostics/{experiment_name}", global_step=step)
+            visualize_idw_diagnostics(diag, writer_fn=diag_writer)
+            n_holes = (diag["diff"] > 0.05).sum()
+            writer.add_scalar("diagnostics/idw_hole_pixels", n_holes, step)
+            writer.add_scalar("diagnostics/idw_mean_cell_weight", diag["cell_weight"].mean(), step)
+            writer.add_scalar("diagnostics/idw_mean_neighbor_count", diag["neighbor_count"].mean(), step)
+
+            # Starvation diagnostics
+            if hasattr(model, '_starvation_count'):
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+
+                writer.add_histogram("diagnostics/starvation_count",
+                                     model._starvation_count, step)
+                if hasattr(model, '_starvation_lifetimes') and model._starvation_lifetimes:
+                    all_lengths = torch.cat([t[0] for t in model._starvation_lifetimes])
+                    all_radii = torch.cat([t[1] for t in model._starvation_lifetimes])
+                    lengths_float = all_lengths.float()
+                    max_len = int(all_lengths.max().item())
+                    bins = torch.arange(0, max_len + 2, dtype=torch.float32) - 0.5
+                    writer.add_histogram("diagnostics/starvation_lifetimes", lengths_float, step, bins=bins)
+                    writer.add_scalar("diagnostics/starvation_lifetime_mean", all_lengths.float().mean().item(), step)
+                    writer.add_scalar("diagnostics/starvation_lifetime_median", all_lengths.float().median().item(), step)
+                    writer.add_scalar("diagnostics/starvation_lifetime_max", all_lengths.max().item(), step)
+                    writer.add_scalar("diagnostics/starvation_lifetime_count", all_lengths.shape[0], step)
+                    writer.add_scalar("diagnostics/starvation_lifetime_p95",
+                                       torch.quantile(lengths_float, 0.95).item(), step)
+                    writer.add_scalar("diagnostics/starvation_lifetime_p99",
+                                       torch.quantile(lengths_float, 0.99).item(), step)
+                    long_count = (all_lengths > 10).sum().item()
+                    writer.add_scalar("diagnostics/starvation_lifetime_long_count", long_count, step)
+
+                    log_r_lt = torch.log10(all_radii.clamp(min=1e-6))
+                    lt_bin_edges = torch.linspace(log_r_lt.min(), log_r_lt.max(), 21)
+                    lt_bin_means, lt_bin_centers = [], []
+                    for b in range(20):
+                        mask = (log_r_lt >= lt_bin_edges[b]) & (log_r_lt < lt_bin_edges[b + 1])
+                        if mask.any():
+                            lt_bin_means.append(all_lengths[mask].float().mean().item())
+                            lt_bin_centers.append(((lt_bin_edges[b] + lt_bin_edges[b + 1]) / 2).item())
+                    if lt_bin_centers:
+                        fig_lt, ax_lt = plt.subplots(figsize=(6, 4))
+                        bw_lt = (lt_bin_centers[1] - lt_bin_centers[0]) * 0.9 if len(lt_bin_centers) > 1 else 0.1
+                        ax_lt.bar(lt_bin_centers, lt_bin_means, width=bw_lt)
+                        ax_lt.set_xlabel("log10(cell_radius)")
+                        ax_lt.set_ylabel("mean starvation lifetime")
+                        ax_lt.set_title("Starvation Lifetime vs Cell Radius")
+                        writer.add_figure(f"diagnostics/starvation_lifetime_vs_radius/{experiment_name}", fig_lt, step)
+                        plt.close(fig_lt)
+
+                    model._starvation_lifetimes.clear()
+
+                starvation = model._starvation_count.float()
+                log_r = torch.log10(cell_radius.clamp(min=1e-6))
+                n_bins = 20
+                bin_edges = torch.linspace(log_r.min(), log_r.max(), n_bins + 1)
+                bin_means, bin_centers = [], []
+                for b in range(n_bins):
+                    mask = (log_r >= bin_edges[b]) & (log_r < bin_edges[b + 1])
+                    if mask.any():
+                        bin_means.append(starvation[mask].mean().item())
+                        bin_centers.append(((bin_edges[b] + bin_edges[b + 1]) / 2).item())
+                if bin_centers:
+                    fig_sv, ax_sv = plt.subplots(figsize=(6, 4))
+                    bw = (bin_centers[1] - bin_centers[0]) * 0.9 if len(bin_centers) > 1 else 0.1
+                    ax_sv.bar(bin_centers, bin_means, width=bw)
+                    ax_sv.set_xlabel("log10(cell_radius)")
+                    ax_sv.set_ylabel("mean starvation count")
+                    ax_sv.set_title("Starvation vs Cell Radius")
+                    writer.add_figure(f"diagnostics/starvation_vs_radius/{experiment_name}", fig_sv, step)
+                    plt.close(fig_sv)
+
+            # Rays-per-cell diagnostics
+            if hit_count is not None:
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+
+                hc = hit_count.squeeze().float()
+                writer.add_histogram("diagnostics/rays_per_cell", hc, step)
+                writer.add_scalar("diagnostics/rays_per_cell_mean", hc.mean().item(), step)
+                writer.add_scalar("diagnostics/rays_per_cell_median", hc.median().item(), step)
+                writer.add_scalar("diagnostics/rays_per_cell_zero_frac",
+                                   (hc == 0).float().mean().item(), step)
+
+                log_r_hc = torch.log10(cell_radius.clamp(min=1e-6))
+                hc_bin_edges = torch.linspace(log_r_hc.min(), log_r_hc.max(), 21)
+                hc_bin_means, hc_bin_centers = [], []
+                for b in range(20):
+                    mask = (log_r_hc >= hc_bin_edges[b]) & (log_r_hc < hc_bin_edges[b + 1])
+                    if mask.any():
+                        hc_bin_means.append(hc[mask].mean().item())
+                        hc_bin_centers.append(((hc_bin_edges[b] + hc_bin_edges[b + 1]) / 2).item())
+                if hc_bin_centers:
+                    fig_hc, ax_hc = plt.subplots(figsize=(6, 4))
+                    bw_hc = (hc_bin_centers[1] - hc_bin_centers[0]) * 0.9 if len(hc_bin_centers) > 1 else 0.1
+                    ax_hc.bar(hc_bin_centers, hc_bin_means, width=bw_hc)
+                    ax_hc.set_xlabel("log10(cell_radius)")
+                    ax_hc.set_ylabel("mean rays per cell")
+                    ax_hc.set_title("Rays Per Cell vs Cell Radius")
+                    writer.add_figure(f"diagnostics/rays_per_cell_vs_radius/{experiment_name}", fig_hc, step)
+                    plt.close(fig_hc)
+
+            # Error comparison figure (projection error vs volume error)
+            if gt_volume is not None:
+                test_with_imgs = eval_views(
+                    test_data_handler,
+                    test_ray_batch_fetcher,
+                    test_proj_batch_fetcher,
+                    return_images=True,
+                )
+                n_views = len(test_with_imgs["pred_imgs"])
+                n_show = min(8, n_views)
+                view_indices = np.linspace(0, n_views - 1, n_show, dtype=int)
+
+                # Voxelize at 128³ for speed
+                raw_vol, _ = voxelize_volumes(field, resolution=128, extent=1.0,
+                                              sigma=sigma, sigma_v=sigma_v)
+                # Downsample GT to match
+                from skimage.transform import resize
+                gt_vol_ds = resize(gt_volume, (128, 128, 128), order=1,
+                                   preserve_range=True).astype(np.float32)
+                error_vol = np.abs(raw_vol - gt_vol_ds)
+
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+                from matplotlib.colors import LinearSegmentedColormap
+                # White-to-blue colormap for volume errors on white background
+                blues_on_white = LinearSegmentedColormap.from_list(
+                    "blues_on_white", ["white", "royalblue", "darkblue"])
+
+                fig, axs = plt.subplots(6, n_show, figsize=(3 * n_show, 18))
+                if n_show == 1:
+                    axs = axs[:, None]
+
+                proj_vmax = max(
+                    max(test_with_imgs["gt_imgs"][vi].max() for vi in view_indices),
+                    max(test_with_imgs["pred_imgs"][vi].max() for vi in view_indices),
+                    1e-6,
+                )
+                err_max = max(
+                    max(abs(test_with_imgs["pred_imgs"][vi] - test_with_imgs["gt_imgs"][vi]).max()
+                        for vi in view_indices),
+                    1e-6,
+                )
+
+                # Pre-compute volume DRRs for shared scaling
+                vol_err_drrs = []
+                for col, vi in enumerate(view_indices):
+                    rays_np = test_with_imgs["rays"][vi]
+                    vol_err_drrs.append(render_volume_drr(error_vol, rays_np,
+                                                          extent=1.0, num_samples=128))
+                vol_err_vmax = max(d.max() for d in vol_err_drrs) + 1e-6
+
+                for col, vi in enumerate(view_indices):
+                    gt_img = test_with_imgs["gt_imgs"][vi]
+                    pred_img = test_with_imgs["pred_imgs"][vi]
+                    proj_err = pred_img - gt_img
+                    rays_np = test_with_imgs["rays"][vi]
+                    vol_err_drr = vol_err_drrs[col]
+
+                    # Row 0: GT projection
+                    axs[0, col].imshow(gt_img.T, origin="lower", cmap="gray",
+                                       vmin=0, vmax=proj_vmax)
+                    axs[0, col].set_title(f"v{vi}", fontsize=8)
+                    axs[0, col].axis("off")
+
+                    # Row 1: Predicted projection
+                    axs[1, col].imshow(pred_img.T, origin="lower", cmap="gray",
+                                       vmin=0, vmax=proj_vmax)
+                    axs[1, col].axis("off")
+
+                    # Row 2: Voxelized volume Beer-Lambert DRR (sanity check)
+                    vol_drr = render_volume_drr(raw_vol, rays_np, extent=1.0,
+                                               num_samples=128)
+                    axs[2, col].imshow(vol_drr.T, origin="lower", cmap="gray",
+                                       vmin=0, vmax=proj_vmax)
+                    axs[2, col].axis("off")
+
+                    # Row 3: Projection error (signed, bwr)
+                    axs[3, col].imshow(proj_err.T, origin="lower", cmap="bwr",
+                                       vmin=-err_max, vmax=err_max)
+                    axs[3, col].axis("off")
+
+                    # Row 4: Volume error DRR (blue on white)
+                    axs[4, col].imshow(vol_err_drr.T, origin="lower",
+                                       cmap=blues_on_white, vmin=0, vmax=vol_err_vmax)
+                    axs[4, col].axis("off")
+
+                    # Row 5: |proj error| - |vol error DRR|
+                    abs_proj_err = np.abs(proj_err)
+                    vol_err_norm = vol_err_drr / (vol_err_vmax + 1e-8) * (err_max + 1e-8)
+                    diff = abs_proj_err - vol_err_norm
+                    diff_max = max(np.abs(diff).max(), 1e-6)
+                    axs[5, col].imshow(diff.T, origin="lower", cmap="bwr",
+                                       vmin=-diff_max, vmax=diff_max)
+                    axs[5, col].axis("off")
+
+                fig.tight_layout(rect=[0.08, 0, 1, 1])  # leave space on left for labels
+
+                # Row labels on left side using fig.text (independent of axis state)
+                row_labels = ["GT Projection", "Predicted Projection",
+                              "Voxelized Volume DRR",
+                              "Projection Error", "Volume Error DRR",
+                              "|Proj Err| \u2212 |Vol Err|"]
+                for row, label in enumerate(row_labels):
+                    bbox = axs[row, 0].get_position()
+                    y_center = (bbox.y0 + bbox.y1) / 2
+                    fig.text(0.01, y_center, label, fontsize=9, rotation=90,
+                             ha="left", va="center")
+                writer.add_figure(f"error_comparison/{experiment_name}", fig, step)
+                plt.close(fig)
+
+        return metrics
 
     def train_loop(viewer):
         print("Training")
@@ -412,72 +775,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
         # Log initial state (step 0, before any optimization)
         if not pipeline_args.debug:
-            init_test = eval_views(
-                test_data_handler,
-                test_ray_batch_fetcher,
-                test_proj_batch_fetcher,
-            )
-            writer.add_scalar("test/rmse", init_test["rmse"], 0)
-            writer.add_scalar("test/psnr", init_test["psnr"], 0)
-            writer.add_scalar("test/ssim", init_test["ssim"], 0)
-            init_train = eval_views(
-                train_data_handler,
-                train_ray_batch_fetcher,
-                train_proj_batch_fetcher,
-            )
-            writer.add_scalar("train/rmse", init_train["rmse"], 0)
-            writer.add_scalar("train/psnr", init_train["psnr"], 0)
-            writer.add_scalar("train/ssim", init_train["ssim"], 0)
-            num_points = model.primal_points.shape[0]
-            writer.add_scalar("train/num_points", num_points, 0)
-            print(f"Step 0: test PSNR={init_test['psnr']:.2f}, "
-                  f"train PSNR={init_train['psnr']:.2f}, "
-                  f"points={num_points}")
-
-            # Slice visualizations at step 0
-            with torch.no_grad():
-                field = field_from_model(model)
-                _, cell_radius = radfoam.farthest_neighbor(
-                    model.primal_points,
-                    model.point_adjacency,
-                    model.point_adjacency_offsets,
-                )
-                sigma = pipeline_args.interp_sigma_scale * cell_radius.median().item()
-                sigma_v = pipeline_args.interp_sigma_v
-                axes = [0, 1, 2]
-                slice_coords = [-0.2, 0.0, 0.2]
-                d_slices, idw_slices, cd_slices = [], [], []
-                gt_slices, r2_slices, ve_slices = [], [], []
-                for a in axes:
-                    for c in slice_coords:
-                        coords_2d = make_slice_coords(a, c, 256, 1.0)
-                        d_slices.append(query_density(field, coords_2d))
-                        idw_slices.append(sample_idw(field, coords_2d,
-                                                     sigma=sigma, sigma_v=sigma_v))
-                        cd_slices.append(
-                            compute_cell_density_slice(field["points"], a, c, 64, 1.0)
-                        )
-                        gt_slices.append(sample_gt_slice(gt_volume, a, c, 256, 1.0))
-                        r2_slices.append(sample_gt_slice(r2_volume, a, c, 256, 1.0))
-                        ve_slices.append(compute_voronoi_edges(field, a, c, 256, 1.0))
-                log_fig_il = partial(writer.add_figure, f"slices_interleaved/{experiment_name}", global_step=0)
-                log_fig_sobel = partial(writer.add_figure, f"slices_sobel/{experiment_name}", global_step=0)
-                metrics = visualize_slices(
-                    d_slices, idw_slices, cd_slices,
-                    gt_slices=gt_slices,
-                    r2_slices=r2_slices if r2_volume is not None else None,
-                    writer_fn_interleaved=log_fig_il,
-                    writer_fn_sobel=log_fig_sobel,
-                    voronoi_edges=ve_slices,
-                )
-                if metrics is not None:
-                    for key, val in metrics.items():
-                        parts = key.split('_')
-                        if len(parts) == 2:
-                            tag = f"slice_{parts[1]}/{parts[0]}"
-                        else:
-                            tag = f"slice_{parts[-1]}/{'_'.join(parts[:-1])}"
-                        writer.add_scalar(tag, val, 0)
+            log_basic(0)
+            log_diag(0)
 
         _loss_cpu = None
         with tqdm.trange(pipeline_args.iterations) as train:
@@ -565,251 +864,13 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 _loss_cpu = loss.detach().to("cpu", non_blocking=True)
 
                 if i % log_interval == log_interval - 1 and not pipeline_args.debug:
-                    writer.add_scalar("train/loss", loss.item(), i)
-                    if optimizer_args.tv_weight > 0 and i >= optimizer_args.tv_start:
-                        writer.add_scalar("train/tv_loss", tv_loss.item(), i)
-                        if optimizer_args.tv_anneal:
-                            writer.add_scalar("train/tv_scale", tv_scale, i)
-                    num_points = model.primal_points.shape[0]
-                    writer.add_scalar("train/num_points", num_points, i)
-
-                    if hasattr(model, '_triangulation_retries'):
-                        writer.add_scalar("diagnostics/triangulation_retries", model._triangulation_retries, i)
-
-                    if (pipeline_args.bf_start >= 0
-                            and pipeline_args.bf_start <= i < pipeline_args.bf_until):
-                        t = (i - pipeline_args.bf_start) / max(
-                            1, pipeline_args.bf_until - pipeline_args.bf_start - 1
-                        )
-                        writer.add_scalar("train/bf_sigma",
-                                          pipeline_args.bf_sigma_init + t * (pipeline_args.bf_sigma_final - pipeline_args.bf_sigma_init), i)
-                        writer.add_scalar("train/bf_sigma_v",
-                                          pipeline_args.bf_sigma_v_final + 0.5 * (pipeline_args.bf_sigma_v_init - pipeline_args.bf_sigma_v_final) * (1 + math.cos(math.pi * t)), i)
-
-                    writer.add_scalar(
-                        "lr/points_lr", model.xyz_scheduler_args(i), i
-                    )
-                    writer.add_scalar(
-                        "lr/density_lr", model.den_scheduler_args(i), i
-                    )
-                    if model.grad_scheduler_args is not None:
-                        writer.add_scalar(
-                            "lr/gradient_lr",
-                            model.grad_scheduler_args(i - model._gradient_start),
-                            i,
-                        )
-                    if hasattr(model, 'peak_scheduler_args'):
-                        writer.add_scalar(
-                            "lr/peak_lr",
-                            model.peak_scheduler_args(i - model._gaussian_start),
-                            i,
-                        )
-                    if getattr(model, '_gaussian_active', False) and hasattr(model, 'density_peak'):
-                        import torch.nn.functional as _F
-                        mu_peak = _F.softplus(model.density_peak, beta=10)
-                        writer.add_scalar("gaussian/mu_peak_mean", mu_peak.mean().item(), i)
-                        writer.add_scalar("gaussian/mu_peak_max", mu_peak.max().item(), i)
-                        offset_mag = (model.delta_raw.detach().tanh()).norm(dim=-1)
-                        writer.add_scalar("gaussian/offset_mag_mean", offset_mag.mean().item(), i)
-
-                    test_metrics = eval_views(
-                        test_data_handler,
-                        test_ray_batch_fetcher,
-                        test_proj_batch_fetcher,
-                    )
-                    writer.add_scalar("test/rmse", test_metrics["rmse"], i)
-                    writer.add_scalar("test/psnr", test_metrics["psnr"], i)
-                    writer.add_scalar("test/ssim", test_metrics["ssim"], i)
-
-                    train_metrics = eval_views(
-                        train_data_handler,
-                        train_ray_batch_fetcher,
-                        train_proj_batch_fetcher,
-                    )
-                    writer.add_scalar("train/rmse", train_metrics["rmse"], i)
-                    writer.add_scalar("train/psnr", train_metrics["psnr"], i)
-                    writer.add_scalar("train/ssim", train_metrics["ssim"], i)
-
-                    if pipeline_args.interpolation_start >= 0 and i >= pipeline_args.densify_until:
-                        ramp_length = max(1, pipeline_args.interpolation_start - pipeline_args.densify_until)
-                        frac = min(1.0, (i - pipeline_args.densify_until) / ramp_length)
-                        writer.add_scalar("train/interp_fraction", frac, i)
+                    tv_loss_val = tv_loss.item() if optimizer_args.tv_weight > 0 and i >= optimizer_args.tv_start else None
+                    tv_scale_val = tv_scale if optimizer_args.tv_anneal and tv_loss_val is not None else None
+                    log_basic(i, loss_val=loss.item(), tv_loss_val=tv_loss_val,
+                              tv_scale_val=tv_scale_val)
 
                 if i % diag_interval == diag_interval - 1 and not pipeline_args.debug:
-                    log_density_histogram(model, writer, i)
-                    log_diagnostics(model, writer, i)
-                    cell_entropy = model.compute_neighbor_entropy(n_bins=pipeline_args.entropy_bins)
-                    writer.add_histogram("diagnostics/cell_entropy", cell_entropy, i)
-                    writer.add_scalar("diagnostics/entropy_mean", cell_entropy.mean().item(), i)
-                    writer.add_scalar("diagnostics/entropy_max", cell_entropy.max().item(), i)
-                    with torch.no_grad():
-                        field = field_from_model(model)
-                        _, cell_radius = radfoam.farthest_neighbor(
-                            model.primal_points,
-                            model.point_adjacency,
-                            model.point_adjacency_offsets,
-                        )
-                        sigma = pipeline_args.interp_sigma_scale * cell_radius.median().item()
-                        sigma_v = pipeline_args.interp_sigma_v
-                        axes = [0, 1, 2]
-                        slice_coords = [-0.2, 0.0, 0.2]
-                        d_slices = []
-                        idw_slices = []
-                        cd_slices = []
-                        gt_slices = []
-                        r2_slices = []
-                        ve_slices = []
-                        for a in axes:
-                            for c in slice_coords:
-                                coords_2d = make_slice_coords(a, c, 256, 1.0)
-                                d_slices.append(query_density(field, coords_2d))
-                                idw_slices.append(sample_idw(field, coords_2d,
-                                                             sigma=sigma, sigma_v=sigma_v))
-                                cd_slices.append(
-                                    compute_cell_density_slice(field["points"], a, c, 64, 1.0)
-                                )
-                                gt_slices.append(sample_gt_slice(gt_volume, a, c, 256, 1.0))
-                                r2_slices.append(sample_gt_slice(r2_volume, a, c, 256, 1.0))
-                                ve_slices.append(compute_voronoi_edges(field, a, c, 256, 1.0))
-                        log_fig_il = partial(writer.add_figure, f"slices_interleaved/{experiment_name}", global_step=i)
-                        log_fig_sobel = partial(writer.add_figure, f"slices_sobel/{experiment_name}", global_step=i)
-                        metrics = visualize_slices(
-                            d_slices, idw_slices, cd_slices,
-                            gt_slices=gt_slices,
-                            r2_slices=r2_slices if r2_volume is not None else None,
-                            writer_fn_interleaved=log_fig_il,
-                            writer_fn_sobel=log_fig_sobel,
-                            voronoi_edges=ve_slices,
-                        )
-                        if metrics is not None:
-                            for key, val in metrics.items():
-                                parts = key.split('_')
-                                if len(parts) == 2:
-                                    tag = f"slice_{parts[1]}/{parts[0]}"
-                                else:
-                                    # e.g. sobel_raw_psnr -> slice_psnr/sobel_raw
-                                    tag = f"slice_{parts[-1]}/{'_'.join(parts[:-1])}"
-                                writer.add_scalar(tag, val, i)
-
-                        # Separate cell heatmap figure
-                        log_fig_hm = partial(writer.add_figure, f"cell_heatmap/{experiment_name}", global_step=i)
-                        visualize_cell_heatmap(cd_slices, writer_fn=log_fig_hm)
-
-                        # IDW diagnostic for a single Z=0 slice
-                        diag_coords = make_slice_coords(axis=2, coord=0.0, resolution=256, extent=1.0)
-                        diag = sample_idw_diagnostic(field, diag_coords,
-                                                     sigma=sigma, sigma_v=sigma_v)
-                        diag_writer = partial(writer.add_figure, f"idw_diagnostics/{experiment_name}", global_step=i)
-                        visualize_idw_diagnostics(diag, writer_fn=diag_writer)
-                        n_holes = (diag["diff"] > 0.05).sum()
-                        writer.add_scalar("diagnostics/idw_hole_pixels", n_holes, i)
-                        writer.add_scalar("diagnostics/idw_mean_cell_weight", diag["cell_weight"].mean(), i)
-                        writer.add_scalar("diagnostics/idw_mean_neighbor_count", diag["neighbor_count"].mean(), i)
-
-                        # Starvation diagnostics
-                        if hasattr(model, '_starvation_count'):
-                            import matplotlib
-                            matplotlib.use("Agg")
-                            import matplotlib.pyplot as plt
-
-                            writer.add_histogram("diagnostics/starvation_count",
-                                                 model._starvation_count, i)
-
-                            # Completed starvation episodes since last log
-                            if hasattr(model, '_starvation_lifetimes') and model._starvation_lifetimes:
-                                all_lengths = torch.cat([t[0] for t in model._starvation_lifetimes])
-                                all_radii = torch.cat([t[1] for t in model._starvation_lifetimes])
-                                lengths_float = all_lengths.float()
-                                max_len = int(all_lengths.max().item())
-                                bins = torch.arange(0, max_len + 2, dtype=torch.float32) - 0.5
-                                writer.add_histogram("diagnostics/starvation_lifetimes", lengths_float, i, bins=bins)
-                                writer.add_scalar("diagnostics/starvation_lifetime_mean", all_lengths.float().mean().item(), i)
-                                writer.add_scalar("diagnostics/starvation_lifetime_median", all_lengths.float().median().item(), i)
-                                writer.add_scalar("diagnostics/starvation_lifetime_max", all_lengths.max().item(), i)
-                                writer.add_scalar("diagnostics/starvation_lifetime_count", all_lengths.shape[0], i)
-                                writer.add_scalar("diagnostics/starvation_lifetime_p95",
-                                                   torch.quantile(lengths_float, 0.95).item(), i)
-                                writer.add_scalar("diagnostics/starvation_lifetime_p99",
-                                                   torch.quantile(lengths_float, 0.99).item(), i)
-                                long_count = (all_lengths > 10).sum().item()
-                                writer.add_scalar("diagnostics/starvation_lifetime_long_count", long_count, i)
-
-                                # Lifetime vs cell radius
-                                log_r_lt = torch.log10(all_radii.clamp(min=1e-6))
-                                lt_bin_edges = torch.linspace(log_r_lt.min(), log_r_lt.max(), 21)
-                                lt_bin_means = []
-                                lt_bin_centers = []
-                                for b in range(20):
-                                    mask = (log_r_lt >= lt_bin_edges[b]) & (log_r_lt < lt_bin_edges[b + 1])
-                                    if mask.any():
-                                        lt_bin_means.append(all_lengths[mask].float().mean().item())
-                                        lt_bin_centers.append(((lt_bin_edges[b] + lt_bin_edges[b + 1]) / 2).item())
-                                if lt_bin_centers:
-                                    fig_lt, ax_lt = plt.subplots(figsize=(6, 4))
-                                    bw_lt = (lt_bin_centers[1] - lt_bin_centers[0]) * 0.9 if len(lt_bin_centers) > 1 else 0.1
-                                    ax_lt.bar(lt_bin_centers, lt_bin_means, width=bw_lt)
-                                    ax_lt.set_xlabel("log10(cell_radius)")
-                                    ax_lt.set_ylabel("mean starvation lifetime")
-                                    ax_lt.set_title("Starvation Lifetime vs Cell Radius")
-                                    writer.add_figure(f"diagnostics/starvation_lifetime_vs_radius/{experiment_name}", fig_lt, i)
-                                    plt.close(fig_lt)
-
-                                model._starvation_lifetimes.clear()
-
-                            # Current starvation vs cell radius
-                            starvation = model._starvation_count.float()
-                            log_r = torch.log10(cell_radius.clamp(min=1e-6))
-                            n_bins = 20
-                            bin_edges = torch.linspace(log_r.min(), log_r.max(), n_bins + 1)
-                            bin_means = []
-                            bin_centers = []
-                            for b in range(n_bins):
-                                mask = (log_r >= bin_edges[b]) & (log_r < bin_edges[b + 1])
-                                if mask.any():
-                                    bin_means.append(starvation[mask].mean().item())
-                                    bin_centers.append(((bin_edges[b] + bin_edges[b + 1]) / 2).item())
-                            if bin_centers:
-                                fig_sv, ax_sv = plt.subplots(figsize=(6, 4))
-                                bw = (bin_centers[1] - bin_centers[0]) * 0.9 if len(bin_centers) > 1 else 0.1
-                                ax_sv.bar(bin_centers, bin_means, width=bw)
-                                ax_sv.set_xlabel("log10(cell_radius)")
-                                ax_sv.set_ylabel("mean starvation count")
-                                ax_sv.set_title("Starvation vs Cell Radius")
-                                writer.add_figure(f"diagnostics/starvation_vs_radius/{experiment_name}", fig_sv, i)
-                                plt.close(fig_sv)
-
-                        # Rays-per-cell diagnostics
-                        if hit_count is not None:
-                            import matplotlib
-                            matplotlib.use("Agg")
-                            import matplotlib.pyplot as plt
-
-                            hc = hit_count.squeeze().float()  # [N]
-                            writer.add_histogram("diagnostics/rays_per_cell", hc, i)
-                            writer.add_scalar("diagnostics/rays_per_cell_mean", hc.mean().item(), i)
-                            writer.add_scalar("diagnostics/rays_per_cell_median", hc.median().item(), i)
-                            writer.add_scalar("diagnostics/rays_per_cell_zero_frac",
-                                               (hc == 0).float().mean().item(), i)
-
-                            # Rays-per-cell vs cell radius (binned bar chart)
-                            log_r_hc = torch.log10(cell_radius.clamp(min=1e-6))
-                            hc_bin_edges = torch.linspace(log_r_hc.min(), log_r_hc.max(), 21)
-                            hc_bin_means = []
-                            hc_bin_centers = []
-                            for b in range(20):
-                                mask = (log_r_hc >= hc_bin_edges[b]) & (log_r_hc < hc_bin_edges[b + 1])
-                                if mask.any():
-                                    hc_bin_means.append(hc[mask].mean().item())
-                                    hc_bin_centers.append(((hc_bin_edges[b] + hc_bin_edges[b + 1]) / 2).item())
-                            if hc_bin_centers:
-                                fig_hc, ax_hc = plt.subplots(figsize=(6, 4))
-                                bw_hc = (hc_bin_centers[1] - hc_bin_centers[0]) * 0.9 if len(hc_bin_centers) > 1 else 0.1
-                                ax_hc.bar(hc_bin_centers, hc_bin_means, width=bw_hc)
-                                ax_hc.set_xlabel("log10(cell_radius)")
-                                ax_hc.set_ylabel("mean rays per cell")
-                                ax_hc.set_title("Rays Per Cell vs Cell Radius")
-                                writer.add_figure(f"diagnostics/rays_per_cell_vs_radius/{experiment_name}", fig_hc, i)
-                                plt.close(fig_hc)
+                    log_diag(i, hit_count=hit_count)
 
                 if iters_since_update >= triangulation_update_period:
                     model.update_triangulation(incremental=True)
@@ -965,18 +1026,13 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
     train_loop(viewer=None)
 
-    test_metrics = eval_views(
-        test_data_handler,
-        test_ray_batch_fetcher,
-        test_proj_batch_fetcher,
-    )
-    train_metrics = eval_views(
-        train_data_handler,
-        train_ray_batch_fetcher,
-        train_proj_batch_fetcher,
-    )
+    iters = pipeline_args.iterations
 
     if not pipeline_args.debug:
+        # Final basic + diag logging
+        test_metrics, train_metrics = log_basic(iters)
+        slice_metrics = log_diag(iters)
+
         with open(f"{out_dir}/metrics.txt", "w") as f:
             f.write(f"Test  RMSE: {test_metrics['rmse']:.6f}\n")
             f.write(f"Test  PSNR: {test_metrics['psnr']:.4f}\n")
@@ -984,6 +1040,11 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
             f.write(f"Train RMSE: {train_metrics['rmse']:.6f}\n")
             f.write(f"Train PSNR: {train_metrics['psnr']:.4f}\n")
             f.write(f"Train SSIM: {train_metrics['ssim']:.6f}\n")
+
+        if slice_metrics is not None:
+            with open(f"{out_dir}/metrics.txt", "a") as f:
+                for key, val in slice_metrics.items():
+                    f.write(f"Slice {key}: {val:.4f}\n")
 
         model_path = f"{out_dir}/model.pt"
 
@@ -997,63 +1058,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
             interp_sigma = pipeline_args.interp_sigma_scale * cell_radius.median().item()
             interp_sigma_v = pipeline_args.interp_sigma_v
 
-        # Direct slice evaluation (no full volume needed)
         field = load_density_field(model_path)
-        axes = [0, 1, 2]
-        coords = [-0.2, 0.0, 0.2]
-        density_slices = []
-        idw_slices = []
-        cell_density_slices = []
-        gt_slices_final = []
-        r2_slices_final = []
-        ve_slices_final = []
-        for a in axes:
-            for c in coords:
-                coords_2d = make_slice_coords(a, c, 256, 1.0)
-                density_slices.append(query_density(field, coords_2d))
-                idw_slices.append(sample_idw(field, coords_2d,
-                                             sigma=interp_sigma, sigma_v=interp_sigma_v))
-                cell_density_slices.append(
-                    compute_cell_density_slice(field["points"], a, c, 64, 1.0)
-                )
-                gt_slices_final.append(sample_gt_slice(gt_volume, a, c, 256, 1.0))
-                r2_slices_final.append(sample_gt_slice(r2_volume, a, c, 256, 1.0))
-                ve_slices_final.append(compute_voronoi_edges(field, a, c, 256, 1.0))
-
-        log_fig_il = partial(writer.add_figure, f"slices_interleaved/{experiment_name}", global_step=pipeline_args.iterations)
-        log_fig_sobel = partial(writer.add_figure, f"slices_sobel/{experiment_name}", global_step=pipeline_args.iterations)
-        slice_metrics = visualize_slices(
-            density_slices, idw_slices, cell_density_slices,
-            gt_slices=gt_slices_final,
-            r2_slices=r2_slices_final if r2_volume is not None else None,
-            writer_fn_interleaved=log_fig_il,
-            writer_fn_sobel=log_fig_sobel,
-            out_path=f"{out_dir}/vis.jpg",
-            voronoi_edges=ve_slices_final,
-        )
-
-        # Separate cell heatmap figure (final)
-        log_fig_hm = partial(writer.add_figure, f"cell_heatmap/{experiment_name}", global_step=pipeline_args.iterations)
-        visualize_cell_heatmap(cell_density_slices, writer_fn=log_fig_hm)
-        if slice_metrics is not None:
-            for key, val in slice_metrics.items():
-                parts = key.split('_')
-                if len(parts) == 2:
-                    tag = f"slice_{parts[1]}/{parts[0]}"
-                else:
-                    tag = f"slice_{parts[-1]}/{'_'.join(parts[:-1])}"
-                writer.add_scalar(tag, val, pipeline_args.iterations)
-            with open(f"{out_dir}/metrics.txt", "a") as f:
-                for key, val in slice_metrics.items():
-                    f.write(f"Slice {key}: {val:.4f}\n")
-
-        # Final IDW diagnostics
-        diag_coords = make_slice_coords(axis=2, coord=0.0, resolution=256, extent=1.0)
-        diag = sample_idw_diagnostic(field, diag_coords,
-                                     sigma=interp_sigma, sigma_v=interp_sigma_v)
-        diag_writer = partial(writer.add_figure, f"idw_diagnostics/{experiment_name}", global_step=pipeline_args.iterations)
-        visualize_idw_diagnostics(diag, writer_fn=diag_writer,
-                                  out_path=f"{out_dir}/idw_diagnostics.jpg")
 
         # 3D volume metrics (matching R2-Gaussian evaluation)
         if gt_volume is not None:
