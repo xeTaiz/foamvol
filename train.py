@@ -677,16 +677,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 if n_show == 1:
                     axs = axs[:, None]
 
-                proj_vmax = max(
-                    max(test_with_imgs["gt_imgs"][vi].max() for vi in view_indices),
-                    max(test_with_imgs["pred_imgs"][vi].max() for vi in view_indices),
-                    1e-6,
-                )
-                err_max = max(
-                    max(abs(test_with_imgs["pred_imgs"][vi] - test_with_imgs["gt_imgs"][vi]).max()
-                        for vi in view_indices),
-                    1e-6,
-                )
+                proj_vmax = max(max(test_with_imgs["gt_imgs"][vi].max() for vi in view_indices), max(test_with_imgs["pred_imgs"][vi].max() for vi in view_indices)) + 1e-9
+                err_max = max(abs(test_with_imgs["pred_imgs"][vi] - test_with_imgs["gt_imgs"][vi]).max() for vi in view_indices) + 1e-9
 
                 # Pre-compute volume DRRs for shared scaling
                 vol_err_drrs = []
