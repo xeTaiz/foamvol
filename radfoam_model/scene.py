@@ -580,6 +580,7 @@ class CTScene(torch.nn.Module):
         self.xyz_scheduler_args = get_cosine_lr_func(
             lr_init=args.points_lr_init,
             lr_final=args.points_lr_final,
+            warmup_steps=warmup,
             max_steps=args.freeze_points,
         )
         self.den_scheduler_args = get_cosine_lr_func(
