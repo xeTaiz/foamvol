@@ -603,6 +603,13 @@ def load_gt_volume(data_path, dataset_type):
         vol = np.zeros((G, G, G), dtype=np.float32)
         vol[x ** 2 + y ** 2 + z ** 2 <= 1.0] = 1.0
         return vol
+    elif dataset_type == "ct_cube":
+        from data_loader.ct_cube import make_single_cube_scene, make_2x2x2_scene, make_gt_volume
+        if "2x2x2" in data_path:
+            boxes, densities = make_2x2x2_scene()
+        else:
+            boxes, densities = make_single_cube_scene()
+        return make_gt_volume(boxes, densities, resolution=256, extent=1.0)
     return None
 
 

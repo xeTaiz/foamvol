@@ -336,6 +336,21 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         device=device,
     )
 
+    # Override initial points if a file is provided
+    init_points_file = getattr(model_args, "init_points_file", "")
+    if init_points_file:
+        pts = torch.load(init_points_file, map_location=device, weights_only=True)
+        print(f"Overriding initial points from {init_points_file}: {pts.shape}")
+        model.triangulation = radfoam.Triangulation(pts.float().contiguous().to(device))
+        perm = model.triangulation.permutation().to(torch.long)
+        model.primal_points = nn.Parameter(pts[perm].to(device))
+        model.update_triangulation(rebuild=False)
+        init_val = model.init_density
+        density = torch.full(
+            (pts.shape[0], 1), init_val, device=device, dtype=torch.float32
+        )
+        model.density = nn.Parameter(density[perm])
+
     # Setting up optimizer
     model.declare_optimizer(
         args=optimizer_args,
@@ -382,8 +397,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     def train_loop(viewer):
         print("Training")
 
-        log_interval = max(1, pipeline_args.iterations // 20)    # 5%
-        diag_interval = max(1, pipeline_args.iterations // 10)    # 10%
+        log_interval = max(1, pipeline_args.iterations * pipeline_args.log_percent // 100)
+        diag_interval = max(1, pipeline_args.iterations * pipeline_args.diag_percent // 100)
 
         torch.cuda.synchronize()
 
@@ -394,6 +409,75 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         iters_since_update = 1
         iters_since_densification = 0
         next_densification_after = 1
+
+        # Log initial state (step 0, before any optimization)
+        if not pipeline_args.debug:
+            init_test = eval_views(
+                test_data_handler,
+                test_ray_batch_fetcher,
+                test_proj_batch_fetcher,
+            )
+            writer.add_scalar("test/rmse", init_test["rmse"], 0)
+            writer.add_scalar("test/psnr", init_test["psnr"], 0)
+            writer.add_scalar("test/ssim", init_test["ssim"], 0)
+            init_train = eval_views(
+                train_data_handler,
+                train_ray_batch_fetcher,
+                train_proj_batch_fetcher,
+            )
+            writer.add_scalar("train/rmse", init_train["rmse"], 0)
+            writer.add_scalar("train/psnr", init_train["psnr"], 0)
+            writer.add_scalar("train/ssim", init_train["ssim"], 0)
+            num_points = model.primal_points.shape[0]
+            writer.add_scalar("train/num_points", num_points, 0)
+            print(f"Step 0: test PSNR={init_test['psnr']:.2f}, "
+                  f"train PSNR={init_train['psnr']:.2f}, "
+                  f"points={num_points}")
+
+            # Slice visualizations at step 0
+            with torch.no_grad():
+                field = field_from_model(model)
+                _, cell_radius = radfoam.farthest_neighbor(
+                    model.primal_points,
+                    model.point_adjacency,
+                    model.point_adjacency_offsets,
+                )
+                sigma = pipeline_args.interp_sigma_scale * cell_radius.median().item()
+                sigma_v = pipeline_args.interp_sigma_v
+                axes = [0, 1, 2]
+                slice_coords = [-0.2, 0.0, 0.2]
+                d_slices, idw_slices, cd_slices = [], [], []
+                gt_slices, r2_slices, ve_slices = [], [], []
+                for a in axes:
+                    for c in slice_coords:
+                        coords_2d = make_slice_coords(a, c, 256, 1.0)
+                        d_slices.append(query_density(field, coords_2d))
+                        idw_slices.append(sample_idw(field, coords_2d,
+                                                     sigma=sigma, sigma_v=sigma_v))
+                        cd_slices.append(
+                            compute_cell_density_slice(field["points"], a, c, 64, 1.0)
+                        )
+                        gt_slices.append(sample_gt_slice(gt_volume, a, c, 256, 1.0))
+                        r2_slices.append(sample_gt_slice(r2_volume, a, c, 256, 1.0))
+                        ve_slices.append(compute_voronoi_edges(field, a, c, 256, 1.0))
+                log_fig_il = partial(writer.add_figure, f"slices_interleaved/{experiment_name}", global_step=0)
+                log_fig_sobel = partial(writer.add_figure, f"slices_sobel/{experiment_name}", global_step=0)
+                metrics = visualize_slices(
+                    d_slices, idw_slices, cd_slices,
+                    gt_slices=gt_slices,
+                    r2_slices=r2_slices if r2_volume is not None else None,
+                    writer_fn_interleaved=log_fig_il,
+                    writer_fn_sobel=log_fig_sobel,
+                    voronoi_edges=ve_slices,
+                )
+                if metrics is not None:
+                    for key, val in metrics.items():
+                        parts = key.split('_')
+                        if len(parts) == 2:
+                            tag = f"slice_{parts[1]}/{parts[0]}"
+                        else:
+                            tag = f"slice_{parts[-1]}/{'_'.join(parts[:-1])}"
+                        writer.add_scalar(tag, val, 0)
 
         _loss_cpu = None
         with tqdm.trange(pipeline_args.iterations) as train:

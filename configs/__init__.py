@@ -73,6 +73,8 @@ class PipelineParams(ParamGroup):
         self.bf_sigma_v_final = 0.1   # final value sigma (low = bilateral)
         self.targeted_fraction = 0.0  # 0 = disabled, 0.2 = 20% targeted rays
         self.targeted_start = -1      # iteration to start (-1 = same as densify_from)
+        self.log_percent = 5          # log metrics every N% of iterations
+        self.diag_percent = 10        # log diagnostics/slices every N% of iterations
         super().__init__(parser, "Setting Pipeline parameters")
 
 
@@ -86,6 +88,7 @@ class ModelParams(ParamGroup):
         self.init_type = "random"
         self.init_density = 0.0
         self.device = "cuda"
+        self.init_points_file = ""
         super().__init__(parser, "Setting Model parameters")
 
 

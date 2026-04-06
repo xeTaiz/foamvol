@@ -6,6 +6,7 @@ import torch
 
 import radfoam
 
+from .ct_cube import CTCubeDataset
 from .ct_synthetic import CTSyntheticDataset
 from .r2_gaussian import R2GaussianDataset
 from .targeted_sampler import build_targeted_batch
@@ -51,6 +52,7 @@ def jitter_rays_cone(rays, pixel_ang_size):
 
 
 dataset_dict = {
+    "ct_cube": CTCubeDataset,
     "ct_synthetic": CTSyntheticDataset,
     "r2_gaussian": R2GaussianDataset,
 }
