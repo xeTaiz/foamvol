@@ -268,6 +268,64 @@ class CTScene(torch.nn.Module):
 
         return edge_loss.mean()
 
+    def voxel_tv_regularization(self, resolution=32, epsilon=1e-3, extent=1.0):
+        """TV regularization on a low-res voxelized grid.
+
+        Bins all cell centers into a (resolution³) grid, computes area-weighted
+        mean density per voxel, then applies Charbonnier TV on the 3D grid.
+        Gradients flow through softplus(density) to all cells within each voxel.
+
+        Unlike neighbor-based TV, this operates at a fixed spatial scale
+        independent of cell count.
+        """
+        res = resolution
+        voxel_size = 2.0 * extent / res
+        points = self.primal_points.detach()  # (N, 3) — no grad through positions
+        mu = self.get_primal_density().squeeze()  # (N,) — grad through density
+
+        # Cell area weight (proxy for Voronoi cell volume)
+        with torch.no_grad():
+            _, cell_radius = radfoam.farthest_neighbor(
+                self.primal_points,
+                self.point_adjacency,
+                self.point_adjacency_offsets,
+            )
+            w = cell_radius.squeeze() ** 2  # (N,)
+
+        # Compute voxel index per cell
+        grid_coords = ((points + extent) / voxel_size).long().clamp(0, res - 1)
+        voxel_idx = grid_coords[:, 0] * res * res + grid_coords[:, 1] * res + grid_coords[:, 2]
+
+        # Exclude cells outside the volume
+        inside = (points.abs() <= extent).all(dim=1)
+        voxel_idx = voxel_idx[inside]
+        mu_inside = mu[inside]
+        w_inside = w[inside]
+
+        # Weighted scatter: voxel value = sum(w * mu) / sum(w)
+        num_voxels = res ** 3
+        sum_wmu = torch.zeros(num_voxels, device=mu.device, dtype=mu.dtype)
+        sum_w = torch.zeros(num_voxels, device=mu.device, dtype=mu.dtype)
+        sum_wmu.scatter_add_(0, voxel_idx, w_inside * mu_inside)
+        sum_w.scatter_add_(0, voxel_idx, w_inside)
+
+        # Avoid division by zero for empty voxels
+        occupied = sum_w > 0
+        voxel_grid = torch.zeros(num_voxels, device=mu.device, dtype=mu.dtype)
+        voxel_grid[occupied] = sum_wmu[occupied] / sum_w[occupied]
+        voxel_grid = voxel_grid.reshape(res, res, res)
+
+        # 3D finite-difference Charbonnier TV
+        dx = voxel_grid[1:, :, :] - voxel_grid[:-1, :, :]
+        dy = voxel_grid[:, 1:, :] - voxel_grid[:, :-1, :]
+        dz = voxel_grid[:, :, 1:] - voxel_grid[:, :, :-1]
+
+        tv = (torch.sqrt(dx ** 2 + epsilon ** 2) - epsilon).mean() + \
+             (torch.sqrt(dy ** 2 + epsilon ** 2) - epsilon).mean() + \
+             (torch.sqrt(dz ** 2 + epsilon ** 2) - epsilon).mean()
+
+        return tv
+
     @torch.no_grad()
     def compute_redundancy_error(self, cell_radius, sigma_scale, sigma_v):
         """Per-cell leave-one-out IDW error: |density_i - interp_from_neighbors|."""

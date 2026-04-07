@@ -116,6 +116,9 @@ class OptimizationParams(ParamGroup):
         self.gradient_freeze_points = 500
         self.tv_anneal = False
         self.tv_on_raw = False
+        self.voxel_tv_weight = 0.0
+        self.voxel_tv_resolution = 32
+        self.voxel_tv_start = 0
         self.density_grad_clip = 1.0
         self.gaussian_start = -1
         self.freeze_base_at_gaussian = False
