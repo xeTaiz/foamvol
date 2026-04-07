@@ -967,9 +967,11 @@ class CTScene(torch.nn.Module):
                     _append_gaussian_for_inds(extra_inds, n_budget)
                     return 0  # added to gradient fallback, not this strategy
                 n_sample = min(n_budget, num_viable)
-                edge_inds = torch.multinomial(
-                    weight, n_sample, replacement=False,
-                )
+                # Filter to above-median edges to stay within multinomial limits
+                candidate_idx = (weight > weight.median()).nonzero(as_tuple=True)[0]
+                sub_weights = weight[candidate_idx]
+                sub_inds = torch.multinomial(sub_weights, min(n_sample, candidate_idx.shape[0]), replacement=False)
+                edge_inds = candidate_idx[sub_inds]
                 # Radius-ratio placement: bias towards the larger cell
                 p_a = points[src[edge_inds]]
                 p_b = points[tgt[edge_inds]]
