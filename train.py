@@ -306,6 +306,13 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     )
     train_data_handler.reload(split="train")
 
+    # Initialize high-error sampling if enabled
+    if pipeline_args.high_error_fraction > 0:
+        train_data_handler.init_high_error_sampling(
+            high_error_fraction=pipeline_args.high_error_fraction,
+            high_error_power=pipeline_args.high_error_power,
+        )
+
     test_data_handler = DataHandler(
         dataset_args, rays_per_batch=0, device=device
     )
@@ -413,6 +420,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
             test_data_handler,
             test_ray_batch_fetcher,
             test_proj_batch_fetcher,
+            return_images=True,
         )
         writer.add_scalar("test/rmse", test_metrics["rmse"], step)
         writer.add_scalar("test/psnr", test_metrics["psnr"], step)
@@ -476,7 +484,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
               f"points={num_points}")
         return test_metrics, train_metrics
 
-    def log_diag(step, hit_count=None):
+    def log_diag(step, hit_count=None, test_images=None):
         """Log slice visualizations, diagnostics, error comparison. Called at step 0, diag_interval, final."""
         log_density_histogram(model, writer, step)
         log_diagnostics(model, writer, step)
@@ -645,14 +653,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     plt.close(fig_hc)
 
             # Error comparison figure (projection error vs volume error)
-            if gt_volume is not None:
-                test_with_imgs = eval_views(
-                    test_data_handler,
-                    test_ray_batch_fetcher,
-                    test_proj_batch_fetcher,
-                    return_images=True,
-                )
-                n_views = len(test_with_imgs["pred_imgs"])
+            if gt_volume is not None and test_images is not None:
+                n_views = len(test_images["pred_imgs"])
                 n_show = min(8, n_views)
                 view_indices = np.linspace(0, n_views - 1, n_show, dtype=int)
 
@@ -677,60 +679,81 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 if n_show == 1:
                     axs = axs[:, None]
 
-                proj_vmax = max(max(test_with_imgs["gt_imgs"][vi].max() for vi in view_indices), max(test_with_imgs["pred_imgs"][vi].max() for vi in view_indices)) + 1e-9
-                err_max = max(abs(test_with_imgs["pred_imgs"][vi] - test_with_imgs["gt_imgs"][vi]).max() for vi in view_indices) + 1e-9
+                gt_vmax = max(
+                    max(test_images["gt_imgs"][vi].max() for vi in view_indices),
+                    1e-6,
+                )
+                pred_vmax = max(
+                    max(test_images["pred_imgs"][vi].max() for vi in view_indices),
+                    1e-6,
+                )
 
-                # Pre-compute volume DRRs for shared scaling
+                # Pre-compute volume DRRs
                 vol_err_drrs = []
+                vol_drrs = []
                 for col, vi in enumerate(view_indices):
-                    rays_np = test_with_imgs["rays"][vi]
+                    rays_np = test_images["rays"][vi]
                     vol_err_drrs.append(render_volume_drr(error_vol, rays_np,
                                                           extent=1.0, num_samples=128))
-                vol_err_vmax = max(d.max() for d in vol_err_drrs) + 1e-6
+                    vol_drrs.append(render_volume_drr(raw_vol, rays_np,
+                                                      extent=1.0, num_samples=128))
 
                 for col, vi in enumerate(view_indices):
-                    gt_img = test_with_imgs["gt_imgs"][vi]
-                    pred_img = test_with_imgs["pred_imgs"][vi]
+                    gt_img = test_images["gt_imgs"][vi]
+                    pred_img = test_images["pred_imgs"][vi]
                     proj_err = pred_img - gt_img
-                    rays_np = test_with_imgs["rays"][vi]
                     vol_err_drr = vol_err_drrs[col]
+                    vol_drr = vol_drrs[col]
+
+                    # Per-view error scaling (99th percentile for visibility)
+                    abs_proj_err = np.abs(proj_err)
+                    proj_err_scale = max(np.percentile(abs_proj_err, 99), 1e-6)
+                    vol_err_scale = max(np.percentile(vol_err_drr, 99), 1e-6)
 
                     # Row 0: GT projection
                     axs[0, col].imshow(gt_img.T, origin="lower", cmap="gray",
-                                       vmin=0, vmax=proj_vmax)
+                                       vmin=0, vmax=gt_vmax)
                     axs[0, col].set_title(f"v{vi}", fontsize=8)
                     axs[0, col].axis("off")
 
                     # Row 1: Predicted projection
                     axs[1, col].imshow(pred_img.T, origin="lower", cmap="gray",
-                                       vmin=0, vmax=proj_vmax)
+                                       vmin=0, vmax=pred_vmax)
                     axs[1, col].axis("off")
 
                     # Row 2: Voxelized volume Beer-Lambert DRR (sanity check)
-                    vol_drr = render_volume_drr(raw_vol, rays_np, extent=1.0,
-                                               num_samples=128)
                     axs[2, col].imshow(vol_drr.T, origin="lower", cmap="gray",
-                                       vmin=0, vmax=proj_vmax)
+                                       vmin=0, vmax=pred_vmax)
                     axs[2, col].axis("off")
 
-                    # Row 3: Projection error (signed, bwr)
+                    # Row 3: Projection error (signed, bwr, per-view scale)
                     axs[3, col].imshow(proj_err.T, origin="lower", cmap="bwr",
-                                       vmin=-err_max, vmax=err_max)
+                                       vmin=-proj_err_scale, vmax=proj_err_scale)
                     axs[3, col].axis("off")
+                    axs[3, col].text(0.02, 0.98, f"max={proj_err_scale:.3f}",
+                                     transform=axs[3, col].transAxes, fontsize=6,
+                                     va="top", color="black", backgroundcolor="white")
 
-                    # Row 4: Volume error DRR (blue on white)
+                    # Row 4: Volume error DRR (blue on white, per-view scale)
                     axs[4, col].imshow(vol_err_drr.T, origin="lower",
-                                       cmap=blues_on_white, vmin=0, vmax=vol_err_vmax)
+                                       cmap=blues_on_white, vmin=0, vmax=vol_err_scale)
                     axs[4, col].axis("off")
+                    axs[4, col].text(0.02, 0.98, f"max={vol_err_scale:.3f}",
+                                     transform=axs[4, col].transAxes, fontsize=6,
+                                     va="top", color="black", backgroundcolor="white")
 
-                    # Row 5: |proj error| - |vol error DRR|
-                    abs_proj_err = np.abs(proj_err)
-                    vol_err_norm = vol_err_drr / (vol_err_vmax + 1e-8) * (err_max + 1e-8)
-                    diff = abs_proj_err - vol_err_norm
+                    # Row 5: Normalized |proj error| - |vol error DRR|
+                    # Both normalized to [0, 1] independently before differencing
+                    proj_norm = abs_proj_err / (proj_err_scale + 1e-8)
+                    vol_norm = vol_err_drr / (vol_err_scale + 1e-8)
+                    diff = proj_norm - vol_norm
                     diff_max = max(np.abs(diff).max(), 1e-6)
                     axs[5, col].imshow(diff.T, origin="lower", cmap="bwr",
                                        vmin=-diff_max, vmax=diff_max)
                     axs[5, col].axis("off")
+                    axs[5, col].text(0.02, 0.98, f"max={diff_max:.2f}",
+                                     transform=axs[5, col].transAxes, fontsize=6,
+                                     va="top", color="black", backgroundcolor="white")
 
                 fig.tight_layout(rect=[0.08, 0, 1, 1])  # leave space on left for labels
 
@@ -759,6 +782,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
         data_iterator = train_data_handler.get_iter()
         ray_batch, proj_batch = next(data_iterator)
+        _he_active = False
 
         triangulation_update_period = 1
         iters_since_update = 1
@@ -767,8 +791,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
         # Log initial state (step 0, before any optimization)
         if not pipeline_args.debug:
-            log_basic(0)
-            log_diag(0)
+            test_m, _ = log_basic(0)
+            log_diag(0, test_images=test_m)
 
         _loss_cpu = None
         with tqdm.trange(pipeline_args.iterations) as train:
@@ -777,6 +801,17 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 proj_output, contribution, hit_count, _, _ = model(ray_batch, return_contribution=return_diag)
 
                 loss = loss_fn(proj_output, proj_batch)
+
+                # Update high-error map with errors from the high-error portion of batch
+                if (pipeline_args.high_error_fraction > 0
+                        and hasattr(train_data_handler, '_he_pool')
+                        and train_data_handler._he_pool is not None):
+                    he_size = train_data_handler._he_batch_size
+                    # High-error rays are appended at the end of the batch
+                    he_errors = (proj_output[-he_size:] - proj_batch[-he_size:]).abs().squeeze(-1).detach()
+                    he_start = train_data_handler._he_pool_cursor - he_size
+                    he_indices = train_data_handler._he_pool[he_start:he_start + he_size]
+                    train_data_handler.update_high_error_map(he_indices, he_errors)
 
                 if optimizer_args.tv_weight > 0 and i >= optimizer_args.tv_start:
                     if optimizer_args.tv_border:
@@ -834,6 +869,20 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                 model.update_learning_rate(i)
 
+                # Activate high-error sampling (one-time switch)
+                if (not _he_active
+                        and pipeline_args.high_error_fraction > 0
+                        and hasattr(train_data_handler, '_he_error_map')):
+                    he_start = pipeline_args.high_error_start
+                    if he_start < 0:
+                        he_start = pipeline_args.densify_from
+                    if i >= he_start:
+                        data_iterator = train_data_handler.get_high_error_iter()
+                        ray_batch, proj_batch = next(data_iterator)
+                        _he_active = True
+                        print(f"High-error sampling activated at iter {i} "
+                              f"(fraction={pipeline_args.high_error_fraction})")
+
                 # Interpolation interleaving schedule
                 if pipeline_args.interpolation_start >= 0:
                     if i >= pipeline_args.interpolation_start:
@@ -858,11 +907,14 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 if i % log_interval == log_interval - 1 and not pipeline_args.debug:
                     tv_loss_val = tv_loss.item() if optimizer_args.tv_weight > 0 and i >= optimizer_args.tv_start else None
                     tv_scale_val = tv_scale if optimizer_args.tv_anneal and tv_loss_val is not None else None
-                    log_basic(i, loss_val=loss.item(), tv_loss_val=tv_loss_val,
-                              tv_scale_val=tv_scale_val)
+                    _last_test_m, _ = log_basic(i, loss_val=loss.item(), tv_loss_val=tv_loss_val,
+                                                tv_scale_val=tv_scale_val)
 
                 if i % diag_interval == diag_interval - 1 and not pipeline_args.debug:
-                    log_diag(i, hit_count=hit_count)
+                    # If log_basic didn't just run at this step, run it now for images
+                    if i % log_interval != log_interval - 1:
+                        _last_test_m, _ = log_basic(i)
+                    log_diag(i, hit_count=hit_count, test_images=_last_test_m)
 
                 if iters_since_update >= triangulation_update_period:
                     model.update_triangulation(incremental=True)
@@ -1023,7 +1075,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     if not pipeline_args.debug:
         # Final basic + diag logging
         test_metrics, train_metrics = log_basic(iters)
-        slice_metrics = log_diag(iters)
+        slice_metrics = log_diag(iters, test_images=test_metrics)
 
         with open(f"{out_dir}/metrics.txt", "w") as f:
             f.write(f"Test  RMSE: {test_metrics['rmse']:.6f}\n")

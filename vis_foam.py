@@ -582,8 +582,7 @@ def compute_cell_density_slice(points, axis, coord, resolution, extent,
 def render_volume_drr(volume, rays, extent=1.0, num_samples=256):
     """Render a DRR (digitally reconstructed radiograph) by ray-summing through a volume.
 
-    For each ray, computes the line integral through the volume using regular
-    sampling with trilinear interpolation.
+    Uses PyTorch grid_sample on GPU for fast trilinear interpolation.
 
     Args:
         volume: (R, R, R) numpy array — the 3D volume to project
@@ -594,73 +593,45 @@ def render_volume_drr(volume, rays, extent=1.0, num_samples=256):
     Returns:
         projection: (H, W) numpy array — accumulated ray-sum values
     """
-    H, W = rays.shape[:2]
-    origins = rays[..., :3]     # (H, W, 3)
-    dirs = rays[..., 3:6]       # (H, W, 3)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    R = volume.shape[0]
-    # Compute ray entry/exit with [-extent, extent]^3 bbox via slab method
+    vol_t = torch.from_numpy(volume).float().to(device)  # (R, R, R)
+    rays_t = torch.from_numpy(rays).float().to(device)   # (H, W, 6)
+    H, W = rays_t.shape[:2]
+    origins = rays_t[..., :3]   # (H, W, 3)
+    dirs = rays_t[..., 3:6]     # (H, W, 3)
+
+    # Ray-AABB intersection via slab method
     inv_dir = 1.0 / (dirs + 1e-12)
     t_min_all = (-extent - origins) * inv_dir
     t_max_all = (extent - origins) * inv_dir
-    t_near = np.minimum(t_min_all, t_max_all)
-    t_far = np.maximum(t_min_all, t_max_all)
-    t_entry = np.max(t_near, axis=-1)   # (H, W)
-    t_exit = np.min(t_far, axis=-1)     # (H, W)
-
-    # Clamp to valid range
-    t_entry = np.maximum(t_entry, 0.0)
+    t_near = torch.minimum(t_min_all, t_max_all)
+    t_far = torch.maximum(t_min_all, t_max_all)
+    t_entry = t_near.max(dim=-1).values.clamp(min=0.0)  # (H, W)
+    t_exit = t_far.min(dim=-1).values                    # (H, W)
     valid = t_exit > t_entry
 
-    # Sample points along rays
-    t_vals = np.linspace(0.0, 1.0, num_samples, dtype=np.float32)  # (S,)
-    # (H, W, S)
-    t_samples = t_entry[..., None] + t_vals[None, None, :] * (t_exit - t_entry)[..., None]
-
-    # 3D sample positions: (H, W, S, 3)
+    # Sample points along rays: (H, W, S, 3)
+    t_vals = torch.linspace(0.0, 1.0, num_samples, device=device)
+    t_samples = t_entry[..., None] + t_vals * (t_exit - t_entry)[..., None]  # (H, W, S)
     sample_pts = origins[..., None, :] + dirs[..., None, :] * t_samples[..., None]
 
-    # Convert to grid coordinates [0, R-1]
-    grid_coords = (sample_pts + extent) / (2.0 * extent) * (R - 1)
+    # grid_sample for 5D: volume is (1, 1, D, H, W) where D=axis0, H=axis1, W=axis2
+    # grid coords are (x_W, y_H, z_D) — reversed relative to our (x, y, z) world coords
+    grid = sample_pts / extent  # [-1, 1] range, shape (H, W, S, 3) as (x, y, z)
+    grid = grid.flip(-1)  # reverse to (z, y, x) for grid_sample convention
+    grid_5d = grid.reshape(1, -1, 1, 1, 3)   # (1, H*W*S, 1, 1, 3)
+    vol_5d = vol_t.unsqueeze(0).unsqueeze(0)  # (1, 1, R, R, R)
+    sampled = F.grid_sample(vol_5d, grid_5d, mode='bilinear',
+                            padding_mode='zeros', align_corners=True)
+    vals = sampled.reshape(H, W, num_samples)  # (H, W, S)
 
-    # Trilinear interpolation
-    gc = grid_coords.reshape(-1, 3)
-    x0 = np.floor(gc).astype(np.int32)
-    x1 = x0 + 1
-    frac = gc - x0.astype(np.float32)
-
-    # Clamp to valid grid range
-    x0 = np.clip(x0, 0, R - 1)
-    x1 = np.clip(x1, 0, R - 1)
-
-    # 8 corner values
-    fx, fy, fz = frac[:, 0], frac[:, 1], frac[:, 2]
-    v000 = volume[x0[:, 0], x0[:, 1], x0[:, 2]]
-    v001 = volume[x0[:, 0], x0[:, 1], x1[:, 2]]
-    v010 = volume[x0[:, 0], x1[:, 1], x0[:, 2]]
-    v011 = volume[x0[:, 0], x1[:, 1], x1[:, 2]]
-    v100 = volume[x1[:, 0], x0[:, 1], x0[:, 2]]
-    v101 = volume[x1[:, 0], x0[:, 1], x1[:, 2]]
-    v110 = volume[x1[:, 0], x1[:, 1], x0[:, 2]]
-    v111 = volume[x1[:, 0], x1[:, 1], x1[:, 2]]
-
-    vals = (v000 * (1 - fx) * (1 - fy) * (1 - fz) +
-            v001 * (1 - fx) * (1 - fy) * fz +
-            v010 * (1 - fx) * fy * (1 - fz) +
-            v011 * (1 - fx) * fy * fz +
-            v100 * fx * (1 - fy) * (1 - fz) +
-            v101 * fx * (1 - fy) * fz +
-            v110 * fx * fy * (1 - fz) +
-            v111 * fx * fy * fz)
-
-    vals = vals.reshape(H, W, num_samples)
-
-    # Ray-sum: integrate along ray (multiply by step length for proper line integral)
+    # Ray-sum with step length
     step_length = (t_exit - t_entry) / num_samples  # (H, W)
-    projection = np.sum(vals, axis=-1) * step_length
+    projection = vals.sum(dim=-1) * step_length
     projection[~valid] = 0.0
 
-    return projection.astype(np.float32)
+    return projection.cpu().numpy().astype(np.float32)
 
 
 def load_gt_volume(data_path, dataset_type):

@@ -73,6 +73,9 @@ class PipelineParams(ParamGroup):
         self.bf_sigma_v_final = 0.1   # final value sigma (low = bilateral)
         self.targeted_fraction = 0.0  # 0 = disabled, 0.2 = 20% targeted rays
         self.targeted_start = -1      # iteration to start (-1 = same as densify_from)
+        self.high_error_fraction = 0.0  # 0 = disabled, 0.2 = 20% high-error rays
+        self.high_error_power = 1.0     # power scaling on error weights (1=linear, 2=quadratic)
+        self.high_error_start = -1      # iteration to start (-1 = same as densify_from)
         self.log_percent = 5          # log metrics every N% of iterations
         self.diag_percent = 10        # log diagnostics/slices every N% of iterations
         super().__init__(parser, "Setting Pipeline parameters")

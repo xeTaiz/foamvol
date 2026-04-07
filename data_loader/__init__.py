@@ -122,6 +122,129 @@ class DataHandler:
         self._target_radii = cell_radii
         self._targeted_batch_size = int(self.batch_size * targeted_fraction)
 
+    # --- High-error sampling ---
+
+    def init_high_error_sampling(self, high_error_fraction, high_error_power=1.0):
+        """Initialize high-error ray sampling state."""
+        num_angles, det_h, det_w, _ = self.rays.shape
+        err_h, err_w = det_h // 2, det_w // 2  # 256² error map
+        self._he_fraction = high_error_fraction
+        self._he_power = high_error_power
+        self._he_batch_size = int(self.batch_size * high_error_fraction)
+        self._he_err_h = err_h
+        self._he_err_w = err_w
+        self._he_det_h = det_h
+        self._he_det_w = det_w
+        self._he_num_angles = num_angles
+
+        # Error map at half resolution, bfloat16
+        self._he_error_map = torch.rand(
+            num_angles, err_h, err_w, dtype=torch.bfloat16, device=self.device,
+        ) * 1e-2
+
+        # Pre-compute downsampled GT projections at 256² (average pool 512→256)
+        gt_full = self.projections  # (N, H, W, 1)
+        gt_4d = gt_full.squeeze(-1).unsqueeze(1).float()  # (N, 1, H, W)
+        self._he_gt_ds = torch.nn.functional.avg_pool2d(
+            gt_4d, kernel_size=2,
+        ).squeeze(1).to(self.device)  # (N, err_h, err_w) on GPU
+
+        # Pre-sampled pool (filled on first refresh)
+        self._he_pool = None
+        self._he_pool_cursor = 0
+
+    def update_high_error_map(self, flat_indices, errors):
+        """Update error map entries for sampled pixels.
+
+        Args:
+            flat_indices: (B,) int64 — flat indices into (N*H*W) at full 512² res
+            errors: (B,) float — |pred - gt| per sampled pixel
+        """
+        if not hasattr(self, '_he_error_map'):
+            return
+        # Map 512² flat indices to 256² error map indices
+        H, W = self._he_det_h, self._he_det_w
+        eh, ew = self._he_err_h, self._he_err_w
+        view_idx = flat_indices // (H * W)
+        pixel_in_view = flat_indices % (H * W)
+        iy = (pixel_in_view // W) // 2  # 512→256
+        ix = (pixel_in_view % W) // 2
+        # Clamp to valid range
+        iy = iy.clamp(0, eh - 1)
+        ix = ix.clamp(0, ew - 1)
+        self._he_error_map[view_idx, iy, ix] = errors.to(torch.bfloat16)
+
+    def _refresh_high_error_pool(self):
+        """Re-sample the high-error ray pool from current error map."""
+        N = self._he_num_angles
+        eh, ew = self._he_err_h, self._he_err_w
+        H, W = self._he_det_h, self._he_det_w
+
+        # Work at 256² — apply power scaling and filter to above median
+        weights = self._he_error_map.float().reshape(-1)  # (N*eh*ew,)
+        weights = weights.clamp(min=1e-8) ** self._he_power
+        median = weights.median()
+        candidate_idx = (weights >= median).nonzero(as_tuple=True)[0]
+        sub_weights = weights[candidate_idx]
+        sub_weights = sub_weights / sub_weights.sum()
+
+        # Pool lasts one epoch — sample at 256², expand to all 4 pixels of 2×2
+        pool_size_lo = int(self._he_fraction * N * H * W) // 4
+        pool_size_lo = min(pool_size_lo, sub_weights.shape[0])
+        pool_sub = torch.multinomial(sub_weights, pool_size_lo, replacement=True)
+        lowres_flat = candidate_idx[pool_sub]  # indices into (N*eh*ew)
+
+        # Map each 256² sample to all 4 corresponding 512² pixels
+        view_idx = lowres_flat // (eh * ew)
+        pixel_in_view = lowres_flat % (eh * ew)
+        iy_lo = pixel_in_view // ew
+        ix_lo = pixel_in_view % ew
+        # Expand to 2×2 block: (pool_size_lo,) → (pool_size_lo, 4)
+        iy_hi = (iy_lo * 2).unsqueeze(1) + torch.tensor([0, 0, 1, 1], device=iy_lo.device)
+        ix_hi = (ix_lo * 2).unsqueeze(1) + torch.tensor([0, 1, 0, 1], device=ix_lo.device)
+        iy_hi = iy_hi.clamp(0, H - 1)
+        ix_hi = ix_hi.clamp(0, W - 1)
+        view_exp = view_idx.unsqueeze(1).expand(-1, 4)
+        flat_indices = view_exp * (H * W) + iy_hi * W + ix_hi  # (pool_size_lo, 4)
+        self._he_pool = flat_indices.reshape(-1)  # (pool_size_lo * 4,)
+        self._he_pool_cursor = 0
+
+    def _get_high_error_batch(self):
+        """Get a batch of high-error rays from the pre-sampled pool."""
+        if self._he_pool is None or self._he_pool_cursor + self._he_batch_size > self._he_pool.shape[0]:
+            self._refresh_high_error_pool()
+        start = self._he_pool_cursor
+        end = start + self._he_batch_size
+        flat_idx = self._he_pool[start:end]
+        self._he_pool_cursor = end
+        rays = self._train_rays_gpu[flat_idx]
+        proj = self._train_projections_gpu[flat_idx]
+        # Apply jitter
+        if self.beam_type == "parallel" and self.pixel_size is not None:
+            rays = jitter_rays_parallel(rays, self.pixel_size)
+        elif self.beam_type == "cone" and self.pixel_ang_size is not None:
+            rays = jitter_rays_cone(rays, self.pixel_ang_size)
+        return rays, proj
+
+    def get_high_error_iter(self):
+        """Iterator yielding (uniform_rays + high_error_rays, uniform_proj + high_error_proj)."""
+        ray_batch_fetcher = radfoam.BatchFetcher(
+            self.train_rays, self.batch_size, shuffle=True
+        )
+        proj_batch_fetcher = radfoam.BatchFetcher(
+            self.train_projections, self.batch_size, shuffle=True
+        )
+
+        while True:
+            u_rays = ray_batch_fetcher.next()
+            u_proj = proj_batch_fetcher.next()
+            if self.beam_type == "parallel" and self.pixel_size is not None:
+                u_rays = jitter_rays_parallel(u_rays, self.pixel_size)
+            elif self.beam_type == "cone" and self.pixel_ang_size is not None:
+                u_rays = jitter_rays_cone(u_rays, self.pixel_ang_size)
+            he_rays, he_proj = self._get_high_error_batch()
+            yield torch.cat([u_rays, he_rays], 0), torch.cat([u_proj, he_proj], 0)
+
     def get_iter(self):
         ray_batch_fetcher = radfoam.BatchFetcher(
             self.train_rays, self.batch_size, shuffle=True
