@@ -268,63 +268,62 @@ class CTScene(torch.nn.Module):
 
         return edge_loss.mean()
 
-    def voxel_tv_regularization(self, resolution=32, epsilon=1e-3, extent=1.0):
-        """TV regularization on a low-res voxelized grid.
+    def voxel_variance_regularization(self, resolution=32, sigma_v=0.2, extent=1.0):
+        """Bilateral variance loss on a randomly-offset voxel grid.
 
-        Bins all cell centers into a (resolution³) grid, computes area-weighted
-        mean density per voxel, then applies Charbonnier TV on the 3D grid.
-        Gradients flow through softplus(density) to all cells within each voxel.
+        Bins cells into a voxel grid, computes weighted mean density per voxel,
+        then penalizes each cell's deviation from its voxel mean — weighted
+        bilaterally so cells near density boundaries are not smoothed.
 
-        Unlike neighbor-based TV, this operates at a fixed spatial scale
-        independent of cell count.
+        Random grid offset each call prevents persistent binning artifacts.
+
+        Args:
+            resolution: grid resolution per axis
+            sigma_v: bilateral value sigma — cells with density difference
+                     > sigma_v from the voxel mean get reduced weight
+            extent: half-extent of the volume (grid spans [-extent, extent]^3)
         """
         res = resolution
         voxel_size = 2.0 * extent / res
         points = self.primal_points.detach()  # (N, 3) — no grad through positions
         mu = self.get_primal_density().squeeze()  # (N,) — grad through density
 
-        # Cell area weight (proxy for Voronoi cell volume)
-        with torch.no_grad():
-            _, cell_radius = radfoam.farthest_neighbor(
-                self.primal_points,
-                self.point_adjacency,
-                self.point_adjacency_offsets,
-            )
-            w = cell_radius.squeeze() ** 2  # (N,)
+        # Random grid offset for stochastic binning
+        offset = (torch.rand(3, device=points.device) - 0.5) * voxel_size
 
         # Compute voxel index per cell
-        grid_coords = ((points + extent) / voxel_size).long().clamp(0, res - 1)
+        shifted = points + offset
+        grid_coords = ((shifted + extent) / voxel_size).long().clamp(0, res - 1)
         voxel_idx = grid_coords[:, 0] * res * res + grid_coords[:, 1] * res + grid_coords[:, 2]
 
         # Exclude cells outside the volume
         inside = (points.abs() <= extent).all(dim=1)
         voxel_idx = voxel_idx[inside]
         mu_inside = mu[inside]
-        w_inside = w[inside]
 
-        # Weighted scatter: voxel value = sum(w * mu) / sum(w)
+        # Compute weighted mean per voxel (uniform weights for the mean)
         num_voxels = res ** 3
-        sum_wmu = torch.zeros(num_voxels, device=mu.device, dtype=mu.dtype)
-        sum_w = torch.zeros(num_voxels, device=mu.device, dtype=mu.dtype)
-        sum_wmu.scatter_add_(0, voxel_idx, w_inside * mu_inside)
-        sum_w.scatter_add_(0, voxel_idx, w_inside)
+        sum_mu = torch.zeros(num_voxels, device=mu.device, dtype=mu.dtype)
+        count = torch.zeros(num_voxels, device=mu.device, dtype=mu.dtype)
+        sum_mu.scatter_add_(0, voxel_idx, mu_inside)
+        count.scatter_add_(0, voxel_idx, torch.ones_like(mu_inside))
 
-        # Avoid division by zero for empty voxels
-        occupied = sum_w > 0
-        voxel_grid = torch.zeros(num_voxels, device=mu.device, dtype=mu.dtype)
-        voxel_grid[occupied] = sum_wmu[occupied] / sum_w[occupied]
-        voxel_grid = voxel_grid.reshape(res, res, res)
+        # Per-voxel mean (only occupied voxels)
+        occupied = count > 1  # need at least 2 cells for variance
+        voxel_mean = torch.zeros(num_voxels, device=mu.device, dtype=mu.dtype)
+        voxel_mean[occupied] = sum_mu[occupied] / count[occupied]
 
-        # 3D finite-difference Charbonnier TV
-        dx = voxel_grid[1:, :, :] - voxel_grid[:-1, :, :]
-        dy = voxel_grid[:, 1:, :] - voxel_grid[:, :-1, :]
-        dz = voxel_grid[:, :, 1:] - voxel_grid[:, :, :-1]
+        # Per-cell deviation from voxel mean
+        cell_mean = voxel_mean[voxel_idx]  # (N_inside,)
+        diff = mu_inside - cell_mean
 
-        tv = (torch.sqrt(dx ** 2 + epsilon ** 2) - epsilon).mean() + \
-             (torch.sqrt(dy ** 2 + epsilon ** 2) - epsilon).mean() + \
-             (torch.sqrt(dz ** 2 + epsilon ** 2) - epsilon).mean()
+        # Bilateral weight: suppress smoothing across density boundaries
+        bilateral_w = torch.exp(-diff.detach() ** 2 / (sigma_v ** 2))
 
-        return tv
+        # Weighted variance loss
+        loss = (bilateral_w * diff ** 2).mean()
+
+        return loss
 
     @torch.no_grad()
     def compute_redundancy_error(self, cell_radius, sigma_scale, sigma_v):
