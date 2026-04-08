@@ -833,12 +833,12 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                             tv_scale = max(0.0, 1.0 - (i - optimizer_args.tv_start) / anneal_range)
                     loss = loss + optimizer_args.tv_weight * tv_scale * tv_loss
 
-                if optimizer_args.voxel_tv_weight > 0 and i >= optimizer_args.voxel_tv_start:
-                    voxel_tv_loss = model.voxel_tv_regularization(
-                        resolution=optimizer_args.voxel_tv_resolution,
-                        epsilon=optimizer_args.tv_epsilon,
+                if optimizer_args.voxel_var_weight > 0 and i >= optimizer_args.voxel_var_start:
+                    voxel_var_loss = model.voxel_variance_regularization(
+                        resolution=optimizer_args.voxel_var_resolution,
+                        sigma_v=optimizer_args.voxel_var_sigma_v,
                     )
-                    loss = loss + optimizer_args.voxel_tv_weight * voxel_tv_loss
+                    loss = loss + optimizer_args.voxel_var_weight * voxel_var_loss
 
                 model.optimizer.zero_grad(set_to_none=True)
 
@@ -914,8 +914,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 if i % log_interval == log_interval - 1 and not pipeline_args.debug:
                     tv_loss_val = tv_loss.item() if optimizer_args.tv_weight > 0 and i >= optimizer_args.tv_start else None
                     tv_scale_val = tv_scale if optimizer_args.tv_anneal and tv_loss_val is not None else None
-                    if optimizer_args.voxel_tv_weight > 0 and i >= optimizer_args.voxel_tv_start:
-                        writer.add_scalar("train/voxel_tv_loss", voxel_tv_loss.item(), i)
+                    if optimizer_args.voxel_var_weight > 0 and i >= optimizer_args.voxel_var_start:
+                        writer.add_scalar("train/voxel_var_loss", voxel_var_loss.item(), i)
                     _last_test_m, _ = log_basic(i, loss_val=loss.item(), tv_loss_val=tv_loss_val,
                                                 tv_scale_val=tv_scale_val)
 

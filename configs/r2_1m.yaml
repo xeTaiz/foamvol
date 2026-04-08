@@ -29,9 +29,10 @@ tv_area_weighted: False
 tv_border: False
 tv_anneal: False
 tv_on_raw: True
-voxel_tv_weight: 0.0
-voxel_tv_resolution: 32
-voxel_tv_start: 0
+voxel_var_weight: 0.0
+voxel_var_resolution: 32
+voxel_var_sigma_v: 0.2
+voxel_var_start: 0
 
 # Densification (full: gradient + IDW + entropy)
 densify_from: 1000
