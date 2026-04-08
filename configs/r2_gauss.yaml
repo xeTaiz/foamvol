@@ -29,6 +29,9 @@ tv_area_weighted: False
 tv_border: False
 tv_anneal: False
 tv_on_raw: True
+voxel_tv_weight: 0.0
+voxel_tv_resolution: 32
+voxel_tv_start: 0
 
 # Densification
 densify_from: 1000
@@ -43,6 +46,11 @@ redundancy_threshold: 0.01
 redundancy_cap: 0.05
 targeted_fraction: 0.0
 targeted_start: -1
+
+# High-error sampling OFF
+high_error_fraction: 0.0
+high_error_power: 1.0
+high_error_start: -1
 
 # Interpolation
 interpolation_start: -1
