@@ -9,26 +9,13 @@ Usage from train.py or standalone:
                           visualize_slices)
 """
 
-from collections import namedtuple
-
 import numpy as np
 import torch
 import torch.nn.functional as F
 import radfoam
 
 from voxelize import sample_interpolated
-
-
-IDWResult = namedtuple("IDWResult", [
-    "nn_idx",      # (B,) containing cell indices
-    "pad_idx",     # (B, K+1) padded neighbor indices (slot 0 = self)
-    "valid",       # (B, K+1) validity mask
-    "weights",     # (B, K+1) normalized bilateral weights
-    "vals",        # (B, K+1) activated density values
-    "dist_sq",     # (B, K+1) squared distances to neighbors
-    "counts",      # (B,) neighbor counts per cell
-    "idw_result",  # (B,) weighted average
-])
+from radfoam_model.scene import IDWResult, idw_query
 
 
 def field_from_model(model):
@@ -126,101 +113,14 @@ def query_density(field, coordinates):
 
 def _idw_query(query, field, activated, sigma, sigma_v, global_max_k=None,
                per_cell_sigma=False, per_neighbor_sigma=False):
-    """Core bilateral IDW for a batch of query points.
-
-    Matches the CUDA kernel: exp(-d²/σ²) spatial × exp(-Δμ²/σ_v²) bilateral.
-    Applies a 1e-6 weight floor on valid neighbors to prevent black spots
-    when all spatial+bilateral weights collapse to near-zero.
-
-    Args:
-        query: (B, 3) tensor of query positions
-        field: density field dict
-        activated: (N,) precomputed softplus-activated densities
-        sigma: spatial Gaussian scale (or sigma_scale when per_cell_sigma=True)
-        sigma_v: bilateral value-similarity scale (None=disabled)
-        global_max_k: max neighbor count (computed if None)
-        per_cell_sigma: if True, sigma is treated as a scale factor multiplied
-            by each cell's radius instead of a global value
-        per_neighbor_sigma: only used when per_cell_sigma=True.
-            False (Mode A): all slots use containing cell's radius.
-            True (Mode B): each slot uses its own cell's radius.
-
-    Returns:
-        IDWResult namedtuple
-    """
-    device = field["device"]
-    points = field["points"]
-    adj = field["adjacency"]
-    adj_off = field["adjacency_offsets"]
-    B = query.shape[0]
-
-    if global_max_k is None:
-        global_max_k = int((adj_off[1:] - adj_off[:-1]).max().item())
-
-    # 1. NN lookup
-    nn_idx = radfoam.nn(points, field["aabb_tree"], query).long()
-
-    # 2. Build padded neighbor tensor (slot 0 = self, 1..K = neighbors)
-    counts = adj_off[nn_idx + 1] - adj_off[nn_idx]
-    offsets = adj_off[nn_idx]
-
-    pad_idx = torch.zeros(B, global_max_k + 1, dtype=torch.long, device=device)
-    valid = torch.zeros(B, global_max_k + 1, dtype=torch.bool, device=device)
-
-    pad_idx[:, 0] = nn_idx
-    valid[:, 0] = True
-
-    k_range = torch.arange(global_max_k, device=device)
-    has_k = counts.unsqueeze(1) > k_range.unsqueeze(0)
-    flat_offsets = offsets.unsqueeze(1) + k_range.unsqueeze(0)
-    flat_offsets = flat_offsets.clamp(max=adj.shape[0] - 1)
-    pad_idx[:, 1:] = adj[flat_offsets]
-    valid[:, 1:] = has_k
-
-    # 3. Gaussian spatial weights: exp(-d²/σ²)
-    centers = points[pad_idx]
-    diff = query.unsqueeze(1) - centers
-    dist_sq = diff.pow(2).sum(dim=-1)
-
-    if per_cell_sigma:
-        cell_radius = field["cell_radius"]
-        if per_neighbor_sigma:
-            # Mode B: each slot uses its own cell's radius
-            sigma_sq = (sigma * cell_radius[pad_idx]).pow(2)  # (B, K+1)
-        else:
-            # Mode A: all slots use the containing cell's radius
-            sigma_sq = (sigma * cell_radius[nn_idx]).pow(2)   # (B,)
-            sigma_sq = sigma_sq.unsqueeze(1)                  # (B, 1) broadcast
-    else:
-        sigma_sq = sigma * sigma
-
-    w = torch.exp(-dist_sq / sigma_sq)
-
-    # 4. Bilateral: w *= exp(-Δμ²/σ_v²)
-    vals = activated[pad_idx]
-    if sigma_v is not None:
-        ref_val = activated[nn_idx]
-        val_diff = vals - ref_val.unsqueeze(1)
-        w = w * torch.exp(-val_diff * val_diff / (sigma_v * sigma_v))
-
-    # 5. Mask invalid, apply weight floor, normalize, weighted sum
-    w[~valid] = 0.0
-    w = w + valid.float() * 1e-6  # weight floor on valid neighbors only
-    weights = w / w.sum(dim=1, keepdim=True)
-
-    masked_vals = vals.clone()
-    masked_vals[~valid] = 0.0
-    idw_result = (weights * masked_vals).sum(dim=1)
-
-    return IDWResult(
-        nn_idx=nn_idx,
-        pad_idx=pad_idx,
-        valid=valid,
-        weights=weights,
-        vals=vals,
-        dist_sq=dist_sq,
-        counts=counts,
-        idw_result=idw_result,
+    """Core bilateral IDW for a batch of query points. Thin wrapper around scene.idw_query."""
+    return idw_query(
+        query, field["points"], field["adjacency"], field["adjacency_offsets"],
+        field["aabb_tree"], activated, sigma, sigma_v,
+        global_max_k=global_max_k,
+        per_cell_sigma=per_cell_sigma,
+        per_neighbor_sigma=per_neighbor_sigma,
+        cell_radius=field.get("cell_radius"),
     )
 
 
