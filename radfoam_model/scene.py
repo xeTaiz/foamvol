@@ -1,4 +1,6 @@
 import os
+from collections import namedtuple
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -9,6 +11,102 @@ import tqdm
 import radfoam
 from radfoam_model.render import TraceRays
 from radfoam_model.utils import *
+
+
+IDWResult = namedtuple("IDWResult", [
+    "nn_idx",      # (B,) containing cell indices
+    "pad_idx",     # (B, K+1) padded neighbor indices (slot 0 = self)
+    "valid",       # (B, K+1) validity mask
+    "weights",     # (B, K+1) normalized bilateral weights
+    "vals",        # (B, K+1) activated density values
+    "dist_sq",     # (B, K+1) squared distances to neighbors
+    "counts",      # (B,) neighbor counts per cell
+    "idw_result",  # (B,) weighted average
+])
+
+
+def idw_query(query, points, adjacency, adjacency_offsets, aabb_tree,
+              activated, sigma, sigma_v, global_max_k=None,
+              per_cell_sigma=False, per_neighbor_sigma=False,
+              cell_radius=None):
+    """Bilateral IDW interpolation for a batch of query points.
+
+    Matches the CUDA kernel: exp(-d²/σ²) spatial × exp(-Δμ²/σ_v²) bilateral.
+
+    Args:
+        query: (B, 3) tensor of query positions
+        points: (N, 3) cell centers
+        adjacency: (E,) CSR column indices
+        adjacency_offsets: (N+1,) CSR row pointers
+        aabb_tree: AABB tree for NN queries
+        activated: (N,) precomputed softplus-activated densities
+        sigma: spatial Gaussian scale (or scale factor when per_cell_sigma=True)
+        sigma_v: bilateral value-similarity scale (None=disabled)
+        global_max_k: max neighbor count (computed if None)
+        per_cell_sigma: if True, sigma is a scale factor × cell_radius
+        per_neighbor_sigma: each neighbor slot uses its own cell's radius
+        cell_radius: (N,) required when per_cell_sigma=True
+
+    Returns:
+        IDWResult namedtuple
+    """
+    device = query.device
+    adj = adjacency.long()
+    adj_off = adjacency_offsets.long()
+    B = query.shape[0]
+
+    if global_max_k is None:
+        global_max_k = int((adj_off[1:] - adj_off[:-1]).max().item())
+
+    nn_idx = radfoam.nn(points, aabb_tree, query).long()
+
+    counts = adj_off[nn_idx + 1] - adj_off[nn_idx]
+    offsets = adj_off[nn_idx]
+
+    pad_idx = torch.zeros(B, global_max_k + 1, dtype=torch.long, device=device)
+    valid = torch.zeros(B, global_max_k + 1, dtype=torch.bool, device=device)
+    pad_idx[:, 0] = nn_idx
+    valid[:, 0] = True
+
+    k_range = torch.arange(global_max_k, device=device)
+    has_k = counts.unsqueeze(1) > k_range.unsqueeze(0)
+    flat_offsets = offsets.unsqueeze(1) + k_range.unsqueeze(0)
+    flat_offsets = flat_offsets.clamp(max=adj.shape[0] - 1)
+    pad_idx[:, 1:] = adj[flat_offsets]
+    valid[:, 1:] = has_k
+
+    centers = points[pad_idx]
+    diff = query.unsqueeze(1) - centers
+    dist_sq = diff.pow(2).sum(dim=-1)
+
+    if per_cell_sigma and cell_radius is not None:
+        if per_neighbor_sigma:
+            sigma_sq = (sigma * cell_radius[pad_idx]).pow(2)
+        else:
+            sigma_sq = (sigma * cell_radius[nn_idx]).pow(2).unsqueeze(1)
+    else:
+        sigma_sq = sigma * sigma
+
+    w = torch.exp(-dist_sq / sigma_sq)
+
+    vals = activated[pad_idx]
+    if sigma_v is not None:
+        ref_val = activated[nn_idx]
+        val_diff = vals - ref_val.unsqueeze(1)
+        w = w * torch.exp(-val_diff * val_diff / (sigma_v * sigma_v))
+
+    w[~valid] = 0.0
+    w = w + valid.float() * 1e-6
+    weights = w / w.sum(dim=1, keepdim=True)
+
+    masked_vals = vals.clone()
+    masked_vals[~valid] = 0.0
+    idw_result = (weights * masked_vals).sum(dim=1)
+
+    return IDWResult(
+        nn_idx=nn_idx, pad_idx=pad_idx, valid=valid, weights=weights,
+        vals=vals, dist_sq=dist_sq, counts=counts, idw_result=idw_result,
+    )
 
 
 def projection_contrast(proj, normalize=True):
@@ -1094,7 +1192,21 @@ class CTScene(torch.nn.Module):
 
             sampled_inds = torch.cat(sampled_inds_list, dim=0)
             sampled_points = torch.cat(sampled_points_list, dim=0)
-            sampled_density = torch.cat(sampled_density_list, dim=0)
+
+            # Initialize new cell densities via IDW interpolation at their positions.
+            # This gives each new cell the smooth field value rather than a parent's raw density.
+            result = idw_query(
+                sampled_points, points,
+                self.point_adjacency, self.point_adjacency_offsets,
+                self.aabb_tree, activated,
+                sigma=sigma_scale, sigma_v=sigma_v,
+                per_cell_sigma=True, per_neighbor_sigma=True,
+                cell_radius=cell_radius,
+            )
+            idw_activated = result.idw_result
+            beta = 10.0
+            raw = torch.log((idw_activated * beta).exp().clamp(min=1.0 + 1e-6) - 1.0) / beta
+            sampled_density = raw.unsqueeze(-1)
             if has_density_grad:
                 sampled_dg = torch.cat(sampled_density_grad_list, dim=0)
 
