@@ -196,6 +196,36 @@ class CTScene(torch.nn.Module):
         )
         self.density = nn.Parameter(density[perm])
 
+    @torch.no_grad()
+    def initialize_from_volume(self, vol_path):
+        """Initialize cell densities by sampling a pre-computed volume (e.g. FDK).
+
+        The volume must be a (R, R, R) float32 numpy array covering [-1, 1]^3,
+        stored in (X, Y, Z) axis order (same convention as vis_foam DRR rendering).
+
+        Negative values (FDK ring artifacts) are clamped to zero before inversion.
+        """
+        import numpy as np
+        vol_np = np.load(vol_path).astype(np.float32)
+        vol_t = torch.from_numpy(vol_np).to(self.device)      # (R, R, R)
+        vol_5d = vol_t.unsqueeze(0).unsqueeze(0)               # (1, 1, R, R, R)
+
+        pts = self.primal_points.detach()                      # (N, 3) as (x, y, z)
+        # grid_sample: grid[..., 0]→W, grid[..., 1]→H, grid[..., 2]→D
+        # volume is (D=X, H=Y, W=Z) so we need to pass (z, y, x) — flip world (x,y,z)
+        grid = pts.flip(-1).reshape(1, 1, 1, -1, 3)           # (1, 1, 1, N, 3)
+        sampled = F.grid_sample(
+            vol_5d, grid, mode="bilinear", padding_mode="border", align_corners=True
+        )                                                       # (1, 1, 1, 1, N)
+        fdk_mu = sampled.reshape(-1).clamp(1e-6, 1.0)            # (N,) — clamp negatives (0 → -inf via softplus_inv)
+
+        raw = self.softplus_inv(fdk_mu / self.activation_scale)
+        self.density.data.copy_(raw.unsqueeze(1))
+
+        print(f"[FDK init] loaded {vol_path}")
+        print(f"  cells: {pts.shape[0]}  density [{fdk_mu.min():.4f}, {fdk_mu.max():.4f}]"
+              f"  mean: {fdk_mu.mean():.4f}")
+
     def permute_points(self, permutation):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:

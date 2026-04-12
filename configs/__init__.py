@@ -92,6 +92,7 @@ class ModelParams(ParamGroup):
         self.init_density = 0.0
         self.device = "cuda"
         self.init_points_file = ""
+        self.init_volume_path = ""  # path to .npy volume for density init (e.g. FDK)
         super().__init__(parser, "Setting Model parameters")
 
 
