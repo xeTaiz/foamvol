@@ -358,6 +358,11 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         )
         model.density = nn.Parameter(density[perm])
 
+    # Initialize densities from a pre-computed volume (e.g. FDK reconstruction)
+    init_volume_path = getattr(model_args, "init_volume_path", "")
+    if init_volume_path:
+        model.initialize_from_volume(init_volume_path)
+
     # Setting up optimizer
     model.declare_optimizer(
         args=optimizer_args,
