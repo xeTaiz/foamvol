@@ -7,6 +7,7 @@ activation_scale: 1.0
 init_scale: 1.05
 init_type: random
 init_density: 2.0
+init_volume_path: ""  # path to .npy volume for density init (e.g. FDK); empty = disabled
 device: cuda
 debug: False
 viewer: False
@@ -30,8 +31,8 @@ tv_border: False
 tv_anneal: False
 tv_on_raw: True
 voxel_var_weight: 1e-3
-voxel_var_resolution: 32
-voxel_var_sigma_v: 0.5
+voxel_var_resolution: 64
+voxel_var_sigma_v: 0.2
 voxel_var_start: 0
 
 # Densification (full: gradient + IDW + entropy)
