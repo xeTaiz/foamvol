@@ -114,8 +114,14 @@ def collect_summary(datasets, run_name):
         print("[WARN] No completed datasets to summarize")
         return
 
-    # Determine columns
-    metric_keys = [k for k in rows[0] if k != "name"]
+    # Determine columns: union of all keys across all rows (preserves order, first-seen)
+    seen_keys: set = set()
+    metric_keys = []
+    for row in rows:
+        for k in row:
+            if k != "name" and k not in seen_keys:
+                metric_keys.append(k)
+                seen_keys.add(k)
     fieldnames = ["name"] + metric_keys
 
     # Compute MEAN and STD
@@ -134,7 +140,7 @@ def collect_summary(datasets, run_name):
     output_csv = os.path.join("output", run_name, "summary.csv")
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
     with open(output_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
         writer.writeheader()
         writer.writerows(rows_out)
 
