@@ -838,12 +838,26 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                             tv_scale = max(0.0, 1.0 - (i - optimizer_args.tv_start) / anneal_range)
                     loss = loss + optimizer_args.tv_weight * tv_scale * tv_loss
 
+                # Variance sigma schedule: linear from init → final over densification period
+                _densify_range = max(1, pipeline_args.densify_until - pipeline_args.densify_from)
+                _var_sched_t = max(0.0, min(1.0,
+                    (i - pipeline_args.densify_from) / _densify_range))
+                var_sigma_v = (optimizer_args.var_sigma_v_init * (1.0 - _var_sched_t)
+                               + optimizer_args.var_sigma_v_final * _var_sched_t)
+
                 if optimizer_args.voxel_var_weight > 0 and i >= optimizer_args.voxel_var_start:
                     voxel_var_loss = model.voxel_variance_regularization(
                         resolution=optimizer_args.voxel_var_resolution,
-                        sigma_v=optimizer_args.voxel_var_sigma_v,
+                        sigma_v=var_sigma_v,
                     )
                     loss = loss + optimizer_args.voxel_var_weight * voxel_var_loss
+
+                if optimizer_args.neighbor_var_weight > 0 and i >= optimizer_args.neighbor_var_start:
+                    neighbor_var_loss = model.neighbor_variance_regularization(
+                        sigma_v=var_sigma_v,
+                        hops=optimizer_args.neighbor_var_hops,
+                    )
+                    loss = loss + optimizer_args.neighbor_var_weight * neighbor_var_loss
 
                 model.optimizer.zero_grad(set_to_none=True)
 
@@ -921,6 +935,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     tv_scale_val = tv_scale if optimizer_args.tv_anneal and tv_loss_val is not None else None
                     if optimizer_args.voxel_var_weight > 0 and i >= optimizer_args.voxel_var_start:
                         writer.add_scalar("train/voxel_var_loss", voxel_var_loss.item(), i)
+                    if optimizer_args.neighbor_var_weight > 0 and i >= optimizer_args.neighbor_var_start:
+                        writer.add_scalar("train/neighbor_var_loss", neighbor_var_loss.item(), i)
                     _last_test_m, _ = log_basic(i, loss_val=loss.item(), tv_loss_val=tv_loss_val,
                                                 tv_scale_val=tv_scale_val)
 
@@ -963,6 +979,15 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         contrast_alpha=pipeline_args.contrast_alpha,
                     )
 
+                    # Adaptive redundancy cap schedule
+                    if pipeline_args.redundancy_cap_init > 0 or pipeline_args.redundancy_cap_final > 0:
+                        _redundancy_cap = (
+                            pipeline_args.redundancy_cap_init * (1.0 - _var_sched_t)
+                            + pipeline_args.redundancy_cap_final * _var_sched_t
+                        )
+                    else:
+                        _redundancy_cap = pipeline_args.redundancy_cap
+
                     densify_stats = model.prune_and_densify(
                         point_error,
                         point_contribution,
@@ -972,9 +997,11 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         entropy_fraction=pipeline_args.entropy_fraction,
                         entropy_bins=pipeline_args.entropy_bins,
                         redundancy_threshold=pipeline_args.redundancy_threshold,
-                        redundancy_cap=pipeline_args.redundancy_cap,
+                        redundancy_cap=_redundancy_cap,
                         sigma_scale=pipeline_args.interp_sigma_scale,
                         sigma_v=pipeline_args.interp_sigma_v,
+                        variance_pruning=pipeline_args.prune_variance_criterion,
+                        prune_hops=pipeline_args.prune_hops,
                     )
 
                     if not pipeline_args.debug and densify_stats is not None:

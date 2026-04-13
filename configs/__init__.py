@@ -62,7 +62,11 @@ class PipelineParams(ParamGroup):
         self.per_neighbor_sigma = False
         self.redundancy_threshold = 0.01   # relative to max activated density
         self.interp_ramp = False
-        self.redundancy_cap = 0.05         # max fraction of cells removed per step
+        self.redundancy_cap = 0.05         # max fraction of cells removed per step (constant)
+        self.redundancy_cap_init = 0.0     # adaptive cap schedule: start value (0 = use redundancy_cap)
+        self.redundancy_cap_final = 0.0    # adaptive cap schedule: end value
+        self.prune_variance_criterion = False  # use neighborhood variance instead of IDW error
+        self.prune_hops = 1                # k-hop neighborhood for variance pruning
         self.rays_per_batch = 2_000_000
         self.bf_start = -1            # iteration to start (-1 = disabled)
         self.bf_until = 6000          # iteration to stop
@@ -119,8 +123,13 @@ class OptimizationParams(ParamGroup):
         self.tv_on_raw = False
         self.voxel_var_weight = 0.0
         self.voxel_var_resolution = 32
-        self.voxel_var_sigma_v = 0.2
+        self.voxel_var_sigma_v = 0.2       # kept for backward compat; overridden by var_sigma_v_*
         self.voxel_var_start = 0
+        self.neighbor_var_weight = 0.0     # graph neighbor variance regularization weight
+        self.neighbor_var_hops = 1         # k-hop neighborhood depth
+        self.neighbor_var_start = 0
+        self.var_sigma_v_init = 0.2        # bilateral sigma at start (large = plain smoothing)
+        self.var_sigma_v_final = 0.2       # bilateral sigma at end (small = edge-preserving)
         self.density_grad_clip = 1.0
         self.gaussian_start = -1
         self.freeze_base_at_gaussian = False

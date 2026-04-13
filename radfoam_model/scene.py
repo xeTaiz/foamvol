@@ -453,6 +453,67 @@ class CTScene(torch.nn.Module):
 
         return loss
 
+    def _neighbor_smooth_target(self, mu_detached, hops):
+        """K-hop smoothed density target via iterated message passing (O(k×E)).
+
+        Each hop replaces each cell's value with the mean of its neighbors' current
+        values. k=1 = immediate neighbor mean; k=2 = neighbors' neighbor mean, etc.
+        Operates on detached mu to avoid grad accumulation across hops.
+        """
+        offsets = self.point_adjacency_offsets.long()
+        adj = self.point_adjacency.long()
+        N = mu_detached.shape[0]
+        counts = (offsets[1:] - offsets[:-1]).float().clamp(min=1)
+        src = torch.repeat_interleave(
+            torch.arange(N, device=mu_detached.device),
+            offsets[1:] - offsets[:-1],
+        )
+        smooth = mu_detached.clone()
+        for _ in range(hops):
+            nbr_sum = torch.zeros(N, device=smooth.device, dtype=smooth.dtype)
+            nbr_sum.scatter_add_(0, src, smooth[adj])
+            smooth = nbr_sum / counts
+        return smooth  # [N], detached k-hop neighborhood mean
+
+    def neighbor_variance_regularization(self, sigma_v=1.0, hops=1):
+        """Bilateral variance loss over the Voronoi neighbor graph.
+
+        Each cell is penalized for deviating from its k-hop neighborhood mean.
+        Bilaterally weighted by sigma_v: large sigma_v = plain L2 smoothing;
+        small sigma_v = edge-preserving (boundaries down-weighted).
+        Combined with sigma annealing in train.py this starts as full smoothing
+        and transitions to edge-preserving as training progresses.
+        """
+        mu = self.get_primal_density().squeeze()        # [N], with grad
+        target = self._neighbor_smooth_target(mu.detach(), hops)
+        diff = mu - target
+        bilateral_w = torch.exp(-(diff.detach() ** 2) / (sigma_v ** 2))
+        return (bilateral_w * diff ** 2).mean()
+
+    @torch.no_grad()
+    def compute_neighborhood_variance(self, cell_radius=None, hops=1):
+        """Per-cell neighborhood variance score for variance-based pruning.
+
+        Returns per-cell score = (mu - k_hop_mean)^2 * max(radius, p10_radius).
+        Combined score targets cells that are BOTH smooth (low variance) AND
+        small-to-medium sized. Large empty-space cells (large radius) score high
+        → protected. Tiny densification-placed cells near boundaries (high variance
+        even if small) score high → kept.
+
+        Args:
+            cell_radius: [N] tensor of per-cell radii. If None, returns raw variance.
+            hops: k-hop neighborhood depth for smoothing target.
+        """
+        mu = self.get_primal_density().squeeze().detach()
+        target = self._neighbor_smooth_target(mu, hops)
+        var = (mu - target) ** 2  # [N]
+
+        if cell_radius is not None:
+            p10 = torch.quantile(cell_radius, 0.1)
+            size_factor = cell_radius.clamp(min=p10)
+            return var * size_factor
+        return var
+
     @torch.no_grad()
     def compute_redundancy_error(self, cell_radius, sigma_scale, sigma_v):
         """Per-cell leave-one-out IDW error: |density_i - interp_from_neighbors|."""
@@ -1002,6 +1063,7 @@ class CTScene(torch.nn.Module):
         entropy_fraction=0.3, entropy_bins=5,
         redundancy_threshold=0.0, redundancy_cap=0.0,
         sigma_scale=0.5, sigma_v=0.1,
+        variance_pruning=False, prune_hops=1,
     ):
         with torch.no_grad():
             num_curr_points = self.primal_points.shape[0]
@@ -1063,14 +1125,25 @@ class CTScene(torch.nn.Module):
 
             ################ Redundancy pruning ################
             if redundancy_cap > 0:
-                density_scale = torch.quantile(activated, 0.95).item()
-                candidates = cell_error < redundancy_threshold * density_scale
-                # Don't re-mark cells already pruned
-                candidates = candidates & ~prune_mask
+                if variance_pruning:
+                    # Variance-based criterion: score = neighborhood_var × clamped_radius
+                    # All non-pruned cells are candidates (no threshold); purely cap-based.
+                    cell_score = self.compute_neighborhood_variance(
+                        cell_radius, hops=prune_hops
+                    )
+                    candidates = ~prune_mask
+                    prune_label = "variance"
+                else:
+                    # IDW leave-one-out criterion (original)
+                    density_scale = torch.quantile(activated, 0.95).item()
+                    cell_score = cell_error
+                    candidates = cell_score < redundancy_threshold * density_scale
+                    candidates = candidates & ~prune_mask
+                    prune_label = f"IDW threshold={redundancy_threshold * density_scale:.4f}"
 
                 if candidates.sum() > 0:
-                    # Independent set: error-based priority (most redundant neighbor wins)
-                    priorities = cell_error.clone()
+                    # Independent set: lowest-score neighbor wins (most redundant wins locally)
+                    priorities = cell_score.clone()
                     priorities[~candidates] = float('inf')
                     neighbor_min = torch.full(
                         (num_curr_points,), float('inf'), device=points.device
@@ -1081,17 +1154,17 @@ class CTScene(torch.nn.Module):
                     max_remove = int(redundancy_cap * num_curr_points)
                     n_removable = removable.sum().item()
                     if n_removable > max_remove:
-                        err_vals = cell_error.clone()
-                        err_vals[~removable] = float('inf')
-                        _, topk = err_vals.topk(max_remove, largest=False)
+                        score_vals = cell_score.clone()
+                        score_vals[~removable] = float('inf')
+                        _, topk = score_vals.topk(max_remove, largest=False)
                         removable = torch.zeros_like(removable)
                         removable[topk] = True
 
                     n_redundant_here = removable.sum().item()
                     if n_redundant_here > 0:
                         n_redundant = n_redundant_here
-                        print(f"Redundancy prune: {n_redundant}/{num_curr_points} cells "
-                              f"(threshold={redundancy_threshold * density_scale:.4f})")
+                        print(f"Redundancy prune ({prune_label}): "
+                              f"{n_redundant}/{num_curr_points} cells")
                         prune_mask = prune_mask | removable
 
             ######################## Sampling ########################

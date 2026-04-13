@@ -32,8 +32,12 @@ tv_anneal: False
 tv_on_raw: True
 voxel_var_weight: 1e-3
 voxel_var_resolution: 64
-voxel_var_sigma_v: 0.2
 voxel_var_start: 0
+neighbor_var_weight: 0.0
+neighbor_var_hops: 1
+neighbor_var_start: 0
+var_sigma_v_init: 0.2
+var_sigma_v_final: 0.2
 
 # Densification (full: gradient + IDW + entropy)
 densify_from: 1000
@@ -46,6 +50,10 @@ entropy_bins: 5
 contrast_alpha: 0.0
 redundancy_threshold: 0.0
 redundancy_cap: 0.0
+redundancy_cap_init: 0.0
+redundancy_cap_final: 0.0
+prune_variance_criterion: False
+prune_hops: 1
 targeted_fraction: 0.0
 targeted_start: -1
 
