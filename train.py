@@ -228,7 +228,7 @@ def compute_volume_ssim_3d(pred, gt, window_size=11):
 
 
 @torch.no_grad()
-def compute_dice(pred, gt, thresholds=(0.1, 0.3, 0.5, 0.7, 0.9)):
+def compute_dice(pred, gt, thresholds=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)):
     if isinstance(pred, torch.Tensor):
         pred = pred.cpu().numpy()
     if isinstance(gt, torch.Tensor):
@@ -242,28 +242,53 @@ def compute_dice(pred, gt, thresholds=(0.1, 0.3, 0.5, 0.7, 0.9)):
 
 
 @torch.no_grad()
-def compute_surface_metrics(pred, gt, threshold=0.5, f_thresholds=(1.0, 2.0)):
-    if isinstance(pred, torch.Tensor):
-        pred = pred.cpu().numpy()
-    if isinstance(gt, torch.Tensor):
-        gt = gt.cpu().numpy()
+def _surface_metrics_at_level(pred, gt, level, f_thresholds=(1.0, 2.0)):
+    """Surface metrics at a single isosurface level. Returns None on failure."""
     try:
-        verts_p, _, _, _ = marching_cubes(pred, level=threshold)
-        verts_g, _, _, _ = marching_cubes(gt, level=threshold)
-    except ValueError:
-        return {"chamfer": float("inf"), **{f"f1_{d:.0f}v": 0.0 for d in f_thresholds}}
+        verts_p, _, _, _ = marching_cubes(pred, level=level)
+        verts_g, _, _, _ = marching_cubes(gt, level=level)
+    except (ValueError, RuntimeError):
+        return None
+    if len(verts_p) < 3 or len(verts_g) < 3:
+        return None
     tree_p = KDTree(verts_p)
     tree_g = KDTree(verts_g)
     d_pred_to_gt, _ = tree_g.query(verts_p)
     d_gt_to_pred, _ = tree_p.query(verts_g)
     chamfer = 0.5 * (d_pred_to_gt.mean() + d_gt_to_pred.mean())
-    result = {"chamfer": float(chamfer)}
+    hausdorff_max = float(max(d_pred_to_gt.max(), d_gt_to_pred.max()))
+    hausdorff_95 = float(max(np.percentile(d_pred_to_gt, 95),
+                             np.percentile(d_gt_to_pred, 95)))
+    result = {"chamfer": float(chamfer),
+              "hausdorff": hausdorff_max, "hausdorff_95": hausdorff_95}
     for d in f_thresholds:
         prec = (d_pred_to_gt <= d).mean()
         rec = (d_gt_to_pred <= d).mean()
         f1 = 2 * prec * rec / (prec + rec + 1e-8)
         result[f"f1_{d:.0f}v"] = float(f1)
     return result
+
+
+@torch.no_grad()
+def compute_surface_metrics(pred, gt,
+                            thresholds=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9),
+                            f_thresholds=(1.0, 2.0)):
+    """Surface metrics averaged over multiple isosurface thresholds."""
+    if isinstance(pred, torch.Tensor):
+        pred = pred.cpu().numpy()
+    if isinstance(gt, torch.Tensor):
+        gt = gt.cpu().numpy()
+    per_level = []
+    for t in thresholds:
+        m = _surface_metrics_at_level(pred, gt, t, f_thresholds)
+        if m is not None:
+            per_level.append(m)
+    if not per_level:
+        return {"chamfer": float("inf"), "hausdorff": float("inf"),
+                "hausdorff_95": float("inf"),
+                **{f"f1_{d:.0f}v": 0.0 for d in f_thresholds}}
+    keys = per_level[0].keys()
+    return {k: float(np.mean([m[k] for m in per_level])) for k in keys}
 
 
 def log_diagnostics(model, writer, step):
@@ -1226,14 +1251,20 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
             idw_surf = compute_surface_metrics(idw_vol_t, vol_gt_t)
 
             print(f"Vol Raw  Dice: {raw_dice:.6f}, CD: {raw_surf['chamfer']:.4f}v, "
+                  f"HD95: {raw_surf['hausdorff_95']:.4f}v, "
                   f"F1@1v: {raw_surf['f1_1v']:.4f}, F1@2v: {raw_surf['f1_2v']:.4f}")
             print(f"Vol IDW  Dice: {idw_dice:.6f}, CD: {idw_surf['chamfer']:.4f}v, "
+                  f"HD95: {idw_surf['hausdorff_95']:.4f}v, "
                   f"F1@1v: {idw_surf['f1_1v']:.4f}, F1@2v: {idw_surf['f1_2v']:.4f}")
 
             writer.add_scalar("test/vol_raw_dice", raw_dice, iters)
             writer.add_scalar("test/vol_idw_dice", idw_dice, iters)
             writer.add_scalar("test/vol_raw_chamfer", raw_surf["chamfer"], iters)
             writer.add_scalar("test/vol_idw_chamfer", idw_surf["chamfer"], iters)
+            writer.add_scalar("test/vol_raw_hausdorff", raw_surf["hausdorff"], iters)
+            writer.add_scalar("test/vol_idw_hausdorff", idw_surf["hausdorff"], iters)
+            writer.add_scalar("test/vol_raw_hausdorff_95", raw_surf["hausdorff_95"], iters)
+            writer.add_scalar("test/vol_idw_hausdorff_95", idw_surf["hausdorff_95"], iters)
             writer.add_scalar("test/vol_raw_f1_1v", raw_surf["f1_1v"], iters)
             writer.add_scalar("test/vol_idw_f1_1v", idw_surf["f1_1v"], iters)
             writer.add_scalar("test/vol_raw_f1_2v", raw_surf["f1_2v"], iters)
@@ -1244,6 +1275,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 f.write(f"Vol IDW Dice: {idw_dice:.6f}\n")
                 f.write(f"Vol Raw CD: {raw_surf['chamfer']:.4f}\n")
                 f.write(f"Vol IDW CD: {idw_surf['chamfer']:.4f}\n")
+                f.write(f"Vol Raw Hausdorff: {raw_surf['hausdorff']:.4f}\n")
+                f.write(f"Vol IDW Hausdorff: {idw_surf['hausdorff']:.4f}\n")
+                f.write(f"Vol Raw Hausdorff 95: {raw_surf['hausdorff_95']:.4f}\n")
+                f.write(f"Vol IDW Hausdorff 95: {idw_surf['hausdorff_95']:.4f}\n")
                 f.write(f"Vol Raw F1 1v: {raw_surf['f1_1v']:.4f}\n")
                 f.write(f"Vol IDW F1 1v: {idw_surf['f1_1v']:.4f}\n")
                 f.write(f"Vol Raw F1 2v: {raw_surf['f1_2v']:.4f}\n")
@@ -1269,6 +1304,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 print(f"Vol R2   Sobel PSNR: {sobel_r2_psnr_3d:.4f}, Sobel SSIM: {sobel_r2_ssim_3d:.6f}")
                 print(f"Vol R2   SSIM3D: {r2_ssim3d:.6f}")
                 print(f"Vol R2   Dice: {r2_dice:.6f}, CD: {r2_surf['chamfer']:.4f}v, "
+                      f"HD95: {r2_surf['hausdorff_95']:.4f}v, "
                       f"F1@1v: {r2_surf['f1_1v']:.4f}, F1@2v: {r2_surf['f1_2v']:.4f}")
 
                 writer.add_scalar("test/vol_r2_psnr", r2_psnr_3d, iters)
@@ -1280,6 +1316,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 writer.add_scalar("test/vol_r2_ssim3d", r2_ssim3d, iters)
                 writer.add_scalar("test/vol_r2_dice", r2_dice, iters)
                 writer.add_scalar("test/vol_r2_chamfer", r2_surf["chamfer"], iters)
+                writer.add_scalar("test/vol_r2_hausdorff", r2_surf["hausdorff"], iters)
+                writer.add_scalar("test/vol_r2_hausdorff_95", r2_surf["hausdorff_95"], iters)
                 writer.add_scalar("test/vol_r2_f1_1v", r2_surf["f1_1v"], iters)
                 writer.add_scalar("test/vol_r2_f1_2v", r2_surf["f1_2v"], iters)
 
@@ -1293,6 +1331,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     f.write(f"Vol R2 SSIM3D: {r2_ssim3d:.6f}\n")
                     f.write(f"Vol R2 Dice: {r2_dice:.6f}\n")
                     f.write(f"Vol R2 CD: {r2_surf['chamfer']:.4f}\n")
+                    f.write(f"Vol R2 Hausdorff: {r2_surf['hausdorff']:.4f}\n")
+                    f.write(f"Vol R2 Hausdorff 95: {r2_surf['hausdorff_95']:.4f}\n")
                     f.write(f"Vol R2 F1 1v: {r2_surf['f1_1v']:.4f}\n")
                     f.write(f"Vol R2 F1 2v: {r2_surf['f1_2v']:.4f}\n")
 
