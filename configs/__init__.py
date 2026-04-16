@@ -122,10 +122,12 @@ class OptimizationParams(ParamGroup):
         self.tv_anneal = False
         self.tv_on_raw = False
         self.voxel_var_weight = 0.0
+        self.voxel_var_weight_final = -1.0  # weight at interpolation_start (-1 = hold voxel_var_weight)
         self.voxel_var_resolution = 32
         self.voxel_var_sigma_v = 0.2       # kept for backward compat; overridden by var_sigma_v_*
         self.voxel_var_start = 0
         self.neighbor_var_weight = 0.0     # graph neighbor variance regularization weight
+        self.neighbor_var_weight_final = -1.0  # weight at interpolation_start (-1 = hold neighbor_var_weight)
         self.neighbor_var_hops = 1         # k-hop neighborhood depth
         self.neighbor_var_start = 0
         self.var_sigma_v_init = 0.2        # bilateral sigma at start (large = plain smoothing)

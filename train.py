@@ -870,19 +870,34 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 var_sigma_v = (optimizer_args.var_sigma_v_init * (1.0 - _var_sched_t)
                                + optimizer_args.var_sigma_v_final * _var_sched_t)
 
-                if optimizer_args.voxel_var_weight > 0 and i >= optimizer_args.voxel_var_start:
+                # Variance weight schedule: hold init through densify_until, then linearly decay
+                # to *_weight_final over [densify_until, interpolation_start]. _final<0 disables decay.
+                _decay_range = max(1, pipeline_args.interpolation_start - pipeline_args.densify_until)
+                _w_t = max(0.0, min(1.0, (i - pipeline_args.densify_until) / _decay_range))
+                vvar_w_final = (optimizer_args.voxel_var_weight
+                                if optimizer_args.voxel_var_weight_final < 0
+                                else optimizer_args.voxel_var_weight_final)
+                nvar_w_final = (optimizer_args.neighbor_var_weight
+                                if optimizer_args.neighbor_var_weight_final < 0
+                                else optimizer_args.neighbor_var_weight_final)
+                vvar_w = (optimizer_args.voxel_var_weight * (1.0 - _w_t)
+                          + vvar_w_final * _w_t)
+                nvar_w = (optimizer_args.neighbor_var_weight * (1.0 - _w_t)
+                          + nvar_w_final * _w_t)
+
+                if vvar_w > 0 and i >= optimizer_args.voxel_var_start:
                     voxel_var_loss = model.voxel_variance_regularization(
                         resolution=optimizer_args.voxel_var_resolution,
                         sigma_v=var_sigma_v,
                     )
-                    loss = loss + optimizer_args.voxel_var_weight * voxel_var_loss
+                    loss = loss + vvar_w * voxel_var_loss
 
-                if optimizer_args.neighbor_var_weight > 0 and i >= optimizer_args.neighbor_var_start:
+                if nvar_w > 0 and i >= optimizer_args.neighbor_var_start:
                     neighbor_var_loss = model.neighbor_variance_regularization(
                         sigma_v=var_sigma_v,
                         hops=optimizer_args.neighbor_var_hops,
                     )
-                    loss = loss + optimizer_args.neighbor_var_weight * neighbor_var_loss
+                    loss = loss + nvar_w * neighbor_var_loss
 
                 model.optimizer.zero_grad(set_to_none=True)
 
@@ -960,8 +975,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     tv_scale_val = tv_scale if optimizer_args.tv_anneal and tv_loss_val is not None else None
                     if optimizer_args.voxel_var_weight > 0 and i >= optimizer_args.voxel_var_start:
                         writer.add_scalar("train/voxel_var_loss", voxel_var_loss.item(), i)
+                        writer.add_scalar("train/voxel_var_weight", vvar_w, i)
                     if optimizer_args.neighbor_var_weight > 0 and i >= optimizer_args.neighbor_var_start:
                         writer.add_scalar("train/neighbor_var_loss", neighbor_var_loss.item(), i)
+                        writer.add_scalar("train/neighbor_var_weight", nvar_w, i)
                     _last_test_m, _ = log_basic(i, loss_val=loss.item(), tv_loss_val=tv_loss_val,
                                                 tv_scale_val=tv_scale_val)
 
