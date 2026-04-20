@@ -9,6 +9,8 @@ import radfoam
 from .ct_cube import CTCubeDataset
 from .ct_synthetic import CTSyntheticDataset
 from .r2_gaussian import R2GaussianDataset
+from .lodopab import LoDoPaBDataset
+from .two_detectct import TwoDeteCTDataset
 from .targeted_sampler import build_targeted_batch
 
 
@@ -55,6 +57,8 @@ dataset_dict = {
     "ct_cube": CTCubeDataset,
     "ct_synthetic": CTSyntheticDataset,
     "r2_gaussian": R2GaussianDataset,
+    "lodopab": LoDoPaBDataset,
+    "two_detectct": TwoDeteCTDataset,
 }
 
 
@@ -67,11 +71,20 @@ class DataHandler:
     def reload(self, split, downsample=None):
         dataset = dataset_dict[self.args.dataset]
 
+        import inspect
+        accepted = set(inspect.signature(dataset.__init__).parameters)
+
         kwargs = {}
-        if hasattr(self.args, "num_angles"):
+        if "num_angles" in accepted and hasattr(self.args, "num_angles") and self.args.num_angles > 0:
             kwargs["num_angles"] = self.args.num_angles
-        if hasattr(self.args, "detector_size"):
+        if "detector_size" in accepted and hasattr(self.args, "detector_size"):
             kwargs["detector_size"] = self.args.detector_size
+        if "sample_index" in accepted and hasattr(self.args, "sample_index"):
+            kwargs["sample_index"] = self.args.sample_index
+        if "mode" in accepted and hasattr(self.args, "mode"):
+            kwargs["mode"] = self.args.mode
+        if "split_override" in accepted and hasattr(self.args, "split_override") and self.args.split_override:
+            kwargs["split_override"] = self.args.split_override
 
         split_dataset = dataset(
             data_dir=self.args.data_path, split=split, **kwargs
@@ -109,7 +122,7 @@ class DataHandler:
             if self.beam_type == "parallel":
                 self._beam_geom["center_rays"] = self.rays[:, det_h // 2, det_w // 2].to(self.device, non_blocking=True)
                 self._beam_geom["pixel_size"] = self.pixel_size
-            elif self.beam_type == "cone":
+            elif self.beam_type == "cone" and self.c2ws is not None:
                 self._beam_geom["c2ws"] = self.c2ws.to(self.device, non_blocking=True)
                 self._beam_geom["fx"] = self.fx
                 self._beam_geom["fy"] = self.fy
@@ -127,6 +140,17 @@ class DataHandler:
     def init_high_error_sampling(self, high_error_fraction, high_error_power=1.0):
         """Initialize high-error ray sampling state."""
         num_angles, det_h, det_w, _ = self.rays.shape
+        if det_h < 2:
+            if high_error_fraction > 0:
+                import warnings
+                warnings.warn(
+                    "high_error_fraction is not supported when det_h=1 (e.g. LoDoPaB). "
+                    "Set high_error_fraction=0 in your config.",
+                    stacklevel=2,
+                )
+            self._he_fraction = 0.0
+            self._he_batch_size = 0
+            return
         err_h, err_w = det_h // 2, det_w // 2  # 256² error map
         self._he_fraction = high_error_fraction
         self._he_power = high_error_power
@@ -211,6 +235,10 @@ class DataHandler:
 
     def _get_high_error_batch(self):
         """Get a batch of high-error rays from the pre-sampled pool."""
+        if self._he_batch_size == 0:
+            empty = torch.zeros(0, 6, device=self.device)
+            empty_proj = torch.zeros(0, 1, device=self.device)
+            return empty, empty_proj
         if self._he_pool is None or self._he_pool_cursor + self._he_batch_size > self._he_pool.shape[0]:
             self._refresh_high_error_pool()
         start = self._he_pool_cursor

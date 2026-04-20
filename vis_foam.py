@@ -534,12 +534,13 @@ def render_volume_drr(volume, rays, extent=1.0, num_samples=256):
     return projection.cpu().numpy().astype(np.float32)
 
 
-def load_gt_volume(data_path, dataset_type):
+def load_gt_volume(data_path, dataset_type, dataset_args=None):
     """Load or generate a ground-truth 3D density volume.
 
     Args:
         data_path: path to the dataset directory
-        dataset_type: 'r2_gaussian' or 'ct_synthetic'
+        dataset_type: 'r2_gaussian', 'ct_synthetic', 'lodopab', etc.
+        dataset_args: full dataset args namespace (used for lodopab sample_index / split_override)
 
     Returns:
         (G,G,G) numpy array, or None if GT not available.
@@ -565,6 +566,45 @@ def load_gt_volume(data_path, dataset_type):
         else:
             boxes, densities = make_single_cube_scene()
         return make_gt_volume(boxes, densities, resolution=256, extent=1.0)
+    elif dataset_type == "lodopab":
+        import h5py, os
+        G = 256
+        SAMPLES_PER_FILE = 128
+        sample_index = getattr(dataset_args, "sample_index", 0) if dataset_args is not None else 0
+        split = getattr(dataset_args, "split_override", "") or "train"
+        file_idx = sample_index // SAMPLES_PER_FILE
+        in_file_idx = sample_index % SAMPLES_PER_FILE
+        gt_path = os.path.join(data_path, f"ground_truth_{split}_{file_idx:03d}.hdf5")
+        if not os.path.exists(gt_path):
+            return None
+        with h5py.File(gt_path, "r") as f:
+            gt2d = f["data"][in_file_idx].astype(np.float32)  # (362, 362), values in [0,1]
+        # Resize to G×G
+        from skimage.transform import resize
+        gt2d = resize(gt2d, (G, G), order=1, anti_aliasing=True).astype(np.float32)
+        # Embed 2D slice into a 3D volume by replicating across z.
+        # Axis convention: volume[x, y, z] — the CT image is in the xy-plane.
+        # LoDoPaB image axes: row=y (top→bottom), col=x (left→right).
+        gt3d = np.stack([gt2d] * G, axis=2)  # (G, G, G): same slice at every z
+        return gt3d
+    elif dataset_type == "two_detectct":
+        import os, tifffile
+        G = 256
+        sample_index = getattr(dataset_args, "sample_index", 1) if dataset_args is not None else 1
+        mode = getattr(dataset_args, "mode", 1) if dataset_args is not None else 1
+        # 2DeteCT includes FBP reconstructions for slices 2001-3000 in the RecSeg package.
+        # Look for reconstruction TIFF in slice dir.
+        slice_dir = os.path.join(data_path, f"slice{sample_index:05d}", f"mode{mode}")
+        recon_path = os.path.join(slice_dir, "reconstruction.tif")
+        if not os.path.exists(recon_path):
+            return None
+        gt2d = tifffile.imread(recon_path).astype(np.float32)  # (H, W)
+        from skimage.transform import resize
+        gt2d = resize(gt2d, (G, G), order=1, anti_aliasing=True).astype(np.float32)
+        # Normalize to [0, 1]
+        gt2d = (gt2d - gt2d.min()) / (gt2d.max() - gt2d.min() + 1e-9)
+        gt3d = np.stack([gt2d] * G, axis=2)
+        return gt3d
     return None
 
 
@@ -920,7 +960,7 @@ def visualize_slices(density_slices, idw_slices, cell_density_slices,
         writer_fn(fig)
 
     # Build interleaved view by rearranging rendered tiles
-    if writer_fn_interleaved is not None:
+    if writer_fn_interleaved is not None and has_gt:
         fig.canvas.draw()
         buf = np.asarray(fig.canvas.buffer_rgba())
         h, w, _ = buf.shape

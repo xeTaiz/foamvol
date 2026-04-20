@@ -1,0 +1,45 @@
+# LoDoPaB-CT reconstruction config
+# Train on a single 2D CT slice from the LoDoPaB dataset.
+# Download data first: python setup_lodopab.py --path /mnt/hdd/lodopab --download
+
+# Dataset
+dataset: lodopab
+data_path: /mnt/hdd/lodopab
+sample_index: 0          # which CT slice to reconstruct (0-3521 for validation split)
+split_override: validation  # use validation split (obs + GT both extracted)
+
+# Model
+init_points: 32000
+final_points: 128000
+init_scale: 1.05         # slightly outside [-1,1] to cover the full slice
+init_density: 0.0
+
+# Training schedule
+iterations: 10000
+densify_from: 1000
+densify_until: 6000
+densify_factor: 1.15
+interpolation_start: 9000
+interp_sigma_scale: 0.7
+interp_sigma_v: 0.35
+per_cell_sigma: false
+freeze_points: 9500
+rays_per_batch: 513000   # ~513 det pixels * 1000 angles (full sinogram)
+
+# Regularization
+tv_weight: 1e-4
+tv_start: 5000
+neighbor_var_weight: 1e-3
+neighbor_var_start: 1000
+neighbor_var_hops: 1
+
+# Ray sampling
+# NOTE: high_error_fraction must be 0 for LoDoPaB (det_h=1, no 2D downsampling)
+high_error_fraction: 0.0
+targeted_fraction: 0.0
+
+# Learning rates
+density_lr_init: 0.05
+density_lr_final: 0.001
+points_lr_init: 0.0002
+points_lr_final: 0.000005
