@@ -97,6 +97,8 @@ class ModelParams(ParamGroup):
         self.device = "cuda"
         self.init_points_file = ""
         self.init_volume_path = ""  # path to .npy volume for density init (e.g. FDK)
+        self.frozen_points_file = ""      # path to model.pt whose xyz+density start frozen
+        self.frozen_freeze_density = True # also freeze density of old points until unfreeze
         super().__init__(parser, "Setting Model parameters")
 
 
@@ -108,6 +110,7 @@ class OptimizationParams(ParamGroup):
         self.density_lr_init = 5e-2
         self.density_lr_final = 1e-3
         self.freeze_points = 9_500
+        self.frozen_unfreeze_step = -1    # iter to unfreeze loaded frozen points (-1 = never)
         self.tv_weight = 1e-4
         self.tv_start = 5_000
         self.tv_epsilon = 1e-4
@@ -153,4 +156,7 @@ class DatasetParams(ParamGroup):
         self.scene = "sphere"
         self.num_angles = 180
         self.detector_size = 128
+        self.sample_index = 0
+        self.mode = 1
+        self.split_override = ""
         super().__init__(parser, "Setting Dataset parameters")

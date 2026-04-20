@@ -263,6 +263,8 @@ class CTScene(torch.nn.Module):
             self.delta_raw = optimizable_tensors["delta_raw"]
         if "cov_raw" in optimizable_tensors:
             self.cov_raw = optimizable_tensors["cov_raw"]
+        if hasattr(self, '_frozen_mask'):
+            self._frozen_mask = self._frozen_mask[permutation]
 
     def update_triangulation(self, rebuild=True, incremental=False):
         if not self.primal_points.isfinite().all():
@@ -992,6 +994,8 @@ class CTScene(torch.nn.Module):
             self.cov_raw = optimizable_tensors["cov_raw"]
         if hasattr(self, '_starvation_count'):
             self._starvation_count = self._starvation_count[valid_points_mask]
+        if hasattr(self, '_frozen_mask'):
+            self._frozen_mask = self._frozen_mask[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, new_params):
         optimizable_tensors = {}
@@ -1056,6 +1060,11 @@ class CTScene(torch.nn.Module):
                 self._starvation_count,
                 torch.zeros(n_new, dtype=torch.int32, device=self.device),
             ])
+        if hasattr(self, '_frozen_mask'):
+            self._frozen_mask = torch.cat([
+                self._frozen_mask,
+                torch.zeros(n_new, dtype=torch.bool, device=self.device),
+            ])
 
     def prune_and_densify(
         self, point_error, point_contribution, upsample_factor=1.2,
@@ -1110,6 +1119,8 @@ class CTScene(torch.nn.Module):
             low_contrib = point_contribution.squeeze() < 1e-2
             tiny_radius = cell_radius < 1e-4
             prune_mask = low_contrib | tiny_radius
+            if hasattr(self, '_frozen_mask'):
+                prune_mask = prune_mask & ~self._frozen_mask
             n_pruned_low_contrib = (low_contrib & ~tiny_radius).sum().item()
             n_pruned_tiny_radius = (tiny_radius & ~low_contrib).sum().item()
             n_pruned_both = (low_contrib & tiny_radius).sum().item()
@@ -1132,6 +1143,8 @@ class CTScene(torch.nn.Module):
                         cell_radius, hops=prune_hops
                     )
                     candidates = ~prune_mask
+                    if hasattr(self, '_frozen_mask'):
+                        candidates = candidates & ~self._frozen_mask
                     prune_label = "variance"
                 else:
                     # IDW leave-one-out criterion (original)
@@ -1139,6 +1152,8 @@ class CTScene(torch.nn.Module):
                     cell_score = cell_error
                     candidates = cell_score < redundancy_threshold * density_scale
                     candidates = candidates & ~prune_mask
+                    if hasattr(self, '_frozen_mask'):
+                        candidates = candidates & ~self._frozen_mask
                     prune_label = f"IDW threshold={redundancy_threshold * density_scale:.4f}"
 
                 if candidates.sum() > 0:
@@ -1542,3 +1557,56 @@ class CTScene(torch.nn.Module):
         ).to(torch.uint32)
 
         self.aabb_tree = radfoam.build_aabb_tree(self.primal_points)
+
+    def load_frozen_checkpoint(self, pt_path, n_new_points, freeze_density=True):
+        """Load xyz+density from pt_path as frozen seed, add n_new_points fresh random cells.
+
+        After this call, self._frozen_mask[i] is True for the N_f loaded points (permuted).
+        init_points in the stage config refers to n_new_points (the fresh additions only).
+        """
+        scene_data = torch.load(pt_path, map_location=self.device)
+        frozen_xyz = scene_data["xyz"].to(self.device)      # (N_f, 3)
+        frozen_den = scene_data["density"].to(self.device)  # (N_f, 1)
+        N_f = frozen_xyz.shape[0]
+
+        s = self.init_scale
+        new_xyz = torch.rand(n_new_points, 3, device=self.device) * 2 * s - s
+        new_den = torch.full((n_new_points, 1), self.init_density,
+                             device=self.device, dtype=torch.float32)
+
+        all_xyz = torch.cat([frozen_xyz, new_xyz])
+        all_den = torch.cat([frozen_den, new_den])
+
+        self.triangulation = radfoam.Triangulation(all_xyz.float().contiguous())
+        perm = self.triangulation.permutation().to(torch.long)
+        self.primal_points = nn.Parameter(all_xyz[perm])
+        self.density = nn.Parameter(all_den[perm])
+        self.update_triangulation(rebuild=False)
+
+        mask = torch.zeros(N_f + n_new_points, dtype=torch.bool, device=self.device)
+        mask[:N_f] = True
+        self._frozen_mask = mask[perm].clone()
+        self._freeze_density = freeze_density
+        # Fix scheduler denominator: interval formula uses num_final_points - num_init_points
+        # to estimate how many cells will be added. Actual start is N_f + n_new, not n_new.
+        self.num_init_points = N_f + n_new_points
+        print(f"[frozen init] {N_f} frozen + {n_new_points} new = {N_f + n_new_points} total "
+              f"({N_f / (N_f + n_new_points):.1%} frozen)")
+
+    @torch.no_grad()
+    def apply_frozen_mask(self):
+        """Zero gradients for all frozen points. Call after backward(), before optimizer.step()."""
+        if not hasattr(self, '_frozen_mask') or not self._frozen_mask.any():
+            return
+        mask = self._frozen_mask
+        if self.primal_points.grad is not None:
+            self.primal_points.grad[mask] = 0.0
+        if getattr(self, '_freeze_density', True) and self.density.grad is not None:
+            self.density.grad[mask] = 0.0
+
+    def unfreeze_all(self):
+        """Remove per-point freeze. Called at frozen_unfreeze_step."""
+        if hasattr(self, '_frozen_mask'):
+            n = self._frozen_mask.sum().item()
+            del self._frozen_mask
+            print(f"[unfreeze] released {n} previously-frozen points")
