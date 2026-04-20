@@ -368,9 +368,18 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         device=device,
     )
 
+    # Staged init: load frozen checkpoint + add fresh random cells on top
+    frozen_points_file = getattr(model_args, "frozen_points_file", "")
+    if frozen_points_file:
+        model.load_frozen_checkpoint(
+            pt_path=frozen_points_file,
+            n_new_points=model_args.init_points,
+            freeze_density=getattr(model_args, "frozen_freeze_density", True),
+        )
+
     # Override initial points if a file is provided
     init_points_file = getattr(model_args, "init_points_file", "")
-    if init_points_file:
+    if init_points_file and not frozen_points_file:
         pts = torch.load(init_points_file, map_location=device, weights_only=True)
         print(f"Overriding initial points from {init_points_file}: {pts.shape}")
         model.triangulation = radfoam.Triangulation(pts.float().contiguous().to(device))
@@ -395,7 +404,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         max_iterations=pipeline_args.iterations,
     )
 
-    gt_volume = load_gt_volume(dataset_args.data_path, dataset_args.dataset)
+    gt_volume = load_gt_volume(dataset_args.data_path, dataset_args.dataset, dataset_args=dataset_args)
     if gt_volume is not None:
         print(f"Loaded GT volume: shape={gt_volume.shape}")
 
@@ -912,6 +921,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 if optimizer_args.density_grad_clip > 0 and model.density.grad is not None:
                     model.density.grad.clamp_(-optimizer_args.density_grad_clip, optimizer_args.density_grad_clip)
 
+                model.apply_frozen_mask()
+
                 model.optimizer.step()
                 model.update_starvation_count()
 
@@ -1138,6 +1149,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 ):
                     model.density.requires_grad_(True)
                     print(f"Unfroze base density for joint fine-tuning at iter {i}")
+
+                frozen_unfreeze = getattr(optimizer_args, "frozen_unfreeze_step", -1)
+                if frozen_unfreeze >= 0 and i == frozen_unfreeze:
+                    model.unfreeze_all()
 
                 if i == optimizer_args.freeze_points:
                     model.update_triangulation(incremental=False)
