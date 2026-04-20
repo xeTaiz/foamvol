@@ -1,0 +1,45 @@
+# 2DeteCT fan-beam 2D CT reconstruction config
+# Train on a single 2D CT slice from the 2DeteCT dataset.
+# Data should be at /mnt/hdd/2detectct/slice00001/mode1/ etc.
+
+# Dataset
+dataset: two_detectct
+data_path: /mnt/hdd/2detectct
+sample_index: 1          # 1-based slice ID (1..6370)
+mode: 1                  # 1=high-dose (90kV/90W), 2=low-dose, 3=60kV
+
+# Model
+init_points: 32000
+final_points: 128000
+init_scale: 1.05
+init_density: 0.0
+
+# Training schedule
+iterations: 10000
+densify_from: 1000
+densify_until: 6000
+densify_factor: 1.15
+interpolation_start: 9000
+interp_sigma_scale: 0.7
+interp_sigma_v: 0.35
+per_cell_sigma: false
+freeze_points: 9500
+rays_per_batch: 956000   # ~956 det pixels * 1000 angles
+
+# Regularization
+tv_weight: 1e-4
+tv_start: 5000
+neighbor_var_weight: 1e-3
+neighbor_var_start: 1000
+neighbor_var_hops: 1
+
+# Ray sampling
+# NOTE: high_error_fraction must be 0 (det_h=1, no 2D downsampling supported)
+high_error_fraction: 0.0
+targeted_fraction: 0.0
+
+# Learning rates
+density_lr_init: 0.05
+density_lr_final: 0.001
+points_lr_init: 0.0002
+points_lr_final: 0.000005
