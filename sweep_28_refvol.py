@@ -207,11 +207,12 @@ ALL_RUNS = {
 # ---------------------------------------------------------------------------
 
 def prepare_idw_warmup():
-    """Run 1k-iteration warmup to produce IDW_CKPT if it doesn't exist yet."""
+    """Run 3k-iteration warmup to produce IDW_CKPT if it doesn't exist yet."""
     if os.path.exists(IDW_CKPT):
         print(f"[SKIP] IDW warmup — {IDW_CKPT} already exists")
         return
 
+    warmup_iters = 3000
     warmup_cfg = base_config(
         final_points=64000,
         redundancy_cap=0.0,
@@ -220,10 +221,10 @@ def prepare_idw_warmup():
         neighbor_var_weight=0.0,
     )
     warmup_cfg.update({
-        "iterations": 1000,
-        "densify_from": 10000,    # no densification
+        "iterations": warmup_iters,
+        "densify_from": warmup_iters + 1,  # no densification
         "interpolation_start": -1,
-        "freeze_points": 10000,
+        "freeze_points": warmup_iters,     # point LR decays to final over warmup duration
     })
 
     warmup_dir = os.path.join(SWEEP_DIR, "_warmup")
@@ -237,7 +238,7 @@ def prepare_idw_warmup():
         "-c", config_file,
         "--experiment_name", "sweep28_refvol/_warmup",
     ]
-    print("[RUN]  IDW warmup (1k iters, 64k points, no densification)")
+    print(f"[RUN]  IDW warmup ({warmup_iters} iters, 64k points, no densification)")
     result = subprocess.run(cmd, cwd=os.path.dirname(os.path.abspath(__file__)))
     if result.returncode != 0:
         print(f"[FAIL] IDW warmup exited with code {result.returncode}")
