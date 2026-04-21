@@ -136,6 +136,15 @@ class OptimizationParams(ParamGroup):
         self.var_sigma_v_init = 0.2        # bilateral sigma at start (large = plain smoothing)
         self.var_sigma_v_final = 0.2       # bilateral sigma at end (small = edge-preserving)
         self.density_grad_clip = 1.0
+        self.ref_volume_path = ""           # path to .npy or .pt reference volume (empty = off)
+        self.ref_volume_weight = 0.0        # L2 loss weight (0 = disabled)
+        self.ref_volume_weight_final = -1.0 # weight at interpolation_start (-1 = hold weight)
+        self.ref_volume_start = 0           # activation step
+        self.ref_volume_until = -1          # deactivation step (-1 = never)
+        self.ref_volume_resolution = 64     # voxel grid resolution for loss computation
+        self.ref_volume_blur_sigma = 2.0    # Gaussian blur applied to reference (in source voxels)
+        self.ref_volume_edge_mask = False   # weight loss by inverse gradient magnitude
+        self.ref_volume_edge_alpha = 10.0   # edge mask sensitivity: 1/(1+alpha*|∇ref|)
         self.gaussian_start = -1
         self.freeze_base_at_gaussian = False
         self.joint_finetune_start = -1

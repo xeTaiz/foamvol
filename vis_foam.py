@@ -1157,3 +1157,67 @@ def log_density_histogram(model, writer, step):
         ax.set_xlim(-10, 10)
         writer.add_figure("diagnostics/density_histogram", fig, step)
         plt.close(fig)
+
+
+def log_volume_slices(model, writer, gt_volume, step, experiment_name):
+    """Log slices of the stored reference/init volume, edge weight map, and GT.
+
+    Reads model._ref_volume (R,R,R) and optionally model._ref_weight (R,R,R).
+    Intended to be called at step 0 to inspect the init/reference density prior
+    and verify which regions are strongly vs. weakly regularized.
+    """
+    if not hasattr(model, "_ref_volume") or model._ref_volume is None:
+        return
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ref_np = model._ref_volume.cpu().numpy()   # (R, R, R)
+    has_gt = gt_volume is not None
+    has_weight = getattr(model, "_ref_weight", None) is not None
+    weight_np = model._ref_weight.cpu().numpy() if has_weight else None
+
+    axes = [0, 1, 2]
+    positions = [-0.2, 0.0, 0.2]
+    axis_names = ["X", "Y", "Z"]
+    n_cols = len(axes) * len(positions)        # 9
+    row_labels = ["ref/init vol"]
+    if has_weight:
+        row_labels.append("reg weight")
+    if has_gt:
+        row_labels.append("GT vol")
+    n_rows = len(row_labels)
+
+    fig, axs = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2, n_rows * 2))
+    if n_rows == 1:
+        axs = axs[None, :]
+
+    for col, (a, c) in enumerate((a, c) for a in axes for c in positions):
+        row = 0
+        axs[row, col].set_title(f"{axis_names[a]}={c:.1f}", fontsize=7)
+
+        ref_sl = sample_gt_slice(ref_np, a, c, ref_np.shape[0], 1.0)
+        axs[row, col].imshow(ref_sl.T, origin="lower", cmap="gray", vmin=0, vmax=1.0)
+        axs[row, col].axis("off")
+        row += 1
+
+        if has_weight:
+            w_sl = sample_gt_slice(weight_np, a, c, weight_np.shape[0], 1.0)
+            # viridis: yellow=high weight (strongly regularized), purple=low (free)
+            axs[row, col].imshow(w_sl.T, origin="lower", cmap="viridis", vmin=0, vmax=1.0)
+            axs[row, col].axis("off")
+            row += 1
+
+        if has_gt:
+            gt_sl = sample_gt_slice(gt_volume, a, c, gt_volume.shape[0], 1.0)
+            if gt_sl is not None:
+                axs[row, col].imshow(gt_sl.T, origin="lower", cmap="gray", vmin=0, vmax=1.0)
+            axs[row, col].axis("off")
+
+    for row, label in enumerate(row_labels):
+        axs[row, 0].set_ylabel(label, fontsize=8)
+
+    fig.suptitle(f"Reference volume slices (step {step})", fontsize=9)
+    fig.tight_layout()
+    writer.add_figure(f"ref_vol_slices/{experiment_name}", fig, global_step=step)
+    plt.close(fig)
