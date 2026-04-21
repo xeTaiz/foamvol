@@ -31,7 +31,7 @@ from collections import OrderedDict
 import yaml
 
 SWEEP_DIR = "output/sweep27_wdecay"
-DATA_PATH = "/mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone"
+DATA_PATH = "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone"
 
 
 def base_config(**overrides):

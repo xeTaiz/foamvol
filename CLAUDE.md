@@ -30,7 +30,7 @@ micromamba run -n radfoam python train.py -c configs/r2_1m.yaml --experiment_nam
 micromamba run -n radfoam python train_all.py -c configs/r2_1m.yaml --name my_run
 micromamba run -n radfoam python train_all.py -c configs/r2_1m.yaml --name my_run --worker 1 --of 4
 micromamba run -n radfoam python train_all.py --name my_run --summarize
-micromamba run -n radfoam python train_all.py --list --data-root /mnt/hdd/r2_data
+micromamba run -n radfoam python train_all.py --list --data-root r2_data
 ```
 
 **Evaluate / benchmark:**
