@@ -161,7 +161,7 @@ class DatasetParams(ParamGroup):
 
     def __init__(self, parser):
         self.dataset = "r2_gaussian"
-        self.data_path = "/mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone"
+        self.data_path = "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone"
         self.scene = "sphere"
         self.num_angles = 180
         self.detector_size = 128

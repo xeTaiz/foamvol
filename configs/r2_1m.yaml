@@ -13,7 +13,7 @@ debug: False
 viewer: False
 save_volume: False
 dataset: r2_gaussian
-data_path: /mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone
+data_path: r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone
 
 # Optimization
 loss_type: l1
