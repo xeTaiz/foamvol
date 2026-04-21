@@ -22,6 +22,7 @@ from scipy.spatial import KDTree
 from data_loader import DataHandler
 from configs import *
 from radfoam_model.scene import CTScene
+from radfoam_model.utils import gauss_conv3d_separable as _gauss_conv3d_separable
 from visualize_volume import visualize
 from vis_foam import (load_density_field, field_from_model, query_density,
                       sample_idw, sample_idw_diagnostic,
@@ -30,7 +31,8 @@ from vis_foam import (load_density_field, field_from_model, query_density,
                       compute_voronoi_edges, visualize_cell_heatmap,
                       visualize_slices, load_gt_volume, load_r2_volume,
                       sample_gt_slice, render_volume_drr,
-                      voxelize_volumes, log_density_histogram)
+                      voxelize_volumes, log_density_histogram,
+                      log_volume_slices)
 import radfoam
 
 
@@ -180,17 +182,6 @@ def sobel_filter_3d(vol):
     gz = F.conv3d(v, kz)
     return torch.log1p(1.0 * torch.sqrt(gx**2 + gy**2 + gz**2)).clamp(0, 1).squeeze()
 
-
-def _gauss_conv3d_separable(x, gauss_1d, pad):
-    """Apply separable 3D Gaussian smoothing using three 1D conv3d passes."""
-    ws = gauss_1d.shape[0]
-    kx = gauss_1d.reshape(1, 1, ws, 1, 1)
-    ky = gauss_1d.reshape(1, 1, 1, ws, 1)
-    kz = gauss_1d.reshape(1, 1, 1, 1, ws)
-    x = F.conv3d(x, kx, padding=(pad, 0, 0))
-    x = F.conv3d(x, ky, padding=(0, pad, 0))
-    x = F.conv3d(x, kz, padding=(0, 0, pad))
-    return x
 
 
 @torch.no_grad()
@@ -395,7 +386,22 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     # Initialize densities from a pre-computed volume (e.g. FDK reconstruction)
     init_volume_path = getattr(model_args, "init_volume_path", "")
     if init_volume_path:
-        model.initialize_from_volume(init_volume_path)
+        model.initialize_from_volume(
+            init_volume_path,
+            ref_resolution=getattr(optimizer_args, "ref_volume_resolution", 64),
+            ref_blur_sigma=getattr(optimizer_args, "ref_volume_blur_sigma", 2.0),
+        )
+
+    # Load reference volume for 3D regularization loss (can be same as init volume or different)
+    ref_volume_path = getattr(optimizer_args, "ref_volume_path", "")
+    if ref_volume_path:
+        model.load_reference_volume(
+            ref_volume_path,
+            resolution=getattr(optimizer_args, "ref_volume_resolution", 64),
+            blur_sigma=getattr(optimizer_args, "ref_volume_blur_sigma", 2.0),
+            edge_mask=getattr(optimizer_args, "ref_volume_edge_mask", False),
+            edge_alpha=getattr(optimizer_args, "ref_volume_edge_alpha", 10.0),
+        )
 
     # Setting up optimizer
     model.declare_optimizer(
@@ -832,6 +838,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         if not pipeline_args.debug:
             test_m, _ = log_basic(0)
             log_diag(0, test_images=test_m)
+            log_volume_slices(model, writer, gt_volume, 0, experiment_name)
 
         _loss_cpu = None
         with tqdm.trange(pipeline_args.iterations) as train:
@@ -907,6 +914,23 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         hops=optimizer_args.neighbor_var_hops,
                     )
                     loss = loss + nvar_w * neighbor_var_loss
+
+                rv_w_cfg = getattr(optimizer_args, "ref_volume_weight", 0.0)
+                rv_start = getattr(optimizer_args, "ref_volume_start", 0)
+                rv_until = getattr(optimizer_args, "ref_volume_until", -1)
+                if (rv_w_cfg > 0
+                        and hasattr(model, "_ref_volume")
+                        and i >= rv_start
+                        and (rv_until < 0 or i < rv_until)):
+                    rv_w_final_cfg = getattr(optimizer_args, "ref_volume_weight_final", -1.0)
+                    if rv_w_final_cfg >= 0:
+                        rv_w = rv_w_cfg * (1.0 - _w_t) + rv_w_final_cfg * _w_t
+                    else:
+                        rv_w = rv_w_cfg
+                    ref_vol_loss = model.reference_volume_loss(
+                        resolution=getattr(optimizer_args, "ref_volume_resolution", 64),
+                    )
+                    loss = loss + rv_w * ref_vol_loss
 
                 model.optimizer.zero_grad(set_to_none=True)
 
@@ -990,6 +1014,13 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     if optimizer_args.neighbor_var_weight > 0 and i >= optimizer_args.neighbor_var_start:
                         writer.add_scalar("train/neighbor_var_loss", neighbor_var_loss.item(), i)
                         writer.add_scalar("train/neighbor_var_weight", nvar_w, i)
+                    _rv_until = getattr(optimizer_args, "ref_volume_until", -1)
+                    if (getattr(optimizer_args, "ref_volume_weight", 0.0) > 0
+                            and hasattr(model, "_ref_volume")
+                            and i >= getattr(optimizer_args, "ref_volume_start", 0)
+                            and (_rv_until < 0 or i < _rv_until)):
+                        writer.add_scalar("train/ref_vol_loss", ref_vol_loss.item(), i)
+                        writer.add_scalar("train/ref_vol_weight", rv_w, i)
                     _last_test_m, _ = log_basic(i, loss_val=loss.item(), tv_loss_val=tv_loss_val,
                                                 tv_scale_val=tv_scale_val)
 

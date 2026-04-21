@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 def inverse_softplus(x, beta, scale=1):
@@ -81,3 +82,27 @@ def get_cosine_lr_func(
         return lr_cos
 
     return helper
+
+
+def gauss_conv3d_separable(x, gauss_1d, pad):
+    """Apply separable 3D Gaussian smoothing via three 1D conv3d passes.
+
+    Uses replicate boundary padding to avoid darkening at volume borders.
+
+    Args:
+        x: (1, 1, D, H, W) float tensor on any device
+        gauss_1d: (ks,) normalized 1D Gaussian kernel
+        pad: kernel half-width (ks // 2)
+
+    Returns:
+        Smoothed tensor, same shape as x.
+    """
+    ws = gauss_1d.shape[0]
+    # F.pad order for 5-D: (W_left, W_right, H_top, H_bottom, D_front, D_back)
+    kx = gauss_1d.reshape(1, 1, ws, 1, 1)   # convolves along D
+    ky = gauss_1d.reshape(1, 1, 1, ws, 1)   # convolves along H
+    kz = gauss_1d.reshape(1, 1, 1, 1, ws)   # convolves along W
+    x = F.conv3d(F.pad(x, (0, 0, 0, 0, pad, pad), mode="replicate"), kx)
+    x = F.conv3d(F.pad(x, (0, 0, pad, pad, 0, 0), mode="replicate"), ky)
+    x = F.conv3d(F.pad(x, (pad, pad, 0, 0, 0, 0), mode="replicate"), kz)
+    return x

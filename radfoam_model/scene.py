@@ -197,18 +197,42 @@ class CTScene(torch.nn.Module):
         self.density = nn.Parameter(density[perm])
 
     @torch.no_grad()
-    def initialize_from_volume(self, vol_path):
+    def initialize_from_volume(self, vol_path, ref_resolution=64, ref_blur_sigma=2.0):
         """Initialize cell densities by sampling a pre-computed volume (e.g. FDK).
 
         The volume must be a (R, R, R) float32 numpy array covering [-1, 1]^3,
         stored in (X, Y, Z) axis order (same convention as vis_foam DRR rendering).
 
         Negative values (FDK ring artifacts) are clamped to zero before inversion.
+        The volume is Gaussian-blurred before sampling to remove high-frequency noise
+        and FDK streak artifacts. A blurred+downsampled copy is also stored as the
+        reference volume for reference_volume_loss().
+
+        Args:
+            vol_path: path to .npy volume
+            ref_resolution: target resolution for the stored reference volume
+            ref_blur_sigma: Gaussian blur sigma applied before sampling (source voxels)
         """
-        import numpy as np
+        import math
         vol_np = np.load(vol_path).astype(np.float32)
-        vol_t = torch.from_numpy(vol_np).to(self.device)      # (R, R, R)
-        vol_5d = vol_t.unsqueeze(0).unsqueeze(0)               # (1, 1, R, R, R)
+        vol_5d = torch.from_numpy(vol_np).to(self.device).unsqueeze(0).unsqueeze(0)
+
+        if ref_blur_sigma > 0:
+            ks = max(3, 2 * int(math.ceil(2 * ref_blur_sigma)) + 1)
+            pad = ks // 2
+            coords = torch.arange(ks, dtype=torch.float32, device=vol_5d.device) - pad
+            gauss_1d = torch.exp(-coords ** 2 / (2 * ref_blur_sigma ** 2))
+            gauss_1d = gauss_1d / gauss_1d.sum()
+            vol_5d = gauss_conv3d_separable(vol_5d, gauss_1d, pad)
+
+        # Store blurred+downsampled reference volume
+        raw_res = vol_np.shape[0]
+        stride = max(1, raw_res // ref_resolution)
+        t_ref = F.avg_pool3d(vol_5d, kernel_size=stride, stride=stride) if stride > 1 else vol_5d
+        if t_ref.shape[-1] != ref_resolution:
+            t_ref = F.interpolate(t_ref, size=ref_resolution, mode="trilinear", align_corners=True)
+        self._ref_volume = t_ref.squeeze().detach().float()
+        self._ref_weight = None
 
         pts = self.primal_points.detach()                      # (N, 3) as (x, y, z)
         # grid_sample: grid[..., 0]→W, grid[..., 1]→H, grid[..., 2]→D
@@ -217,14 +241,220 @@ class CTScene(torch.nn.Module):
         sampled = F.grid_sample(
             vol_5d, grid, mode="bilinear", padding_mode="border", align_corners=True
         )                                                       # (1, 1, 1, 1, N)
-        fdk_mu = sampled.reshape(-1).clamp(1e-6, 1.0)            # (N,) — clamp negatives (0 → -inf via softplus_inv)
+        fdk_mu = sampled.reshape(-1).clamp(1e-6, 1.0)         # (N,) — clamp negatives
 
         raw = self.softplus_inv(fdk_mu / self.activation_scale)
         self.density.data.copy_(raw.unsqueeze(1))
 
-        print(f"[FDK init] loaded {vol_path}")
+        print(f"[FDK init] loaded {vol_path} (blur σ={ref_blur_sigma}, ref_res={ref_resolution})")
         print(f"  cells: {pts.shape[0]}  density [{fdk_mu.min():.4f}, {fdk_mu.max():.4f}]"
               f"  mean: {fdk_mu.mean():.4f}")
+
+    @torch.no_grad()
+    def load_reference_volume(self, path, resolution=64, blur_sigma=2.0,
+                              edge_mask=False, edge_alpha=10.0):
+        """Load a reference volume from a .npy or .pt file for reference_volume_loss().
+
+        The volume is Gaussian-blurred and downsampled to `resolution` before storage.
+
+        Args:
+            path: path to .npy volume or .pt model checkpoint
+            resolution: target voxel grid resolution (stored at this resolution)
+            blur_sigma: Gaussian blur sigma applied to .npy volumes (source voxels)
+            edge_mask: if True, weight loss by inverse gradient magnitude of ref
+            edge_alpha: sensitivity of edge mask — weight = 1/(1 + alpha*|∇ref|)
+        """
+        import math
+        if path.endswith(".pt"):
+            ckpt = torch.load(path, map_location="cpu")
+            pts = ckpt["xyz"].to(self.device)
+            raw = ckpt["density"].to(self.device)
+            adjacency = ckpt["adjacency"].to(self.device).to(torch.int32)
+            adjacency_offsets = ckpt["adjacency_offsets"].to(self.device).to(torch.int32)
+            mu = F.softplus(raw.squeeze(), beta=10).detach()
+
+            aabb_tree = radfoam.build_aabb_tree(pts)
+            _, cell_radius = radfoam.farthest_neighbor(pts, adjacency, adjacency_offsets)
+
+            # Sample at 128³ to avoid undersampling the Voronoi, then blur+downsample
+            idw_res = 128
+            voxel_size = 2.0 / idw_res
+            centers = torch.linspace(
+                -1 + voxel_size / 2, 1 - voxel_size / 2, idw_res,
+                device=self.device,
+            )
+            xx, yy, zz = torch.meshgrid(centers, centers, centers, indexing="ij")
+            query = torch.stack([xx.flatten(), yy.flatten(), zz.flatten()], dim=-1)
+
+            adj_off_long = adjacency_offsets.long()
+            global_max_k = int((adj_off_long[1:] - adj_off_long[:-1]).max().item())
+
+            result = torch.zeros(idw_res ** 3, device=self.device)
+            batch = 500_000
+            for start in range(0, idw_res ** 3, batch):
+                end = min(start + batch, idw_res ** 3)
+                r = idw_query(
+                    query[start:end], pts, adjacency, adjacency_offsets,
+                    aabb_tree, mu, sigma=0.7, sigma_v=None,
+                    global_max_k=global_max_k,
+                    per_cell_sigma=True,
+                    cell_radius=cell_radius,
+                )
+                result[start:end] = r.idw_result
+
+            n_cells = pts.shape[0]
+            print(f"  IDW grid: {n_cells} cells → {idw_res}³ (no gaps), then blur+downsample → {resolution}³")
+
+            t = result.reshape(1, 1, idw_res, idw_res, idw_res)
+            blur_sigma = max(blur_sigma, 1.0)  # always blur to anti-alias the downsample
+        else:
+            vol_np = np.load(path).astype(np.float32)
+            t = torch.from_numpy(vol_np).to(self.device).unsqueeze(0).unsqueeze(0)
+
+        # Shared blur + downsample for both .pt and .npy paths
+        if blur_sigma > 0:
+            ks = max(3, 2 * int(math.ceil(2 * blur_sigma)) + 1)
+            pad = ks // 2
+            coords = torch.arange(ks, dtype=torch.float32, device=t.device) - pad
+            gauss_1d = torch.exp(-coords ** 2 / (2 * blur_sigma ** 2))
+            gauss_1d = gauss_1d / gauss_1d.sum()
+            t = gauss_conv3d_separable(t, gauss_1d, pad)
+        if t.shape[2] != resolution:
+            t = F.interpolate(t, size=resolution, mode="trilinear", align_corners=True)
+        vol = t.squeeze()
+        self.set_reference_volume(vol, edge_mask=edge_mask, edge_alpha=edge_alpha)
+        print(f"[ref vol] loaded {path} → {resolution}³ grid")
+
+    def set_reference_volume(self, tensor, edge_mask=False, edge_alpha=10.0):
+        """Set a pre-computed reference volume for reference_volume_loss().
+
+        Can be called directly with a (R, R, R) tensor — useful for setting
+        an intermediate snapshot without file I/O:
+            model.set_reference_volume(model._scatter_voxelize(64)[0].detach())
+
+        Args:
+            tensor: (R, R, R) float tensor (any resolution — resampled at loss time)
+            edge_mask: if True, weight loss by inverse gradient magnitude of ref
+            edge_alpha: sensitivity of edge mask
+        """
+        self._ref_volume = tensor.detach().float()
+        if edge_mask:
+            grad_mag = self._gradient_magnitude_3d(tensor).detach()
+            self._ref_weight = 1.0 / (1.0 + edge_alpha * grad_mag)
+        else:
+            self._ref_weight = None
+
+    @staticmethod
+    def _gradient_magnitude_3d(vol):
+        """3D gradient magnitude via central differences. vol: (R,R,R) → (R,R,R)."""
+        v = vol.float().unsqueeze(0).unsqueeze(0)  # (1,1,R,R,R)
+        k = torch.tensor([-0.5, 0.0, 0.5], device=vol.device, dtype=torch.float32)
+        gx = F.conv3d(v, k.reshape(1, 1, 3, 1, 1), padding=(1, 0, 0))
+        gy = F.conv3d(v, k.reshape(1, 1, 1, 3, 1), padding=(0, 1, 0))
+        gz = F.conv3d(v, k.reshape(1, 1, 1, 1, 3), padding=(0, 0, 1))
+        return (gx ** 2 + gy ** 2 + gz ** 2).sqrt().squeeze()
+
+    def _scatter_voxelize(self, resolution=64, extent=1.0):
+        """Bin cells into a voxel grid weighted by cell area (radius²), differentiable.
+
+        Returns:
+            vol: (res, res, res) float tensor with gradient through density
+            occupied: (res, res, res) bool mask — True for voxels with ≥1 cell
+        """
+        res = resolution
+        voxel_size = 2.0 * extent / res
+        points = self.primal_points.detach()            # (N, 3), no positional grad
+        mu = self.get_primal_density().squeeze()        # (N,) grad through density
+
+        grid_coords = ((points + extent) / voxel_size).long().clamp(0, res - 1)
+        voxel_idx = (grid_coords[:, 0] * res * res
+                     + grid_coords[:, 1] * res
+                     + grid_coords[:, 2])               # (N,) int64
+
+        inside = (points.abs() <= extent).all(dim=1)
+        voxel_idx_in = voxel_idx[inside]
+        mu_in = mu[inside]
+
+        if self._cached_cell_radius is not None:
+            w_in = self._cached_cell_radius[inside].detach() ** 2
+        else:
+            w_in = torch.ones(inside.sum(), device=mu.device, dtype=mu.dtype)
+
+        num_voxels = res ** 3
+        weighted_sum = torch.zeros(num_voxels, device=mu.device, dtype=mu.dtype)
+        total_weight = torch.zeros(num_voxels, device=mu.device, dtype=mu.dtype)
+        weighted_sum.scatter_add_(0, voxel_idx_in, mu_in * w_in)
+        total_weight.scatter_add_(0, voxel_idx_in, w_in)
+
+        occupied_flat = total_weight > 0
+        safe_weight = total_weight.clamp(min=1e-10)
+        vol_flat = weighted_sum / safe_weight           # (num_voxels,), grad through weighted_sum
+
+        return vol_flat.reshape(res, res, res), occupied_flat.reshape(res, res, res)
+
+    @staticmethod
+    @torch.no_grad()
+    def _scatter_voxelize_from(points, mu_detached, resolution=64, extent=1.0):
+        """Scatter-voxelize external points+densities (no grad, uniform cell weights).
+
+        Used when loading a reference from a model.pt checkpoint where cell_radius
+        is not available without rebuilding the triangulation.
+        """
+        res = resolution
+        voxel_size = 2.0 * extent / res
+        grid_coords = ((points + extent) / voxel_size).long().clamp(0, res - 1)
+        voxel_idx = (grid_coords[:, 0] * res * res
+                     + grid_coords[:, 1] * res
+                     + grid_coords[:, 2])
+
+        inside = (points.abs() <= extent).all(dim=1)
+        voxel_idx_in = voxel_idx[inside]
+        mu_in = mu_detached[inside]
+
+        num_voxels = res ** 3
+        weighted_sum = torch.zeros(num_voxels, device=points.device, dtype=torch.float32)
+        count = torch.zeros(num_voxels, device=points.device, dtype=torch.float32)
+        weighted_sum.scatter_add_(0, voxel_idx_in, mu_in.float())
+        count.scatter_add_(0, voxel_idx_in, torch.ones(voxel_idx_in.shape[0],
+                                                        device=points.device))
+
+        safe_count = count.clamp(min=1.0)
+        return (weighted_sum / safe_count).reshape(res, res, res)
+
+    def reference_volume_loss(self, resolution=64):
+        """L2 loss between scatter-voxelized current model and the stored reference volume.
+
+        Only occupied voxels (those containing at least one cell) contribute to the loss.
+        If edge_mask was set via set_reference_volume(), the loss is weighted by
+        1/(1+alpha*|∇ref|) so high-frequency regions are regularized less strongly.
+
+        Returns:
+            scalar loss tensor with gradient through model density
+        """
+        if not hasattr(self, "_ref_volume") or self._ref_volume is None:
+            return torch.tensor(0.0, device=self.density.device)
+
+        vol, occupied = self._scatter_voxelize(resolution)  # (R,R,R), (R,R,R) bool
+
+        ref = self._ref_volume
+        if ref.shape[0] != resolution:
+            ref = F.interpolate(
+                ref.unsqueeze(0).unsqueeze(0),
+                size=resolution, mode="trilinear", align_corners=True,
+            ).squeeze()
+
+        diff = vol - ref  # (R,R,R)
+
+        if self._ref_weight is not None:
+            w = self._ref_weight
+            if w.shape[0] != resolution:
+                w = F.interpolate(
+                    w.unsqueeze(0).unsqueeze(0),
+                    size=resolution, mode="trilinear", align_corners=True,
+                ).squeeze()
+            return (w[occupied] * diff[occupied] ** 2).mean()
+
+        return diff[occupied].pow(2).mean()
 
     def permute_points(self, permutation):
         optimizable_tensors = {}
