@@ -48,14 +48,14 @@ var_sigma_v_init: 50.0
 var_sigma_v_final: 0.2
 
 # 3D reference volume loss — FDK blurred to 64^3, active from start
-ref_volume_path: "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone/traditional/fdk/ct_pred.npy"
-#ref_volume_path: "output/manual/64_init/model.pt"
+#ref_volume_path: "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone/traditional/fdk/ct_pred.npy"
+ref_volume_path: "output/manual/64_init/model.pt"
 ref_volume_weight: 1
 ref_volume_weight_final: 1e-1
 ref_volume_start: 0
 ref_volume_until: -1
 ref_volume_resolution: 64
-ref_volume_blur_sigma: 3.0
+ref_volume_blur_sigma: 0.0
 ref_volume_edge_mask: True
 ref_volume_edge_alpha: 10.0
 
@@ -74,6 +74,9 @@ redundancy_cap_init: 0.0
 redundancy_cap_final: 0.0
 prune_variance_criterion: True
 prune_hops: 1
+ref_guided_pruning: True
+ref_guided_densify: True
+ref_guided_eps: 0.01
 targeted_fraction: 0.1
 targeted_start: -1
 

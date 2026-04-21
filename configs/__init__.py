@@ -67,6 +67,9 @@ class PipelineParams(ParamGroup):
         self.redundancy_cap_final = 0.0    # adaptive cap schedule: end value
         self.prune_variance_criterion = False  # use neighborhood variance instead of IDW error
         self.prune_hops = 1                # k-hop neighborhood for variance pruning
+        self.ref_guided_pruning = False    # replace pruning score with 1-ref_w (requires ref volume)
+        self.ref_guided_densify = False    # bias gradient+IDW densification toward low ref_w regions
+        self.ref_guided_eps = 0.05         # floor on (1-ref_w) densify multiplier
         self.rays_per_batch = 2_000_000
         self.bf_start = -1            # iteration to start (-1 = disabled)
         self.bf_until = 6000          # iteration to stop

@@ -1086,6 +1086,9 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         sigma_v=pipeline_args.interp_sigma_v,
                         variance_pruning=pipeline_args.prune_variance_criterion,
                         prune_hops=pipeline_args.prune_hops,
+                        ref_guided_pruning=getattr(pipeline_args, 'ref_guided_pruning', False),
+                        ref_guided_densify=getattr(pipeline_args, 'ref_guided_densify', False),
+                        ref_guided_eps=getattr(pipeline_args, 'ref_guided_eps', 0.05),
                     )
 
                     if not pipeline_args.debug and densify_stats is not None:

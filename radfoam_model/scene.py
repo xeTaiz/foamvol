@@ -336,13 +336,33 @@ class CTScene(torch.nn.Module):
             tensor: (R, R, R) float tensor (any resolution — resampled at loss time)
             edge_mask: if True, weight loss by inverse gradient magnitude of ref
             edge_alpha: sensitivity of edge mask
+
+        Note: _ref_weight is always computed regardless of edge_mask so it can be
+        used for ref-guided pruning/densification. edge_mask only controls whether
+        it is applied inside reference_volume_loss().
         """
         self._ref_volume = tensor.detach().float()
-        if edge_mask:
-            grad_mag = self._gradient_magnitude_3d(tensor).detach()
-            self._ref_weight = 1.0 / (1.0 + edge_alpha * grad_mag)
-        else:
-            self._ref_weight = None
+        grad_mag = self._gradient_magnitude_3d(tensor).detach()
+        self._ref_weight = 1.0 / (1.0 + edge_alpha * grad_mag)
+        self._ref_weight_in_loss = bool(edge_mask)
+
+    def _sample_ref_weight_at_points(self):
+        """Sample _ref_weight at current primal_point positions via grid_sample.
+
+        Returns (N,) tensor in [0,1]: high = smooth/homogeneous region, low = edge region.
+        Returns None if _ref_weight is not set.
+        Points outside [-1,1]³ return 0 (unknown region — no pruning bias, no densify suppression).
+        """
+        if getattr(self, '_ref_weight', None) is None:
+            return None
+        points = self.primal_points.detach()
+        vol = self._ref_weight.unsqueeze(0).unsqueeze(0)              # (1,1,R,R,R)
+        grid = points.flip(-1).reshape(1, 1, 1, -1, 3)                # ZYX flip — volume stored (X,Y,Z)=(D,H,W)
+        sampled = F.grid_sample(
+            vol, grid, mode='bilinear',
+            padding_mode='zeros', align_corners=True,
+        )
+        return sampled.reshape(-1)                                     # (N,) in [0,1]
 
     @staticmethod
     def _gradient_magnitude_3d(vol):
@@ -445,7 +465,7 @@ class CTScene(torch.nn.Module):
 
         diff = vol - ref  # (R,R,R)
 
-        if self._ref_weight is not None:
+        if getattr(self, '_ref_weight_in_loss', False) and getattr(self, '_ref_weight', None) is not None:
             w = self._ref_weight
             if w.shape[0] != resolution:
                 w = F.interpolate(
@@ -1303,10 +1323,14 @@ class CTScene(torch.nn.Module):
         redundancy_threshold=0.0, redundancy_cap=0.0,
         sigma_scale=0.5, sigma_v=0.1,
         variance_pruning=False, prune_hops=1,
+        ref_guided_pruning=False, ref_guided_densify=False, ref_guided_eps=0.05,
     ):
         with torch.no_grad():
             num_curr_points = self.primal_points.shape[0]
             num_new_points = int((upsample_factor - 1) * num_curr_points)
+
+            # Sample reference weight at all cell positions once, before any pruning/densify
+            ref_w = self._sample_ref_weight_at_points() if (ref_guided_pruning or ref_guided_densify) else None
 
             primal_error_accum = point_error.clip(min=0).squeeze()
             points, _, point_adjacency, point_adjacency_offsets, *_ = (
@@ -1342,6 +1366,13 @@ class CTScene(torch.nn.Module):
             cell_error = self.compute_redundancy_error(cell_radius, sigma_scale, sigma_v)
             idw_weight = (cell_error[src] + cell_error[tgt]) * edge_length
 
+            # Ref-guided densification multiplier: suppress smooth regions, amplify edges
+            if ref_guided_densify and ref_w is not None:
+                ref_factor = (1.0 - ref_w).clamp(min=ref_guided_eps)  # (N,) with floor
+                idw_weight = idw_weight * 0.5 * (ref_factor[src] + ref_factor[tgt])
+            else:
+                ref_factor = None
+
             # Per-cell neighbor entropy
             cell_entropy = self.compute_neighbor_entropy(n_bins=entropy_bins)
 
@@ -1359,6 +1390,9 @@ class CTScene(torch.nn.Module):
             n_added_idw = 0
             n_added_entropy = 0
             n_filtered_dupes = 0
+            mean_ref_w_pruned = None
+            mean_ref_w_gradient = None
+            mean_ref_w_idw = None
             n_basic_pruned = prune_mask.sum().item()
             if n_basic_pruned > 0:
                 print(f"Pruning {n_basic_pruned}/{num_curr_points} cells "
@@ -1366,7 +1400,15 @@ class CTScene(torch.nn.Module):
 
             ################ Redundancy pruning ################
             if redundancy_cap > 0:
-                if variance_pruning:
+                if ref_guided_pruning and ref_w is not None:
+                    # Ref-guided criterion: smooth cells (high ref_w) score low → pruned first.
+                    # Replaces noisy variance/IDW estimate with stable reference volume signal.
+                    cell_score = 1.0 - ref_w
+                    candidates = ~prune_mask
+                    if hasattr(self, '_frozen_mask'):
+                        candidates = candidates & ~self._frozen_mask
+                    prune_label = "ref_weight"
+                elif variance_pruning:
                     # Variance-based criterion: score = neighborhood_var × clamped_radius
                     # All non-pruned cells are candidates (no threshold); purely cap-based.
                     cell_score = self.compute_neighborhood_variance(
@@ -1411,6 +1453,8 @@ class CTScene(torch.nn.Module):
                         print(f"Redundancy prune ({prune_label}): "
                               f"{n_redundant}/{num_curr_points} cells")
                         prune_mask = prune_mask | removable
+                        if ref_w is not None and removable.any():
+                            mean_ref_w_pruned = ref_w[removable].mean().item()
 
             ######################## Sampling ########################
             perturbation = 0.25 * (points[farthest_neighbor] - points)
@@ -1500,11 +1544,16 @@ class CTScene(torch.nn.Module):
 
             # --- Gradient-based sampling (position error × cell radius) ---
             if num_gradient_points > 0:
+                grad_weight = primal_error_accum * cell_radius
+                if ref_factor is not None:
+                    grad_weight = grad_weight * ref_factor
                 grad_inds = torch.multinomial(
-                    primal_error_accum * cell_radius,
+                    grad_weight,
                     num_gradient_points,
                     replacement=False,
                 )
+                if ref_w is not None:
+                    mean_ref_w_gradient = ref_w[grad_inds].mean().item()
                 sampled_points_list.append((points + perturbation)[grad_inds])
                 sampled_inds_list.append(grad_inds)
                 sampled_density_list.append(self.density[grad_inds])
@@ -1515,6 +1564,9 @@ class CTScene(torch.nn.Module):
 
             # --- IDW-based sampling (bilateral prediction error × edge length) ---
             if num_idw_points > 0:
+                if ref_w is not None and ref_factor is not None:
+                    edge_ref = 0.5 * (ref_factor[src] + ref_factor[tgt])
+                    mean_ref_w_idw = (1.0 - edge_ref).mean().item()
                 n_added_idw += _sample_edges(idw_weight, num_idw_points, "idw")
 
             # --- Entropy-based sampling (neighbor density entropy × cell radius) ---
@@ -1608,7 +1660,7 @@ class CTScene(torch.nn.Module):
             self.densification_postfix(new_params)
             self.prune_points(prune_mask)
 
-            return {
+            stats = {
                 "points_before": num_curr_points,
                 "pruned_low_contrib": n_pruned_low_contrib,
                 "pruned_tiny_radius": n_pruned_tiny_radius,
@@ -1620,6 +1672,13 @@ class CTScene(torch.nn.Module):
                 "filtered_duplicates": n_filtered_dupes,
                 "points_after": self.primal_points.shape[0],
             }
+            if mean_ref_w_pruned is not None:
+                stats["ref_w_pruned"] = mean_ref_w_pruned
+            if mean_ref_w_gradient is not None:
+                stats["ref_w_gradient"] = mean_ref_w_gradient
+            if mean_ref_w_idw is not None:
+                stats["ref_w_idw"] = mean_ref_w_idw
+            return stats
 
     def prune_only(self, data_handler):
         """Standalone prune pass: remove cells with negligible contribution or tiny radius."""
