@@ -34,8 +34,8 @@ import yaml
 SWEEP_DIR = "output/sweep26_push"
 
 DATASETS = OrderedDict([
-    ("chest",  "/mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone"),
-    ("pepper", "/mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone"),
+    ("chest",  "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone"),
+    ("pepper", "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone"),
 ])
 
 

@@ -26,7 +26,7 @@ import sys
 import yaml
 
 SWEEP_DIR = "output/sweep28_refvol"
-DATA_PATH = "/mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone"
+DATA_PATH = "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone"
 FDK_PATH  = f"{DATA_PATH}/traditional/fdk/ct_pred.npy"
 IDW_CKPT  = f"{SWEEP_DIR}/_warmup/model.pt"
 

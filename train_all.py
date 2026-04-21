@@ -17,7 +17,7 @@ Usage:
     python train_all.py -c configs/r2fast.yaml --name myrun
     python train_all.py -c configs/r2fast.yaml --name myrun --worker 1 --of 4
     python train_all.py --name myrun --summarize
-    python train_all.py --list --data-root /mnt/hdd/r2_data
+    python train_all.py --list --data-root r2_data
     python train_all.py -c configs/r2.yaml --name run75 --data-root .../synthetic_dataset --filter ntrain_75
 """
 
@@ -29,7 +29,7 @@ import re
 import subprocess
 import sys
 
-DATA_ROOT = "/mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360"
+DATA_ROOT = "r2_data/synthetic_dataset/cone_ntrain_75_angle_360"
 
 
 def discover_datasets(data_roots):
@@ -155,7 +155,7 @@ def main():
                "  python train_all.py -c configs/r2fast.yaml --name myrun\n"
                "  python train_all.py -c configs/r2fast.yaml --name myrun --worker 1 --of 4\n"
                "  python train_all.py --name myrun --summarize\n"
-               "  python train_all.py --list --data-root /mnt/hdd/r2_data\n"
+               "  python train_all.py --list --data-root r2_data\n"
                "  python train_all.py -c configs/r2.yaml --name run75 --data-root .../synthetic_dataset --filter ntrain_75\n"
                "  python train_all.py --list --data-root .../synthetic .../real --filter ntrain_50 ntrain_75\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
