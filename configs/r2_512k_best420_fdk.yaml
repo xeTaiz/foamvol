@@ -10,14 +10,14 @@ activation_scale: 1.0
 init_scale: 1.05
 init_type: random
 init_density: 2.0
-#init_volume_path: "/mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone/traditional/fdk/ct_pred.npy"
+#init_volume_path: "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone/traditional/fdk/ct_pred.npy"
 init_volume_path: ""
 device: cuda
 debug: False
 viewer: False
 save_volume: False
 dataset: r2_gaussian
-data_path: /mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone
+data_path: r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone
 
 # Optimization
 loss_type: l1
@@ -48,14 +48,14 @@ var_sigma_v_init: 50.0
 var_sigma_v_final: 0.2
 
 # 3D reference volume loss — FDK blurred to 64^3, active from start
-ref_volume_path: "/mnt/hdd/r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone/traditional/fdk/ct_pred.npy"
+ref_volume_path: "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone/traditional/fdk/ct_pred.npy"
 #ref_volume_path: "output/manual/64_init/model.pt"
 ref_volume_weight: 1
 ref_volume_weight_final: 1e-1
 ref_volume_start: 0
 ref_volume_until: -1
 ref_volume_resolution: 64
-ref_volume_blur_sigma: 2.0
+ref_volume_blur_sigma: 3.0
 ref_volume_edge_mask: True
 ref_volume_edge_alpha: 10.0
 
