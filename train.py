@@ -23,6 +23,7 @@ from data_loader import DataHandler
 from configs import *
 from radfoam_model.scene import CTScene
 from radfoam_model.mesh import surface_metrics_vs_gt_volume
+from radfoam_model.scene import idw_query
 from radfoam_model.utils import gauss_conv3d_separable as _gauss_conv3d_separable
 from visualize_volume import visualize
 from vis_foam import (load_density_field, field_from_model, query_density,
@@ -1377,32 +1378,65 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 f.write(f"Vol Raw F1 2v: {raw_surf['f1_2v']:.4f}\n")
                 f.write(f"Vol IDW F1 2v: {idw_surf['f1_2v']:.4f}\n")
 
-            # Direct Voronoi mesh surface metrics (no voxelization, world coords)
+            # Direct Voronoi mesh surface metrics (no voxelization, voxel units)
             print("Computing direct Voronoi surface metrics...")
-            voronoi_surf = surface_metrics_vs_gt_volume(
-                model.primal_points.detach(),
-                model.get_primal_density().detach().squeeze(-1),
-                model.triangulation.tets(),
-                gt_volume,
-            )
-            # Distances are in world coords [-1,1]^3; F1 thresholds are
-            # 1v/2v equivalents (1 voxel = 2/(R-1) world units for R=256).
-            print(f"Mesh Direct CD: {voronoi_surf['chamfer']:.4f}v, "
-                  f"HD95: {voronoi_surf['hausdorff_95']:.4f}v, "
-                  f"F1@1v: {voronoi_surf['f1_1v']:.4f}, F1@2v: {voronoi_surf['f1_2v']:.4f}")
+            _pts = model.primal_points.detach()
+            _mu  = model.get_primal_density().detach().squeeze(-1)
+            _adj, _adj_off = model.point_adjacency, model.point_adjacency_offsets
+            _tree = model.aabb_tree
+            _sigma_v = pipeline_args.interp_sigma_v
+            if pipeline_args.per_cell_sigma:
+                _sigma_mesh = pipeline_args.interp_sigma_scale
+                _cr = cell_radius
+            else:
+                _sigma_mesh = interp_sigma
+                _cr = None
+            @torch.no_grad()
+            def _mesh_idw_fn(q,
+                             pts=_pts, mu=_mu, adj=_adj, adj_off=_adj_off,
+                             tree=_tree, sigma=_sigma_mesh, sigma_v=_sigma_v,
+                             per_cell=pipeline_args.per_cell_sigma,
+                             per_nb=pipeline_args.per_neighbor_sigma, cr=_cr):
+                return idw_query(q, pts, adj, adj_off, tree, mu,
+                                 sigma=sigma, sigma_v=sigma_v,
+                                 per_cell_sigma=per_cell,
+                                 per_neighbor_sigma=per_nb,
+                                 cell_radius=cr).idw_result
 
-            writer.add_scalar("test/mesh_direct_chamfer", voronoi_surf["chamfer"], iters)
-            writer.add_scalar("test/mesh_direct_hausdorff", voronoi_surf["hausdorff"], iters)
-            writer.add_scalar("test/mesh_direct_hausdorff_95", voronoi_surf["hausdorff_95"], iters)
-            writer.add_scalar("test/mesh_direct_f1_1v", voronoi_surf["f1_1v"], iters)
-            writer.add_scalar("test/mesh_direct_f1_2v", voronoi_surf["f1_2v"], iters)
+            _tets = model.triangulation.tets()
+            mesh_raw_surf = surface_metrics_vs_gt_volume(_pts, _mu, _tets, gt_volume)
+            mesh_idw_surf = surface_metrics_vs_gt_volume(_pts, _mu, _tets, gt_volume,
+                                                         density_fn=_mesh_idw_fn)
+
+            print(f"Mesh Raw  CD: {mesh_raw_surf['chamfer']:.4f}v, "
+                  f"HD95: {mesh_raw_surf['hausdorff_95']:.4f}v, "
+                  f"F1@1v: {mesh_raw_surf['f1_1v']:.4f}, F1@2v: {mesh_raw_surf['f1_2v']:.4f}")
+            print(f"Mesh IDW  CD: {mesh_idw_surf['chamfer']:.4f}v, "
+                  f"HD95: {mesh_idw_surf['hausdorff_95']:.4f}v, "
+                  f"F1@1v: {mesh_idw_surf['f1_1v']:.4f}, F1@2v: {mesh_idw_surf['f1_2v']:.4f}")
+
+            writer.add_scalar("test/mesh_raw_chamfer", mesh_raw_surf["chamfer"], iters)
+            writer.add_scalar("test/mesh_raw_hausdorff", mesh_raw_surf["hausdorff"], iters)
+            writer.add_scalar("test/mesh_raw_hausdorff_95", mesh_raw_surf["hausdorff_95"], iters)
+            writer.add_scalar("test/mesh_raw_f1_1v", mesh_raw_surf["f1_1v"], iters)
+            writer.add_scalar("test/mesh_raw_f1_2v", mesh_raw_surf["f1_2v"], iters)
+            writer.add_scalar("test/mesh_idw_chamfer", mesh_idw_surf["chamfer"], iters)
+            writer.add_scalar("test/mesh_idw_hausdorff", mesh_idw_surf["hausdorff"], iters)
+            writer.add_scalar("test/mesh_idw_hausdorff_95", mesh_idw_surf["hausdorff_95"], iters)
+            writer.add_scalar("test/mesh_idw_f1_1v", mesh_idw_surf["f1_1v"], iters)
+            writer.add_scalar("test/mesh_idw_f1_2v", mesh_idw_surf["f1_2v"], iters)
 
             with open(f"{out_dir}/metrics.txt", "a") as f:
-                f.write(f"Mesh Direct CD: {voronoi_surf['chamfer']:.4f}\n")
-                f.write(f"Mesh Direct Hausdorff: {voronoi_surf['hausdorff']:.4f}\n")
-                f.write(f"Mesh Direct Hausdorff 95: {voronoi_surf['hausdorff_95']:.4f}\n")
-                f.write(f"Mesh Direct F1 1v: {voronoi_surf['f1_1v']:.4f}\n")
-                f.write(f"Mesh Direct F1 2v: {voronoi_surf['f1_2v']:.4f}\n")
+                f.write(f"Mesh Raw CD: {mesh_raw_surf['chamfer']:.4f}\n")
+                f.write(f"Mesh Raw Hausdorff: {mesh_raw_surf['hausdorff']:.4f}\n")
+                f.write(f"Mesh Raw Hausdorff 95: {mesh_raw_surf['hausdorff_95']:.4f}\n")
+                f.write(f"Mesh Raw F1 1v: {mesh_raw_surf['f1_1v']:.4f}\n")
+                f.write(f"Mesh Raw F1 2v: {mesh_raw_surf['f1_2v']:.4f}\n")
+                f.write(f"Mesh IDW CD: {mesh_idw_surf['chamfer']:.4f}\n")
+                f.write(f"Mesh IDW Hausdorff: {mesh_idw_surf['hausdorff']:.4f}\n")
+                f.write(f"Mesh IDW Hausdorff 95: {mesh_idw_surf['hausdorff_95']:.4f}\n")
+                f.write(f"Mesh IDW F1 1v: {mesh_idw_surf['f1_1v']:.4f}\n")
+                f.write(f"Mesh IDW F1 2v: {mesh_idw_surf['f1_2v']:.4f}\n")
 
             # R2-Gaussian volume metrics
             if r2_volume is not None:
