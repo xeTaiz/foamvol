@@ -65,13 +65,19 @@ tv_border: False
 tv_anneal: False
 tv_on_raw: True
 voxel_var_weight: 1e-3
+voxel_var_weight_final: -1.0
 voxel_var_resolution: 64
 voxel_var_start: 0
+voxel_var_supersample: 1
 neighbor_var_weight: 0.0
+neighbor_var_weight_final: -1.0
 neighbor_var_hops: 1
 neighbor_var_start: 0
+neighbor_reg_type: bilateral_var
+neighbor_huber_delta: 0.1
 var_sigma_v_init: 0.2
 var_sigma_v_final: 0.2
+grad_smooth_hops: 0
 
 # Sampling
 high_error_fraction: 0.2
