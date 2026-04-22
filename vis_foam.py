@@ -664,7 +664,8 @@ def load_gt_volume(data_path, dataset_type, dataset_args=None):
     elif dataset_type in ("more", "aapm_mayo"):
         # GT is the input volume itself (we forward-projected from it).
         # Reconstruct a 256³ volume from the source slices for evaluation.
-        import os, glob, cv2
+        import os, glob
+        from torchvision.io import read_image, ImageReadMode
         from skimage.transform import resize as sk_resize
 
         G = 256
@@ -683,7 +684,7 @@ def load_gt_volume(data_path, dataset_type, dataset_args=None):
                 return None
             patient_id = patients[sample_index]
             files = sorted(glob.glob(os.path.join(split_dir, f"{patient_id}_*.png")))
-            slices = [cv2.imread(f, cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0
+            slices = [read_image(f, mode=ImageReadMode.GRAY).squeeze().numpy().astype(np.float32) / 255.0
                       for f in files]
         else:  # aapm_mayo npy layout
             npy_dir = os.path.join(data_path, split)
