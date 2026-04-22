@@ -1,0 +1,47 @@
+# MORE multi-organ CT dataset — 3D stacked fan-beam reconstruction
+# Loads one patient study (sample_index) from /mnt/hdd/more/{split}/
+# and simulates 1000 fan-beam projections via ASTRA for 3D reconstruction.
+
+# Dataset
+dataset: more
+data_path: /mnt/hdd/more
+sample_index: 0        # patient index within the split directory (0-based)
+# split_override: test # uncomment to use test split
+
+# Model — larger point count for 3D volume (similar to r2_gaussian)
+init_points: 32000
+final_points: 512000
+init_scale: 1.05
+init_density: 0.0
+
+# Training schedule
+iterations: 10000
+densify_from: 1000
+densify_until: 6000
+densify_factor: 1.15
+interpolation_start: 9000
+interp_sigma_scale: 0.7
+interp_sigma_v: 0.35
+per_cell_sigma: true
+freeze_points: 9500
+
+# rays_per_batch: N_angles(1000) × N_slices(varies) × N_det(736) can be huge.
+# Use a fraction; DataHandler shuffles uniformly across all rays.
+rays_per_batch: 1000000
+
+# Regularization
+tv_weight: 1e-4
+tv_start: 5000
+neighbor_var_weight: 1e-3
+neighbor_var_start: 1000
+neighbor_var_hops: 1
+
+# Ray sampling — high-error enabled (det_h = N_slices > 1)
+high_error_fraction: 0.2
+targeted_fraction: 0.0
+
+# Learning rates
+density_lr_init: 0.05
+density_lr_final: 0.001
+points_lr_init: 0.0002
+points_lr_final: 0.000005

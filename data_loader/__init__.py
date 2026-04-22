@@ -11,6 +11,8 @@ from .ct_synthetic import CTSyntheticDataset
 from .r2_gaussian import R2GaussianDataset
 from .lodopab import LoDoPaBDataset
 from .two_detectct import TwoDeteCTDataset
+from .more import MOREDataset
+from .aapm_mayo import AAPMMayoDataset
 from .targeted_sampler import build_targeted_batch
 
 
@@ -59,6 +61,8 @@ dataset_dict = {
     "r2_gaussian": R2GaussianDataset,
     "lodopab": LoDoPaBDataset,
     "two_detectct": TwoDeteCTDataset,
+    "more": MOREDataset,
+    "aapm_mayo": AAPMMayoDataset,
 }
 
 
