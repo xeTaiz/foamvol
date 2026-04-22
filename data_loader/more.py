@@ -27,7 +27,6 @@ import glob
 import warnings
 from collections import defaultdict
 
-import astra
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -148,6 +147,7 @@ def _resize_volume(vol, target_size):
 
 def _astra_fanflat_sino(volume_slice, vol_geom, proj_geom):
     """2D fan-flat ASTRA forward projection. Returns (N_angles, N_det)."""
+    import astra
     vid = astra.data2d.create("-vol", vol_geom, volume_slice)
     sid = astra.data2d.create("-sino", proj_geom)
     cfg = astra.astra_dict("FP_CUDA")
@@ -204,6 +204,7 @@ class MOREDataset:
 
     def __init__(self, data_dir, split="train", sample_index=0,
                  num_angles=None, detector_size=None, **kwargs):
+        import astra
         layout, location, default_thickness = _detect_layout(data_dir, split)
 
         if layout == "png":
