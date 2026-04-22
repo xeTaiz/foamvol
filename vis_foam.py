@@ -1337,3 +1337,110 @@ def log_volume_slices(model, writer, gt_volume, step, experiment_name):
     fig.tight_layout()
     writer.add_figure(f"ref_vol_slices/{experiment_name}", fig, global_step=step)
     plt.close(fig)
+
+
+def visualize_cells_vs_gradient(points, gt_volume, extent=1.0, n_bins=32,
+                                count_res=64, writer_fn=None):
+    """Plot mean cells-per-voxel vs. GT gradient magnitude (binned).
+
+    Confirms the Voronoi representation concentrates cells at structure
+    boundaries. Also returns Spearman ρ between per-voxel cell count and
+    gradient magnitude.
+
+    The GT gradient is computed at full resolution then max-pooled to
+    count_res³, and cells are binned at the same count_res³ grid.
+    This avoids the sparse-count problem that arises when the full 256³
+    grid has far more voxels than cells (~0.03 cells/voxel).
+
+    Args:
+        points:     (N, 3) float32 tensor (any device) — cell positions in
+                    world coords [-extent, extent]^3
+        gt_volume:  (R, R, R) numpy float32 array
+        extent:     half-side of world box (default 1.0)
+        n_bins:     number of linearly-spaced bins over the log1p gradient
+        count_res:  resolution of the counting grid (default 64); the gradient
+                    volume is max-pooled from R to count_res before comparison
+        writer_fn:  optional callable(fig) for TensorBoard; if None, returns fig
+
+    Returns:
+        dict with "spearman_rho" and "spearman_pval" (always),
+        plus figure when writer_fn is None.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from scipy.stats import spearmanr
+
+    R = gt_volume.shape[0]
+    device = points.device if hasattr(points, 'device') else torch.device('cpu')
+
+    # ── 1. Gradient magnitude at full res, then max-pool to count_res³ ─────
+    vol_t = torch.from_numpy(gt_volume).float().to(device)
+    v = vol_t.unsqueeze(0).unsqueeze(0)
+    v = F.pad(v, (1, 1, 1, 1, 1, 1), mode='replicate')
+    sm = torch.tensor([1, 2, 1], dtype=torch.float32, device=device)
+    df = torch.tensor([-1, 0, 1], dtype=torch.float32, device=device)
+    kx = (sm[:, None, None] * sm[None, :, None] * df[None, None, :]).reshape(1, 1, 3, 3, 3)
+    ky = (sm[:, None, None] * df[None, :, None] * sm[None, None, :]).reshape(1, 1, 3, 3, 3)
+    kz = (df[:, None, None] * sm[None, :, None] * sm[None, None, :]).reshape(1, 1, 3, 3, 3)
+    mag = torch.sqrt(F.conv3d(v, kx) ** 2 +
+                     F.conv3d(v, ky) ** 2 +
+                     F.conv3d(v, kz) ** 2)  # (1,1,R,R,R)
+    # Max-pool to count_res: captures "any edge in this region?"
+    stride = R // count_res
+    if stride > 1:
+        mag = F.max_pool3d(mag, kernel_size=stride, stride=stride)
+    grad_log = torch.log1p(mag).squeeze().cpu().numpy().ravel()  # (count_res³,)
+
+    # ── 2. Voxelize point positions into count_res³ cell-count grid ─────────
+    pts = points.detach().float().cpu()
+    C = mag.shape[-1]  # actual grid size after pooling (may differ slightly from count_res)
+    vox = ((pts + extent) / (2.0 * extent) * C).long().clamp(0, C - 1)  # (N,3)
+    flat_idx = vox[:, 0] * C * C + vox[:, 1] * C + vox[:, 2]
+    count_grid = torch.zeros(C ** 3, dtype=torch.float32)
+    count_grid.scatter_add_(0, flat_idx, torch.ones(flat_idx.shape[0]))
+    count_flat = count_grid.numpy()  # (C³,)
+
+    # ── 3. Spearman ρ on per-voxel arrays ──────────────────────────────────
+    rho, pval = spearmanr(grad_log, count_flat)
+
+    # ── 4. Bin voxels by log1p gradient, compute mean cells/voxel ± 95% CI ─
+    g_max = float(grad_log.max())
+    bin_edges = np.linspace(0.0, g_max + 1e-8, n_bins + 1)
+    bin_idx = np.clip(np.digitize(grad_log, bin_edges) - 1, 0, n_bins - 1)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    means = np.full(n_bins, np.nan)
+    cis   = np.full(n_bins, np.nan)
+    for b in range(n_bins):
+        vals = count_flat[bin_idx == b]
+        if len(vals) > 0:
+            means[b] = vals.mean()
+            cis[b]   = 1.96 * vals.std() / max(np.sqrt(len(vals)), 1)
+
+    # ── 5. Plot ─────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(6, 4))
+    valid = ~np.isnan(means)
+    ax.plot(bin_centers[valid], means[valid], color='steelblue', linewidth=2)
+    ax.fill_between(bin_centers[valid],
+                    (means - cis)[valid], (means + cis)[valid],
+                    alpha=0.25, color='steelblue')
+    ax.set_xlabel("GT gradient magnitude  (log1p, max-pooled)")
+    ax.set_ylabel(f"Mean cells per voxel  ({C}³ grid)")
+    ax.set_title(f"Cell allocation vs. GT gradient  (Spearman ρ = {rho:.3f})")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    stats = {
+        "spearman_rho": float(rho),
+        "spearman_pval": float(pval),
+        "bin_centers": bin_centers,
+        "bin_means": means,
+        "bin_cis": cis,
+        "count_res": C,
+    }
+    if writer_fn:
+        writer_fn(fig)
+        plt.close(fig)
+        return stats
+    return fig, stats
