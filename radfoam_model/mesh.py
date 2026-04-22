@@ -42,7 +42,33 @@ _TRI_TABLE = [
 TRI_TABLE = torch.tensor(_TRI_TABLE, dtype=torch.long)
 
 
-def marching_tets(points, density, tets, threshold):
+@torch.no_grad()
+def _refine_crossings_idw(p_i, p_j, d_i, d_j, threshold, density_fn, n_iters=4):
+    """Binary-search refinement of tet edge crossings using an IDW density function.
+
+    Parametrize so t=0 is the inside endpoint (density < threshold) and t=1 is
+    the outside endpoint. Assumes the IDW field is monotone along each edge.
+    """
+    swap = d_i >= threshold
+    p0 = torch.where(swap.unsqueeze(-1), p_j, p_i)
+    p1 = torch.where(swap.unsqueeze(-1), p_i, p_j)
+
+    t_lo = torch.zeros(p0.shape[0], device=p0.device)
+    t_hi = torch.ones(p0.shape[0], device=p0.device)
+
+    for _ in range(n_iters):
+        t_mid = 0.5 * (t_lo + t_hi)
+        p_mid = p0 + t_mid.unsqueeze(-1) * (p1 - p0)
+        d_mid = density_fn(p_mid)
+        inside = d_mid < threshold
+        t_lo = torch.where(inside, t_mid, t_lo)
+        t_hi = torch.where(~inside, t_mid, t_hi)
+
+    t_final = 0.5 * (t_lo + t_hi)
+    return p0 + t_final.unsqueeze(-1) * (p1 - p0)
+
+
+def marching_tets(points, density, tets, threshold, density_fn=None):
     """Extract an iso-surface using marching tetrahedra on the Delaunay complex.
 
     Vertices are deduplicated: two triangles sharing a Delaunay edge share
@@ -142,6 +168,15 @@ def marching_tets(points, density, tets, threshold):
     cnt.scatter_add_(0, inverse, torch.ones(F_count * 3, device=device))
     unique_pos = unique_pos / cnt.unsqueeze(1)
 
+    if density_fn is not None and num_verts > 0:
+        vi_u = unique_keys // N
+        vj_u = unique_keys % N
+        unique_pos = _refine_crossings_idw(
+            points[vi_u], points[vj_u],
+            density[vi_u], density[vj_u],
+            threshold, density_fn,
+        )
+
     faces = inverse.reshape(F_count, 3)  # (F, 3) vertex indices
 
     return unique_pos.cpu().numpy(), faces.cpu().numpy().astype(np.int64)
@@ -154,6 +189,7 @@ def surface_metrics_vs_gt_volume(
     gt_volume,
     thresholds=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9),
     f_thresholds_vox=(1.0, 2.0),
+    density_fn=None,
 ):
     """Direct Voronoi surface metrics vs GT volume, both in world coords [-1, 1]^3.
 
@@ -192,7 +228,7 @@ def surface_metrics_vs_gt_volume(
             continue
         verts_g = verts_g_vox * vox_to_world - 1.0  # → world coords
 
-        verts_v, _ = marching_tets(points, density, tets, threshold=t)
+        verts_v, _ = marching_tets(points, density, tets, threshold=t, density_fn=density_fn)
         if len(verts_v) < 3:
             continue
 
