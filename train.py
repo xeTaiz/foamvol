@@ -35,7 +35,7 @@ from vis_foam import (load_density_field, field_from_model, query_density,
                       visualize_slices, load_gt_volume, load_r2_volume,
                       sample_gt_slice, render_volume_drr,
                       voxelize_volumes, log_density_histogram,
-                      log_volume_slices)
+                      log_volume_slices, visualize_cells_vs_gradient)
 import radfoam
 
 
@@ -836,6 +836,18 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                              ha="left", va="center")
                 writer.add_figure(f"error_comparison/{experiment_name}", fig, step)
                 plt.close(fig)
+
+            # Cell allocation vs. GT gradient magnitude
+            if gt_volume is not None:
+                stats = visualize_cells_vs_gradient(
+                    model.primal_points.detach(),
+                    gt_volume,
+                    writer_fn=partial(writer.add_figure,
+                                      f"cells_vs_gt_grad/{experiment_name}",
+                                      global_step=step),
+                )
+                writer.add_scalar("diagnostics/cells_vs_grad_spearman_rho",
+                                  stats["spearman_rho"], step)
 
         return metrics
 
