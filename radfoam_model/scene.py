@@ -330,7 +330,7 @@ class CTScene(torch.nn.Module):
 
         Can be called directly with a (R, R, R) tensor — useful for setting
         an intermediate snapshot without file I/O:
-            model.set_reference_volume(model._scatter_voxelize(64)[0].detach())
+            model.set_reference_volume(model._idw_voxelize(64)[0].detach())
 
         Args:
             tensor: (R, R, R) float tensor (any resolution — resampled at loss time)
@@ -374,72 +374,72 @@ class CTScene(torch.nn.Module):
         gz = F.conv3d(v, k.reshape(1, 1, 1, 1, 3), padding=(0, 0, 1))
         return (gx ** 2 + gy ** 2 + gz ** 2).sqrt().squeeze()
 
-    def _scatter_voxelize(self, resolution=64, extent=1.0):
-        """Bin cells into a voxel grid weighted by cell area (radius²), differentiable.
+    def _idw_voxelize(self, resolution=64, supersample=1, extent=1.0):
+        """Evaluate scene density on a regular voxel grid via IDW interpolation.
+
+        Uses the same IDW parameters as inference-mode interpolation (_idw_sigma,
+        _idw_sigma_v, _per_cell_sigma, _per_neighbor_sigma), set on the model via
+        set_interpolation_mode(). This means density at each sample point is the
+        bilateral-weighted average of the NN cell and its Voronoi graph neighbors —
+        not just the raw nearest-cell value.
+
+        supersample=1: evaluate at each voxel center (deterministic).
+        supersample>1: evaluate at k uniform random points per voxel and average.
 
         Returns:
             vol: (res, res, res) float tensor with gradient through density
-            occupied: (res, res, res) bool mask — True for voxels with ≥1 cell
+            occupied: (res, res, res) bool — True for voxels inside [-extent, extent]³
         """
         res = resolution
         voxel_size = 2.0 * extent / res
-        points = self.primal_points.detach()            # (N, 3), no positional grad
-        mu = self.get_primal_density().squeeze()        # (N,) grad through density
+        mu = self.get_primal_density().squeeze()  # (N,) with grad
 
-        grid_coords = ((points + extent) / voxel_size).long().clamp(0, res - 1)
-        voxel_idx = (grid_coords[:, 0] * res * res
-                     + grid_coords[:, 1] * res
-                     + grid_coords[:, 2])               # (N,) int64
+        sigma = getattr(self, '_idw_sigma', 0.7)
+        sigma_v = getattr(self, '_idw_sigma_v', None)
+        per_cell_sigma = getattr(self, '_per_cell_sigma', False)
+        per_neighbor_sigma = getattr(self, '_per_neighbor_sigma', False)
+        cell_radius = self._cached_cell_radius if per_cell_sigma else None
 
-        inside = (points.abs() <= extent).all(dim=1)
-        voxel_idx_in = voxel_idx[inside]
-        mu_in = mu[inside]
+        adj = self.point_adjacency
+        adj_off = self.point_adjacency_offsets
+        global_max_k = int((adj_off.long()[1:] - adj_off.long()[:-1]).max().item())
 
-        if self._cached_cell_radius is not None:
-            w_in = self._cached_cell_radius[inside].detach() ** 2
+        # Build all voxel centers in world space
+        ax = torch.arange(res, device=mu.device, dtype=torch.float32)
+        gx, gy, gz = torch.meshgrid(ax, ax, ax, indexing='ij')
+        vox_centers = (torch.stack([gx, gy, gz], dim=-1).reshape(-1, 3) + 0.5) * voxel_size - extent
+
+        if supersample <= 1:
+            sample_pts = vox_centers.contiguous()
         else:
-            w_in = torch.ones(inside.sum(), device=mu.device, dtype=mu.dtype)
+            rand_shifts = (torch.rand(res**3, supersample, 3, device=mu.device) - 0.5) * voxel_size
+            sample_pts = (vox_centers.unsqueeze(1) + rand_shifts).reshape(-1, 3).contiguous()
 
-        num_voxels = res ** 3
-        weighted_sum = torch.zeros(num_voxels, device=mu.device, dtype=mu.dtype)
-        total_weight = torch.zeros(num_voxels, device=mu.device, dtype=mu.dtype)
-        weighted_sum.scatter_add_(0, voxel_idx_in, mu_in * w_in)
-        total_weight.scatter_add_(0, voxel_idx_in, w_in)
+        # IDW query in batches to avoid OOM on large grids
+        B = sample_pts.shape[0]
+        chunks = []
+        batch_size = 500_000
+        for start in range(0, B, batch_size):
+            r = idw_query(
+                sample_pts[start:start + batch_size],
+                self.primal_points.detach(),
+                adj, adj_off, self.aabb_tree, mu,
+                sigma=sigma, sigma_v=sigma_v,
+                global_max_k=global_max_k,
+                per_cell_sigma=per_cell_sigma,
+                per_neighbor_sigma=per_neighbor_sigma,
+                cell_radius=cell_radius,
+            )
+            chunks.append(r.idw_result)
+        sample_dens = torch.cat(chunks)  # (B,) with grad
 
-        occupied_flat = total_weight > 0
-        safe_weight = total_weight.clamp(min=1e-10)
-        vol_flat = weighted_sum / safe_weight           # (num_voxels,), grad through weighted_sum
+        if supersample > 1:
+            vol_flat = sample_dens.reshape(res**3, supersample).mean(dim=1)
+        else:
+            vol_flat = sample_dens
 
-        return vol_flat.reshape(res, res, res), occupied_flat.reshape(res, res, res)
-
-    @staticmethod
-    @torch.no_grad()
-    def _scatter_voxelize_from(points, mu_detached, resolution=64, extent=1.0):
-        """Scatter-voxelize external points+densities (no grad, uniform cell weights).
-
-        Used when loading a reference from a model.pt checkpoint where cell_radius
-        is not available without rebuilding the triangulation.
-        """
-        res = resolution
-        voxel_size = 2.0 * extent / res
-        grid_coords = ((points + extent) / voxel_size).long().clamp(0, res - 1)
-        voxel_idx = (grid_coords[:, 0] * res * res
-                     + grid_coords[:, 1] * res
-                     + grid_coords[:, 2])
-
-        inside = (points.abs() <= extent).all(dim=1)
-        voxel_idx_in = voxel_idx[inside]
-        mu_in = mu_detached[inside]
-
-        num_voxels = res ** 3
-        weighted_sum = torch.zeros(num_voxels, device=points.device, dtype=torch.float32)
-        count = torch.zeros(num_voxels, device=points.device, dtype=torch.float32)
-        weighted_sum.scatter_add_(0, voxel_idx_in, mu_in.float())
-        count.scatter_add_(0, voxel_idx_in, torch.ones(voxel_idx_in.shape[0],
-                                                        device=points.device))
-
-        safe_count = count.clamp(min=1.0)
-        return (weighted_sum / safe_count).reshape(res, res, res)
+        occupied = (vox_centers.abs() <= extent).all(dim=1).reshape(res, res, res)
+        return vol_flat.reshape(res, res, res), occupied
 
     def reference_volume_loss(self, resolution=64):
         """L2 loss between scatter-voxelized current model and the stored reference volume.
@@ -454,7 +454,8 @@ class CTScene(torch.nn.Module):
         if not hasattr(self, "_ref_volume") or self._ref_volume is None:
             return torch.tensor(0.0, device=self.density.device)
 
-        vol, occupied = self._scatter_voxelize(resolution)  # (R,R,R), (R,R,R) bool
+        supersample = getattr(self, '_ref_vol_supersample', 1)
+        vol, occupied = self._idw_voxelize(resolution, supersample=supersample)  # (R,R,R), (R,R,R) bool
 
         ref = self._ref_volume
         if ref.shape[0] != resolution:
@@ -648,20 +649,29 @@ class CTScene(torch.nn.Module):
 
         return edge_loss.mean()
 
-    def voxel_variance_regularization(self, resolution=32, sigma_v=0.2, extent=1.0):
+    def voxel_variance_regularization(self, resolution=32, sigma_v=0.2, extent=1.0,
+                                       supersample=1):
         """Bilateral variance loss on a randomly-offset voxel grid.
 
-        Bins cells into a voxel grid, computes weighted mean density per voxel,
-        then penalizes each cell's deviation from its voxel mean — weighted
-        bilaterally so cells near density boundaries are not smoothed.
+        Assigns cells to voxels via a stochastic grid offset, then estimates each
+        voxel's density using full bilateral IDW (NN cell + graph neighbors, same
+        spatial/bilateral params as interpolation mode) at sample points within the voxel.
+        Each cell is penalized for deviating from its voxel's estimated mean, bilaterally
+        weighted so cells near density edges are smoothed less aggressively.
 
-        Random grid offset each call prevents persistent binning artifacts.
+        supersample=1: evaluate at the voxel center (deterministic single sample).
+        supersample>1: k random points per voxel — better Monte-Carlo estimator,
+            gradient flows through multiple contributing cells per voxel.
+
+        The stochastic grid offset randomizes cell-to-voxel assignment across iterations,
+        preventing persistent artifacts. For k>1 the random sample points add further
+        decorrelation within each voxel.
 
         Args:
             resolution: grid resolution per axis
-            sigma_v: bilateral value sigma — cells with density difference
-                     > sigma_v from the voxel mean get reduced weight
+            sigma_v: bilateral value sigma (large = plain smoothing, small = edge-preserving)
             extent: half-extent of the volume (grid spans [-extent, extent]^3)
+            supersample: IDW sample points per voxel (1 = deterministic center)
         """
         res = resolution
         voxel_size = 2.0 * extent / res
@@ -671,39 +681,69 @@ class CTScene(torch.nn.Module):
         # Random grid offset for stochastic binning
         offset = (torch.rand(3, device=points.device) - 0.5) * voxel_size
 
-        # Compute voxel index per cell
+        # Voxel assignment for all inside cells
         shifted = points + offset
-        grid_coords = ((shifted + extent) / voxel_size).long().clamp(0, res - 1)
+        inside = (points.abs() <= extent).all(dim=1)
+        shifted_inside = shifted[inside]
+        mu_inside = mu[inside]
+        grid_coords = ((shifted_inside + extent) / voxel_size).long().clamp(0, res - 1)
         voxel_idx = grid_coords[:, 0] * res * res + grid_coords[:, 1] * res + grid_coords[:, 2]
 
-        # Exclude cells outside the volume
-        inside = (points.abs() <= extent).all(dim=1)
-        voxel_idx = voxel_idx[inside]
-        mu_inside = mu[inside]
+        # IDW-NN path: k sample points per occupied voxel (k=1 → voxel center, k>1 → random)
+        unique_vox_ids, inverse = torch.unique(voxel_idx, return_inverse=True)
+        M = unique_vox_ids.shape[0]
 
-        # Compute weighted mean per voxel (uniform weights for the mean)
-        num_voxels = res ** 3
-        sum_mu = torch.zeros(num_voxels, device=mu.device, dtype=mu.dtype)
-        count = torch.zeros(num_voxels, device=mu.device, dtype=mu.dtype)
-        sum_mu.scatter_add_(0, voxel_idx, mu_inside)
-        count.scatter_add_(0, voxel_idx, torch.ones_like(mu_inside))
+        vox_z = unique_vox_ids % res
+        vox_y = (unique_vox_ids // res) % res
+        vox_x = unique_vox_ids // (res * res)
+        vox_3d = torch.stack([vox_x, vox_y, vox_z], dim=1).float()
 
-        # Per-voxel mean (only occupied voxels)
-        occupied = count > 1  # need at least 2 cells for variance
-        voxel_mean = torch.zeros(num_voxels, device=mu.device, dtype=mu.dtype)
-        voxel_mean[occupied] = sum_mu[occupied] / count[occupied]
+        # Voxel centers in world space (undo the stochastic grid offset)
+        vox_centers = (vox_3d + 0.5) * voxel_size - extent - offset  # (M, 3)
 
-        # Per-cell deviation from voxel mean
-        cell_mean = voxel_mean[voxel_idx]  # (N_inside,)
+        k = max(1, supersample)
+        if k <= 1:
+            sample_pts = vox_centers.contiguous()  # (M, 3)
+        else:
+            rand_shifts = (torch.rand(M, k, 3, device=mu.device) - 0.5) * voxel_size
+            sample_pts = (vox_centers.unsqueeze(1) + rand_shifts).reshape(-1, 3).contiguous()
+
+        # Full bilateral IDW (NN cell + graph neighbors) — same params as interpolation mode
+        idw_sigma = getattr(self, '_idw_sigma', 0.7)
+        idw_sigma_v = getattr(self, '_idw_sigma_v', None)
+        per_cell_sigma = getattr(self, '_per_cell_sigma', False)
+        per_neighbor_sigma = getattr(self, '_per_neighbor_sigma', False)
+        cell_radius = self._cached_cell_radius if per_cell_sigma else None
+
+        adj = self.point_adjacency
+        adj_off = self.point_adjacency_offsets
+        global_max_k = int((adj_off.long()[1:] - adj_off.long()[:-1]).max().item())
+
+        B_pts = sample_pts.shape[0]
+        chunks = []
+        batch_size = 500_000
+        for start in range(0, B_pts, batch_size):
+            r = idw_query(
+                sample_pts[start:start + batch_size],
+                self.primal_points.detach(),
+                adj, adj_off, self.aabb_tree, mu,
+                sigma=idw_sigma, sigma_v=idw_sigma_v,
+                global_max_k=global_max_k,
+                per_cell_sigma=per_cell_sigma,
+                per_neighbor_sigma=per_neighbor_sigma,
+                cell_radius=cell_radius,
+            )
+            chunks.append(r.idw_result)
+        sample_densities = torch.cat(chunks)  # (M,) or (M*k,) with grad
+
+        if k > 1:
+            sample_densities = sample_densities.reshape(M, k).mean(dim=1)  # (M,)
+
+        cell_mean = sample_densities[inverse]  # (N_inside,) with grad
+
         diff = mu_inside - cell_mean
-
-        # Bilateral weight: suppress smoothing across density boundaries
         bilateral_w = torch.exp(-diff.detach() ** 2 / (sigma_v ** 2))
-
-        # Weighted variance loss
-        loss = (bilateral_w * diff ** 2).mean()
-
-        return loss
+        return (bilateral_w * diff ** 2).mean()
 
     def _neighbor_smooth_target(self, mu_detached, hops):
         """K-hop smoothed density target via iterated message passing (O(k×E)).
@@ -727,20 +767,87 @@ class CTScene(torch.nn.Module):
             smooth = nbr_sum / counts
         return smooth  # [N], detached k-hop neighborhood mean
 
-    def neighbor_variance_regularization(self, sigma_v=1.0, hops=1):
-        """Bilateral variance loss over the Voronoi neighbor graph.
+    def _neighbor_median_target(self, mu_detached, hops):
+        """K-hop median density target via iterated 1-hop median passes (O(k×E)).
 
-        Each cell is penalized for deviating from its k-hop neighborhood mean.
-        Bilaterally weighted by sigma_v: large sigma_v = plain L2 smoothing;
-        small sigma_v = edge-preserving (boundaries down-weighted).
-        Combined with sigma annealing in train.py this starts as full smoothing
-        and transitions to edge-preserving as training progresses.
+        Each hop replaces each cell's value with the median of itself + immediate
+        neighbors. More robust than mean to outlier cells (shot noise): a single
+        noisy cell among correct neighbors gets pulled toward the correct value
+        even if one other neighbor is also noisy, since the majority is clean.
+        """
+        offsets = self.point_adjacency_offsets.long()
+        adj = self.point_adjacency.long()
+        N = mu_detached.shape[0]
+        device = mu_detached.device
+
+        deg = offsets[1:] - offsets[:-1]  # (N,) neighbor counts (excl. self)
+        max_deg = int(deg.max().item())
+
+        # Build padded index matrix (N, max_deg+1): col 0 = self, cols 1..deg = neighbors
+        padded_idx = torch.arange(N, device=device).unsqueeze(1).expand(N, max_deg + 1).clone()
+        k_range = torch.arange(max_deg, device=device)
+        has_k = deg.unsqueeze(1) > k_range.unsqueeze(0)              # (N, max_deg)
+        flat_off = (offsets[:-1].unsqueeze(1) + k_range.unsqueeze(0)).clamp(max=adj.shape[0] - 1)
+        padded_idx[:, 1:] = torch.where(has_k, adj[flat_off], padded_idx[:, 1:])
+
+        valid_count = (deg + 1).clamp(min=1)  # self + true neighbors
+        # is_padding[i, k] = True for slots beyond the real deg[i]+1 entries
+        is_padding = torch.arange(max_deg + 1, device=device).unsqueeze(0) >= valid_count.unsqueeze(1)
+
+        smooth = mu_detached.clone()
+        for _ in range(hops):
+            vals = smooth[padded_idx]                    # (N, max_deg+1)
+            vals = vals + is_padding.float() * 1e6       # push padding above real densities
+            sorted_vals, _ = vals.sort(dim=1)
+            mid_idx = ((valid_count - 1) // 2).clamp(min=0)  # 0-indexed median position
+            smooth = sorted_vals.gather(1, mid_idx.unsqueeze(1)).squeeze(1)
+
+        return smooth  # (N,), detached
+
+    def neighbor_variance_regularization(self, sigma_v=1.0, hops=1,
+                                          reg_type='bilateral_var', huber_delta=0.1):
+        """Variance-style loss over the Voronoi neighbor graph.
+
+        Each cell is penalized for deviating from its k-hop neighborhood mean or median.
+
+        reg_type options:
+          'bilateral_var' (default): bilateral-weighted L2 vs. k-hop mean. sigma_v controls
+             the edge-preservation boundary; large = plain smoothing, small = edge-preserving.
+          'huber': Huber loss on the residual vs. k-hop mean. Aggressively kills sub-delta
+             noise while capping large residuals at edges. huber_delta sets the noise scale.
+          'bilateral_huber': Huber × bilateral weight — both outlier robustness AND
+             edge preservation. Strongest regularizer; may over-smooth at surfaces.
+          'median': L1 loss vs. k-hop iterated median target. Median is robust to outlier
+             neighbors — a single noisy cell does not pull the target for its clean neighbors.
+          'bilateral_median': L1 × bilateral weight vs. k-hop median. Edge-preserving
+             version of 'median'.
         """
         mu = self.get_primal_density().squeeze()        # [N], with grad
-        target = self._neighbor_smooth_target(mu.detach(), hops)
+
+        # Choose target: mean-based or median-based
+        if reg_type in ('median', 'bilateral_median'):
+            target = self._neighbor_median_target(mu.detach(), hops)
+        else:
+            target = self._neighbor_smooth_target(mu.detach(), hops)
+
         diff = mu - target
-        bilateral_w = torch.exp(-(diff.detach() ** 2) / (sigma_v ** 2))
-        return (bilateral_w * diff ** 2).mean()
+
+        if reg_type == 'bilateral_var':
+            bilateral_w = torch.exp(-(diff.detach() ** 2) / (sigma_v ** 2))
+            return (bilateral_w * diff ** 2).mean()
+        elif reg_type == 'huber':
+            return F.huber_loss(mu, target.detach(), delta=huber_delta, reduction='mean')
+        elif reg_type == 'bilateral_huber':
+            bilateral_w = torch.exp(-(diff.detach() ** 2) / (sigma_v ** 2))
+            huber = F.huber_loss(mu, target.detach(), delta=huber_delta, reduction='none')
+            return (bilateral_w * huber).mean()
+        elif reg_type == 'median':
+            return diff.abs().mean()
+        elif reg_type == 'bilateral_median':
+            bilateral_w = torch.exp(-(diff.detach() ** 2) / (sigma_v ** 2))
+            return (bilateral_w * diff.abs()).mean()
+        else:
+            raise ValueError(f"Unknown neighbor reg_type: {reg_type}")
 
     @torch.no_grad()
     def compute_neighborhood_variance(self, cell_radius=None, hops=1):
@@ -765,6 +872,88 @@ class CTScene(torch.nn.Module):
             size_factor = cell_radius.clamp(min=p10)
             return var * size_factor
         return var
+
+    def smooth_density_grad(self, hops=1, eps=1e-12):
+        """Agreement-weighted density gradient smoothing (in-place).
+
+        For each cell, compute the neighborhood mean (including self) of density.grad
+        and scale the cell's own gradient by w = min(1, |mean| / (|own| + eps)).
+        w ∈ [0, 1] acts as a trust weight:
+          - Coherent region (own ≈ mean): w ≈ 1, gradient preserved.
+          - Zero-mean noise (mean ≈ 0): w ≈ 0, noisy gradient suppressed.
+          - Empty cell near active region (|mean| > |own|): w = 1 (capped), grad unchanged.
+          - Noisy cell in otherwise-zero region (|mean| < |own|): w < 1, magnitude capped.
+
+        Never boosts a gradient beyond its own magnitude — the weight is a shrinkage
+        factor, not an amplifier. Applied to density.grad only, after backward() and
+        before optimizer.step().
+
+        Restricted to cells within the nominal scene volume [-1, 1]^3. Outside cells
+        (background) keep their original gradient unchanged, avoiding interactions
+        between large background cells and interior signal.
+
+        Iterated `hops` times — each hop recomputes the mean from the updated grad.
+        """
+        if self.density.grad is None:
+            return
+        grad = self.density.grad.squeeze()  # (N,) view into density.grad
+        N = grad.shape[0]
+
+        # Bail out if adjacency is stale (e.g. right after densification before
+        # update_triangulation rebuilds); smoothing on mismatched shapes is unsafe.
+        if self.point_adjacency_offsets.shape[0] != N + 1:
+            return
+
+        # Clean NaN/Inf at entry (uses returned tensor for unambiguous semantics).
+        grad_clean = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+
+        offsets = self.point_adjacency_offsets.long()
+        # Clamp adjacency indices to [0, N-1] as a defensive guard.
+        adj = self.point_adjacency.long().clamp_(0, N - 1)
+
+        deg = offsets[1:] - offsets[:-1]
+        counts = deg.float() + 1.0  # include self in the neighborhood
+        src = torch.repeat_interleave(
+            torch.arange(N, device=grad.device), deg,
+        )
+
+        # Inside-volume mask: the nominal scene extent is [-1, 1]^3.
+        pts = self.primal_points.detach()
+        inside = (pts.abs() <= 1.0).all(dim=1)
+
+        current = grad_clean.clone()
+        for _ in range(hops):
+            # Neighborhood mean including self: (g_i + Σ_j g_j) / (1 + deg_i)
+            g_sum = current.clone()
+            g_sum.scatter_add_(0, src, current[adj])
+            g_mean = g_sum / counts
+
+            # Agreement weight, clamped to [0, 1].
+            w = (g_mean.abs() / (current.abs() + eps)).clamp_(max=1.0)
+            smoothed = w * current
+
+            # Only update cells whose centers lie inside [-1, 1]^3.
+            current = torch.where(inside, smoothed, current)
+
+        # Safety net: if anything non-finite slipped through, fall back for those entries.
+        bad = ~current.isfinite()
+        if bad.any():
+            n_bad = int(bad.sum().item())
+            print(f"[smooth_density_grad] WARN: {n_bad}/{N} non-finite after smoothing "
+                  f"— falling back to cleaned raw grad for those cells")
+            current = torch.where(bad, grad_clean, current)
+            current = torch.nan_to_num(current, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Copy into the existing grad buffer to preserve its identity.
+        self.density.grad.copy_(current.unsqueeze(1))
+
+        # Stash agreement weights for periodic diagnostic visualization.
+        # Outside cells keep their gradient unchanged (effective weight = 1).
+        if hops > 0:
+            eff_w = torch.where(inside, w, torch.ones(N, device=w.device))
+        else:
+            eff_w = torch.ones(N, device=grad.device)
+        self._last_grad_weights = eff_w.detach().cpu()
 
     @torch.no_grad()
     def compute_redundancy_error(self, cell_radius, sigma_scale, sigma_v):
