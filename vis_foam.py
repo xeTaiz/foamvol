@@ -605,6 +605,65 @@ def load_gt_volume(data_path, dataset_type, dataset_args=None):
         gt2d = (gt2d - gt2d.min()) / (gt2d.max() - gt2d.min() + 1e-9)
         gt3d = np.stack([gt2d] * G, axis=2)
         return gt3d
+    elif dataset_type in ("more", "aapm_mayo"):
+        # GT is the input volume itself (we forward-projected from it).
+        # Reconstruct a 256³ volume from the source slices for evaluation.
+        import os, glob, cv2
+        from skimage.transform import resize as sk_resize
+
+        G = 256
+        split = getattr(dataset_args, "split_override", "") or "train"
+        sample_index = getattr(dataset_args, "sample_index", 0) if dataset_args is not None else 0
+
+        if dataset_type == "more":
+            split_dir = os.path.join(data_path, split)
+            if not os.path.isdir(split_dir):
+                return None
+            patients = sorted(set(
+                os.path.basename(f).split("_")[0]
+                for f in glob.glob(os.path.join(split_dir, "*.png"))
+            ))
+            if sample_index >= len(patients):
+                return None
+            patient_id = patients[sample_index]
+            files = sorted(glob.glob(os.path.join(split_dir, f"{patient_id}_*.png")))
+            slices = [cv2.imread(f, cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0
+                      for f in files]
+        else:  # aapm_mayo npy layout
+            npy_dir = os.path.join(data_path, split)
+            if not os.path.isdir(npy_dir):
+                return None
+            files = sorted(glob.glob(os.path.join(npy_dir, "*.npy")))
+            if not files:
+                return None
+            slices = [np.load(f).squeeze().astype(np.float32) for f in files]
+
+        if not slices:
+            return None
+
+        # Resize each slice to G×G and stack into (G, G, N_slices)
+        resized = np.stack([
+            sk_resize(s, (G, G), order=1, anti_aliasing=True).astype(np.float32)
+            for s in slices
+        ], axis=0)   # (N_slices, G, G)
+
+        # Interpolate N_slices → G in z using numpy
+        n_slices = resized.shape[0]
+        if n_slices != G:
+            z_in = np.linspace(0, 1, n_slices)
+            z_out = np.linspace(0, 1, G)
+            from scipy.interpolate import interp1d
+            interp = interp1d(z_in, resized, axis=0, kind="linear",
+                              bounds_error=False, fill_value="extrapolate")
+            resized = interp(z_out).astype(np.float32)   # (G, G, G)
+
+        # Normalize to [0, 1]
+        vmin, vmax = resized.min(), resized.max()
+        if vmax > vmin:
+            resized = (resized - vmin) / (vmax - vmin)
+
+        # Return as (G, G, G): axes are (x, y, z)
+        return resized.transpose(1, 2, 0)   # (G, G, N_z→G)
     return None
 
 

@@ -1,0 +1,46 @@
+# AAPM-Mayo Low-Dose CT — 3D stacked fan-beam reconstruction
+# Supports DICOM reconstruction files or pre-processed NPY slices.
+# Download from TCIA: https://www.aapm.org/GrandChallenge/LowDoseCT/#registration
+# Place files at /mnt/hdd/aapm_mayo/ (see data_loader/aapm_mayo.py for layout).
+
+# Dataset
+dataset: aapm_mayo
+data_path: /mnt/hdd/aapm_mayo
+sample_index: 0        # DICOM layout: patient index; NPY layout: ignored (one study)
+# split_override: test # uncomment to use test split
+
+# Model
+init_points: 32000
+final_points: 512000
+init_scale: 1.05
+init_density: 0.0
+
+# Training schedule
+iterations: 10000
+densify_from: 1000
+densify_until: 6000
+densify_factor: 1.15
+interpolation_start: 9000
+interp_sigma_scale: 0.7
+interp_sigma_v: 0.35
+per_cell_sigma: true
+freeze_points: 9500
+
+rays_per_batch: 1000000
+
+# Regularization
+tv_weight: 1e-4
+tv_start: 5000
+neighbor_var_weight: 1e-3
+neighbor_var_start: 1000
+neighbor_var_hops: 1
+
+# Ray sampling
+high_error_fraction: 0.2
+targeted_fraction: 0.0
+
+# Learning rates
+density_lr_init: 0.05
+density_lr_final: 0.001
+points_lr_init: 0.0002
+points_lr_final: 0.000005
