@@ -29,6 +29,7 @@ from vis_foam import (load_density_field, field_from_model, query_density,
                       visualize_idw_diagnostics,
                       make_slice_coords, compute_cell_density_slice,
                       compute_voronoi_edges, visualize_cell_heatmap,
+                      visualize_grad_weights,
                       visualize_slices, load_gt_volume, load_r2_volume,
                       sample_gt_slice, render_volume_drr,
                       voxelize_volumes, log_density_histogram,
@@ -402,12 +403,23 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
             edge_mask=getattr(optimizer_args, "ref_volume_edge_mask", False),
             edge_alpha=getattr(optimizer_args, "ref_volume_edge_alpha", 10.0),
         )
+        model._ref_vol_supersample = getattr(optimizer_args, "ref_volume_supersample", 1)
 
     # Setting up optimizer
     model.declare_optimizer(
         args=optimizer_args,
         warmup=pipeline_args.densify_from,
         max_iterations=pipeline_args.iterations,
+    )
+
+    # Store IDW interpolation params on model early so _idw_voxelize can use them
+    # throughout training (not just after interpolation_start).
+    model.set_interpolation_mode(
+        False,
+        sigma=pipeline_args.interp_sigma_scale,
+        sigma_v=pipeline_args.interp_sigma_v,
+        per_cell_sigma=pipeline_args.per_cell_sigma,
+        per_neighbor_sigma=pipeline_args.per_neighbor_sigma,
     )
 
     gt_volume = load_gt_volume(dataset_args.data_path, dataset_args.dataset, dataset_args=dataset_args)
@@ -588,6 +600,14 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
             # Cell heatmap
             log_fig_hm = partial(writer.add_figure, f"cell_heatmap/{experiment_name}", global_step=step)
             visualize_cell_heatmap(cd_slices, writer_fn=log_fig_hm)
+
+            # Gradient agreement weight map (only populated when grad_smooth_hops > 0)
+            if hasattr(model, "_last_grad_weights"):
+                visualize_grad_weights(
+                    model.primal_points.detach().cpu(),
+                    model._last_grad_weights,
+                    writer_fn=partial(writer.add_figure, f"grad_weights/{experiment_name}", global_step=step),
+                )
 
             # IDW diagnostics
             diag_coords = make_slice_coords(axis=2, coord=0.0, resolution=256, extent=1.0)
@@ -905,6 +925,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     voxel_var_loss = model.voxel_variance_regularization(
                         resolution=optimizer_args.voxel_var_resolution,
                         sigma_v=var_sigma_v,
+                        supersample=getattr(optimizer_args, 'voxel_var_supersample', 1),
                     )
                     loss = loss + vvar_w * voxel_var_loss
 
@@ -912,6 +933,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     neighbor_var_loss = model.neighbor_variance_regularization(
                         sigma_v=var_sigma_v,
                         hops=optimizer_args.neighbor_var_hops,
+                        reg_type=getattr(optimizer_args, 'neighbor_reg_type', 'bilateral_var'),
+                        huber_delta=getattr(optimizer_args, 'neighbor_huber_delta', 0.1),
                     )
                     loss = loss + nvar_w * neighbor_var_loss
 
@@ -941,6 +964,9 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                 ray_batch, proj_batch = next(data_iterator)
                 event.synchronize()
+
+                if getattr(optimizer_args, 'grad_smooth_hops', 0) > 0:
+                    model.smooth_density_grad(hops=optimizer_args.grad_smooth_hops)
 
                 if optimizer_args.density_grad_clip > 0 and model.density.grad is not None:
                     model.density.grad.clamp_(-optimizer_args.density_grad_clip, optimizer_args.density_grad_clip)

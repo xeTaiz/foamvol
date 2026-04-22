@@ -435,6 +435,62 @@ def visualize_cell_heatmap(cell_density_slices, writer_fn=None):
     plt.close(fig)
 
 
+def visualize_grad_weights(points, grad_weights, axes=(0, 1, 2),
+                           slice_coords=(-0.2, 0.0, 0.2),
+                           resolution=128, extent=1.0,
+                           writer_fn=None):
+    """Render per-cell gradient agreement weights as a 3×3 slice figure.
+
+    Each pixel shows the mean agreement weight of cells in a thin slab.
+    0 (red) = noisy / suppressed, 1 (green) = coherent / preserved.
+    NaN (gray) = no cells in pixel.
+
+    Args:
+        points: (N, 3) CPU tensor of cell centres
+        grad_weights: (N,) CPU tensor in [0, 1]
+        axes: sequence of 3 axis indices (rows)
+        slice_coords: sequence of 3 slice positions (columns)
+        resolution: pixel resolution per axis
+        extent: half-extent of the scene volume
+        writer_fn: optional callable(fig) for TensorBoard
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    thickness = 15 * (2 * extent / resolution)
+    axes_labels = ["X", "Y", "Z"]
+
+    fig, axs = plt.subplots(3, 3, figsize=(9, 9))
+    for row, ax in enumerate(axes):
+        other = [a for a in range(3) if a != ax]
+        for col, coord in enumerate(slice_coords):
+            slab_mask = (points[:, ax] - coord).abs() < thickness / 2
+            slab_pts = points[slab_mask]
+            slab_w = grad_weights[slab_mask].float()
+
+            w_sum = torch.zeros(resolution, resolution)
+            cnt = torch.zeros(resolution, resolution)
+            if slab_pts.shape[0] > 0:
+                ix = ((slab_pts[:, other[0]] + extent) / (2 * extent) * resolution).long().clamp(0, resolution - 1)
+                iy = ((slab_pts[:, other[1]] + extent) / (2 * extent) * resolution).long().clamp(0, resolution - 1)
+                w_sum.index_put_((ix, iy), slab_w, accumulate=True)
+                cnt.index_put_((ix, iy), torch.ones(slab_pts.shape[0]), accumulate=True)
+
+            mean_w = (w_sum / cnt.clamp(min=1.0)).numpy()
+            mean_w[cnt.numpy() == 0] = float("nan")
+
+            axs[row, col].imshow(mean_w.T, origin="lower", cmap="RdYlGn", vmin=0.0, vmax=1.0)
+            axs[row, col].set_title(f"{axes_labels[ax]}={coord:.1f}", fontsize=8)
+            axs[row, col].axis("off")
+
+    fig.suptitle("Grad agreement weight (0=suppressed, 1=coherent)", fontsize=11)
+    fig.tight_layout()
+    if writer_fn:
+        writer_fn(fig)
+    plt.close(fig)
+
+
 def compute_cell_density_slice(points, axis, coord, resolution, extent,
                                slab_thickness=None, device="cuda"):
     """Count cell centers per pixel bin in a thin slab around a slice.

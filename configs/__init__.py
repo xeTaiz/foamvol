@@ -132,13 +132,17 @@ class OptimizationParams(ParamGroup):
         self.voxel_var_resolution = 32
         self.voxel_var_sigma_v = 0.2       # kept for backward compat; overridden by var_sigma_v_*
         self.voxel_var_start = 0
+        self.voxel_var_supersample = 1     # k random IDW-NN samples per voxel (1 = scatter path)
         self.neighbor_var_weight = 0.0     # graph neighbor variance regularization weight
         self.neighbor_var_weight_final = -1.0  # weight at interpolation_start (-1 = hold neighbor_var_weight)
         self.neighbor_var_hops = 1         # k-hop neighborhood depth
         self.neighbor_var_start = 0
+        self.neighbor_reg_type = "bilateral_var"  # 'bilateral_var', 'huber', or 'bilateral_huber'
+        self.neighbor_huber_delta = 0.1    # Huber delta: residuals below this get L2, above get L1
         self.var_sigma_v_init = 0.2        # bilateral sigma at start (large = plain smoothing)
         self.var_sigma_v_final = 0.2       # bilateral sigma at end (small = edge-preserving)
         self.density_grad_clip = 1.0
+        self.grad_smooth_hops = 0          # graph-neighbor averaging of density grad (0 = off)
         self.ref_volume_path = ""           # path to .npy or .pt reference volume (empty = off)
         self.ref_volume_weight = 0.0        # L2 loss weight (0 = disabled)
         self.ref_volume_weight_final = -1.0 # weight at interpolation_start (-1 = hold weight)
@@ -148,6 +152,7 @@ class OptimizationParams(ParamGroup):
         self.ref_volume_blur_sigma = 2.0    # Gaussian blur applied to reference (in source voxels)
         self.ref_volume_edge_mask = False   # weight loss by inverse gradient magnitude
         self.ref_volume_edge_alpha = 10.0   # edge mask sensitivity: 1/(1+alpha*|∇ref|)
+        self.ref_volume_supersample = 1     # k IDW-NN samples per voxel for ref vol loss (1 = scatter)
         self.gaussian_start = -1
         self.freeze_base_at_gaussian = False
         self.joint_finetune_start = -1
