@@ -22,6 +22,7 @@ from scipy.spatial import KDTree
 from data_loader import DataHandler
 from configs import *
 from radfoam_model.scene import CTScene
+from radfoam_model.mesh import surface_metrics_vs_gt_volume
 from radfoam_model.utils import gauss_conv3d_separable as _gauss_conv3d_separable
 from visualize_volume import visualize
 from vis_foam import (load_density_field, field_from_model, query_density,
@@ -1375,6 +1376,33 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 f.write(f"Vol IDW F1 1v: {idw_surf['f1_1v']:.4f}\n")
                 f.write(f"Vol Raw F1 2v: {raw_surf['f1_2v']:.4f}\n")
                 f.write(f"Vol IDW F1 2v: {idw_surf['f1_2v']:.4f}\n")
+
+            # Direct Voronoi mesh surface metrics (no voxelization, world coords)
+            print("Computing direct Voronoi surface metrics...")
+            voronoi_surf = surface_metrics_vs_gt_volume(
+                model.primal_points.detach(),
+                model.get_primal_density().detach().squeeze(-1),
+                model.triangulation.tets(),
+                gt_volume,
+            )
+            # Distances are in world coords [-1,1]^3; F1 thresholds are
+            # 1v/2v equivalents (1 voxel = 2/(R-1) world units for R=256).
+            print(f"Mesh Direct CD: {voronoi_surf['chamfer']:.4f}v, "
+                  f"HD95: {voronoi_surf['hausdorff_95']:.4f}v, "
+                  f"F1@1v: {voronoi_surf['f1_1v']:.4f}, F1@2v: {voronoi_surf['f1_2v']:.4f}")
+
+            writer.add_scalar("test/mesh_direct_chamfer", voronoi_surf["chamfer"], iters)
+            writer.add_scalar("test/mesh_direct_hausdorff", voronoi_surf["hausdorff"], iters)
+            writer.add_scalar("test/mesh_direct_hausdorff_95", voronoi_surf["hausdorff_95"], iters)
+            writer.add_scalar("test/mesh_direct_f1_1v", voronoi_surf["f1_1v"], iters)
+            writer.add_scalar("test/mesh_direct_f1_2v", voronoi_surf["f1_2v"], iters)
+
+            with open(f"{out_dir}/metrics.txt", "a") as f:
+                f.write(f"Mesh Direct CD: {voronoi_surf['chamfer']:.4f}\n")
+                f.write(f"Mesh Direct Hausdorff: {voronoi_surf['hausdorff']:.4f}\n")
+                f.write(f"Mesh Direct Hausdorff 95: {voronoi_surf['hausdorff_95']:.4f}\n")
+                f.write(f"Mesh Direct F1 1v: {voronoi_surf['f1_1v']:.4f}\n")
+                f.write(f"Mesh Direct F1 2v: {voronoi_surf['f1_2v']:.4f}\n")
 
             # R2-Gaussian volume metrics
             if r2_volume is not None:
