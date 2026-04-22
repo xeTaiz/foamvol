@@ -137,7 +137,7 @@ class OptimizationParams(ParamGroup):
         self.neighbor_var_weight_final = -1.0  # weight at interpolation_start (-1 = hold neighbor_var_weight)
         self.neighbor_var_hops = 1         # k-hop neighborhood depth
         self.neighbor_var_start = 0
-        self.neighbor_reg_type = "bilateral_var"  # 'bilateral_var', 'huber', or 'bilateral_huber'
+        self.neighbor_reg_type = "bilateral_var"  # 'bilateral_var', 'huber', 'bilateral_huber', 'median', 'bilateral_median'
         self.neighbor_huber_delta = 0.1    # Huber delta: residuals below this get L2, above get L1
         self.var_sigma_v_init = 0.2        # bilateral sigma at start (large = plain smoothing)
         self.var_sigma_v_final = 0.2       # bilateral sigma at end (small = edge-preserving)

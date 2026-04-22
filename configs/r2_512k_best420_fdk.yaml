@@ -40,12 +40,16 @@ voxel_var_weight: 1e-3
 voxel_var_weight_final: -1.0
 voxel_var_resolution: 64
 voxel_var_start: 0
+voxel_var_supersample: 1
 neighbor_var_weight: 1e-3
 neighbor_var_weight_final: -1.0
 neighbor_var_hops: 1
 neighbor_var_start: 0
+neighbor_reg_type: bilateral_var
+neighbor_huber_delta: 0.1
 var_sigma_v_init: 50.0
 var_sigma_v_final: 0.2
+grad_smooth_hops: 0
 
 # 3D reference volume loss — FDK blurred to 64^3, active from start
 #ref_volume_path: "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone/traditional/fdk/ct_pred.npy"
@@ -58,6 +62,7 @@ ref_volume_resolution: 64
 ref_volume_blur_sigma: 0.0
 ref_volume_edge_mask: True
 ref_volume_edge_alpha: 10.0
+ref_volume_supersample: 1
 
 # Densification + pruning
 densify_from: 1000
