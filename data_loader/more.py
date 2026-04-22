@@ -28,9 +28,10 @@ import warnings
 from collections import defaultdict
 
 import astra
-import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
+from torchvision.io import read_image, ImageReadMode
 
 # --- Standard AAPM fan-flat CT geometry ---
 SOD_MM = 595.0
@@ -98,10 +99,8 @@ def _load_png_patient(png_dir, patient_id):
         raise FileNotFoundError(f"No PNG slices for patient {patient_id} in {png_dir}")
     slices = []
     for f in files:
-        img = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            raise IOError(f"Failed to read {f}")
-        slices.append(img.astype(np.float32) / 255.0)
+        img_t = read_image(f, mode=ImageReadMode.GRAY)  # (1, H, W) uint8
+        slices.append(img_t.squeeze().numpy().astype(np.float32) / 255.0)
     return np.stack(slices, axis=0)
 
 
@@ -138,10 +137,9 @@ def _load_dicom_series(series_dir):
 def _resize_volume(vol, target_size):
     if vol.shape[1] == target_size and vol.shape[2] == target_size:
         return vol
-    return np.stack([
-        cv2.resize(vol[k], (target_size, target_size), interpolation=cv2.INTER_AREA)
-        for k in range(vol.shape[0])
-    ])
+    t = torch.from_numpy(vol).float().unsqueeze(1)  # (N, 1, H, W)
+    t = F.interpolate(t, size=(target_size, target_size), mode="area")
+    return t.squeeze(1).numpy()
 
 
 # ---------------------------------------------------------------------------

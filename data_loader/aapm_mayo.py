@@ -35,6 +35,7 @@ import warnings
 import astra
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 # --- Mayo clinic scanner geometry (AAPM challenge) ---
 SOD_MM = 595.0
@@ -135,11 +136,9 @@ def _load_dicom_patient(patient_dir):
 
     # Resize to IMG_SIZE if needed
     if vol.shape[1] != IMG_SIZE or vol.shape[2] != IMG_SIZE:
-        import cv2
-        vol = np.stack([
-            cv2.resize(vol[k], (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
-            for k in range(vol.shape[0])
-        ])
+        t = torch.from_numpy(vol).float().unsqueeze(1)  # (N, 1, H, W)
+        t = F.interpolate(t, size=(IMG_SIZE, IMG_SIZE), mode="area")
+        vol = t.squeeze(1).numpy()
 
     return vol
 
