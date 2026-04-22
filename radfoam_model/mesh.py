@@ -201,10 +201,11 @@ def surface_metrics_vs_gt_volume(
         d_v_to_g, _ = tree_g.query(verts_v)
         d_g_to_v, _ = tree_v.query(verts_g)
 
-        chamfer = 0.5 * (float(d_v_to_g.mean()) + float(d_g_to_v.mean()))
+        world_to_vox = (R - 1) / 2.0
+        chamfer = 0.5 * (float(d_v_to_g.mean()) + float(d_g_to_v.mean())) * world_to_vox
         hausdorff_95 = float(max(np.percentile(d_v_to_g, 95),
-                                  np.percentile(d_g_to_v, 95)))
-        hausdorff_max = float(max(d_v_to_g.max(), d_g_to_v.max()))
+                                  np.percentile(d_g_to_v, 95))) * world_to_vox
+        hausdorff_max = float(max(d_v_to_g.max(), d_g_to_v.max())) * world_to_vox
 
         result = {"chamfer": chamfer, "hausdorff": hausdorff_max,
                   "hausdorff_95": hausdorff_95}
