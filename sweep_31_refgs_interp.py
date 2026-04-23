@@ -445,6 +445,9 @@ def main():
 
     if args.worker is not None:
         names = names[args.worker - 1::args.num_workers]
+        if not names:
+            print(f"[WARN] worker {args.worker}/{args.num_workers} has no runs (only {len(all_names)} total) — nothing to do")
+            return
         print(f"Sweep 31: worker {args.worker}/{args.num_workers} — {len(names)} runs")
     else:
         print(f"Sweep 31: {len(names)}/{len(all_names)} runs selected")
