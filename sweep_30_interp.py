@@ -126,7 +126,14 @@ def collect_summary(names, output_csv, sort_key="vol_idw_psnr"):
         print("[WARN] No completed runs to summarize")
         return rows
 
-    fieldnames = ["name"] + [k for k in rows[0] if k != "name"]
+    seen = set()
+    all_keys = []
+    for row in rows:
+        for k in row:
+            if k not in seen:
+                seen.add(k)
+                all_keys.append(k)
+    fieldnames = ["name"] + [k for k in all_keys if k != "name"]
     with open(output_csv, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
         writer.writeheader()
@@ -144,7 +151,14 @@ def main():
     parser.add_argument("--runs", nargs="+", metavar="ID")
     parser.add_argument("--summarize", action="store_true")
     parser.add_argument("--list", action="store_true")
+    parser.add_argument("--worker", type=int, metavar="W")
+    parser.add_argument("--of", type=int, metavar="N", dest="num_workers")
     args = parser.parse_args()
+
+    if (args.worker is None) != (args.num_workers is None):
+        parser.error("--worker and --of must be used together")
+    if args.worker is not None and not (1 <= args.worker <= args.num_workers):
+        parser.error(f"--worker must be between 1 and {args.num_workers}")
 
     if args.list:
         print(f"\n{len(ALL_RUNS)} sweep 30 runs:")
@@ -172,7 +186,11 @@ def main():
     else:
         names = all_names
 
-    print(f"Sweep 30: {len(names)}/{len(all_names)} runs selected")
+    if args.worker is not None:
+        names = names[args.worker - 1::args.num_workers]
+        print(f"Sweep 30: worker {args.worker}/{args.num_workers} — {len(names)} runs")
+    else:
+        print(f"Sweep 30: {len(names)}/{len(all_names)} runs selected")
 
     if not args.summarize:
         for name in names:
