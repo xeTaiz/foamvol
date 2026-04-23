@@ -369,7 +369,14 @@ def collect_summary(names, output_csv, sort_key="vol_raw_dice"):
         print("[WARN] No completed runs to summarize")
         return rows
 
-    fieldnames = ["name"] + [k for k in rows[0] if k != "name"]
+    seen = set()
+    all_keys = []
+    for row in rows:
+        for k in row:
+            if k not in seen:
+                seen.add(k)
+                all_keys.append(k)
+    fieldnames = ["name"] + [k for k in all_keys if k != "name"]
     with open(output_csv, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
         writer.writeheader()
