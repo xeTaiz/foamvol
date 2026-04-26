@@ -1,0 +1,137 @@
+# Best config as of April 26, 2026 for 75-view cone-beam CT reconstruction.
+# Optimized for surface metrics (Chamfer Distance, Hausdorff, mesh F1).
+# Based on sweep 31 run V04-d04-global:
+#   Vol IDW: PSNR=31.60, Dice=0.847, CD=0.861, H95=4.54, mesh-F1@1v=0.844
+#
+# Key findings baked in vs best420:
+#  - Global interp sigma (per_cell=False, per_neighbor=False) wins surface metrics
+#    over per_cell and per_neighbor variants — sweep 31 V-group result
+#  - 1-hop gradient smoothing (grad_smooth_hops=1) gives consistent +0.02–0.04 F1
+#  - vvar/nvar OFF — light regularization actually hurts surface sharpness at this setup
+#  - prune_variance_criterion=False — IDW redundancy cap (0.03) better than variance criterion
+#    for the no-reg no-refvol baseline (sweep 31 group comparison)
+#  - interp_sigma_scale=0.7, interp_sigma_v=0.8 (sweep 32: v080 consistently beats v020)
+
+# Training
+iterations: 10000
+rays_per_batch: 1_000_000
+rays_per_batch_late: 8_000_000
+rays_per_batch_late_start: 9000
+init_points: 64000
+final_points: 512000
+activation_scale: 1.0
+init_scale: 1.05
+init_type: random
+init_density: 2.0
+init_volume_path: ""
+device: cuda
+debug: False
+viewer: False
+save_volume: False
+dataset: r2_gaussian
+data_path: r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone
+
+# Optimization
+loss_type: l1
+points_lr_init: 2e-4
+points_lr_final: 5e-6
+density_lr_init: 5e-2
+density_lr_final: 1e-2
+freeze_points: 9500
+density_grad_clip: 10.0
+tv_weight: 0.0
+tv_start: 0
+tv_epsilon: 1e-4
+tv_area_weighted: False
+tv_border: False
+tv_anneal: False
+tv_on_raw: True
+
+# Regularization — OFF (no vvar, no nvar; sweep 31 shows clean surfaces without)
+voxel_var_weight: 0.0
+voxel_var_weight_final: -1.0
+voxel_var_resolution: 64
+voxel_var_start: 0
+voxel_var_supersample: 4
+neighbor_var_weight: 0.0
+neighbor_var_weight_final: -1.0
+neighbor_var_hops: 1
+neighbor_var_start: 0
+neighbor_reg_type: bilateral_var
+neighbor_huber_delta: 0.1
+var_sigma_v_init: 50.0
+var_sigma_v_final: 0.2
+grad_smooth_hops: 1              # 1-hop gradient smoothing (d04-style; sweep 31 winner)
+
+# Densification + pruning
+densify_from: 1000
+densify_until: 6000
+densify_factor: 1.15
+gradient_fraction: 0.4
+idw_fraction: 0.3
+entropy_fraction: 0.3
+entropy_bins: 5
+contrast_alpha: 0.0
+redundancy_threshold: 0.0
+redundancy_cap: 0.03
+redundancy_cap_init: 0.0
+redundancy_cap_final: 0.0
+prune_variance_criterion: False
+prune_hops: 1
+ref_guided_pruning: False
+ref_guided_densify: False
+ref_guided_eps: 0.01
+targeted_fraction: 0.1
+targeted_start: -1
+
+# Reference volume OFF
+ref_volume_path: ""
+ref_volume_weight: 0.0
+ref_volume_weight_final: -1.0
+ref_volume_start: 0
+ref_volume_until: -1
+ref_volume_resolution: 64
+ref_volume_blur_sigma: 0.0
+ref_volume_edge_mask: True
+ref_volume_edge_alpha: 10.0
+ref_volume_supersample: 4
+
+# High-error sampling
+high_error_fraction: 0.2
+high_error_power: 1.0
+high_error_start: -1
+
+# Interpolation — global sigma (sweep 31 surface-metric winner)
+interpolation_start: 9000
+interp_ramp: False
+interp_sigma_abs: 0.035          # absolute sigma in scene units (~s07 for 512k, between s07-s15 for 1M)
+interp_sigma_scale: 0.7          # fallback if interp_sigma_abs=0
+interp_sigma_v: 0.8
+per_cell_sigma: False            # global sigma wins on CD/H95/F1 vs per_cell (sweep 31)
+per_neighbor_sigma: False        # no-op when per_cell=False (confirmed scene.py:82-88)
+bf_start: -1
+bf_until: 6000
+bf_period: 10
+bf_sigma_init: 2.0
+bf_sigma_final: 0.3
+bf_sigma_v_init: 10.0
+bf_sigma_v_final: 0.1
+
+# Gaussians OFF
+gaussian_start: -1
+freeze_base_at_gaussian: False
+joint_finetune_start: -1
+peak_lr_init: 1e-2
+peak_lr_final: 1e-3
+offset_lr_init: 1e-3
+offset_lr_final: 1e-4
+cov_lr_init: 1e-2
+cov_lr_final: 1e-3
+
+# Linear Gradient OFF
+gradient_start: -1
+gradient_lr_init: 1e-2
+gradient_lr_final: 1e-3
+gradient_warmup: 500
+gradient_max_slope: 5.0
+gradient_freeze_points: 500
