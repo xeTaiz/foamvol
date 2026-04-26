@@ -258,6 +258,13 @@ class DataHandler:
             rays = jitter_rays_cone(rays, self.pixel_ang_size)
         return rays, proj
 
+    def set_batch_size(self, new_batch_size):
+        self.rays_per_batch = new_batch_size
+        self.batch_size = new_batch_size
+        if hasattr(self, '_he_fraction'):
+            self._he_batch_size = int(self.batch_size * self._he_fraction)
+            # _he_pool cursor logic auto-refreshes when remaining < _he_batch_size
+
     def get_high_error_iter(self):
         """Iterator yielding (uniform_rays + high_error_rays, uniform_proj + high_error_proj)."""
         ray_batch_fetcher = radfoam.BatchFetcher(
