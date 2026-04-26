@@ -71,6 +71,9 @@ class PipelineParams(ParamGroup):
         self.ref_guided_densify = False    # bias gradient+IDW densification toward low ref_w regions
         self.ref_guided_eps = 0.05         # floor on (1-ref_w) densify multiplier
         self.rays_per_batch = 2_000_000
+        self.rays_per_batch_late = 8_000_000   # batch size from rays_per_batch_late_start onward (<= rays_per_batch disables)
+        self.rays_per_batch_late_start = 9000  # iter to switch (-1 disables)
+        self.interp_sigma_abs = 0.0            # absolute IDW sigma in scene units (0 = use interp_sigma_scale × median_radius)
         self.bf_start = -1            # iteration to start (-1 = disabled)
         self.bf_until = 6000          # iteration to stop
         self.bf_period = 10           # apply every N steps
