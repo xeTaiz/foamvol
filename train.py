@@ -862,6 +862,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         data_iterator = train_data_handler.get_iter()
         ray_batch, proj_batch = next(data_iterator)
         _he_active = False
+        _batch_ramped = False
 
         triangulation_update_period = 1
         iters_since_update = 1
@@ -1024,6 +1025,21 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         print(f"High-error sampling activated at iter {i} "
                               f"(fraction={pipeline_args.high_error_fraction})")
 
+                # Late-phase batch ramp (one-time switch)
+                if (not _batch_ramped
+                        and pipeline_args.rays_per_batch_late_start >= 0
+                        and pipeline_args.rays_per_batch_late > pipeline_args.rays_per_batch
+                        and i >= pipeline_args.rays_per_batch_late_start):
+                    train_data_handler.set_batch_size(pipeline_args.rays_per_batch_late)
+                    if _he_active:
+                        data_iterator = train_data_handler.get_high_error_iter()
+                    else:
+                        data_iterator = train_data_handler.get_iter()
+                    ray_batch, proj_batch = next(data_iterator)
+                    _batch_ramped = True
+                    print(f"Late-phase batch ramp at iter {i}: "
+                          f"{pipeline_args.rays_per_batch} -> {pipeline_args.rays_per_batch_late} rays/batch")
+
                 # Interpolation interleaving schedule
                 if pipeline_args.interpolation_start >= 0:
                     if i >= pipeline_args.interpolation_start:
@@ -1185,6 +1201,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         if use_adaptive:
                             # Pass raw scale factor — kernel multiplies by per-cell radius
                             sigma = pipeline_args.interp_sigma_scale
+                        elif pipeline_args.interp_sigma_abs > 0:
+                            sigma = pipeline_args.interp_sigma_abs
                         else:
                             _, cell_radius = radfoam.farthest_neighbor(
                                 model.primal_points,
