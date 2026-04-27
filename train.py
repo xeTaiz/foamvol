@@ -295,6 +295,22 @@ def log_diagnostics(model, writer, step):
         writer.add_histogram("diagnostics/cell_radius", cell_radius, step)
 
 
+def _resolve_global_sigma(model, pipeline_args):
+    """Return absolute physical IDW sigma for global (non-per-cell) consumers.
+
+    Uses interp_sigma_abs directly when set; otherwise computes scale × median(cell_radius)
+    from the current mesh. Per-cell consumers should use interp_sigma_scale raw instead.
+    Pruning (compute_redundancy_error) intentionally stays on scale-of-median regardless —
+    pruning quality is intrinsically relative to local mesh density.
+    """
+    if pipeline_args.interp_sigma_abs > 0:
+        return pipeline_args.interp_sigma_abs
+    _, cr = radfoam.farthest_neighbor(
+        model.primal_points, model.point_adjacency, model.point_adjacency_offsets,
+    )
+    return pipeline_args.interp_sigma_scale * cr.median().item()
+
+
 def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     device = torch.device(model_args.device)
     # Setting up output directory
@@ -414,11 +430,17 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         max_iterations=pipeline_args.iterations,
     )
 
-    # Store IDW interpolation params on model early so _idw_voxelize can use them
+    # Store IDW interpolation params on model early so vvar and idw_voxelize can use them
     # throughout training (not just after interpolation_start).
+    # For the global (non-per-cell) path, resolve to an absolute physical sigma now so that
+    # vvar and pre-densify_until voxelizations use a correctly-scaled spatial kernel.
+    # Per-cell consumers get the raw scale factor; the kernel multiplies it by cell_radius_i.
+    _use_adaptive = pipeline_args.per_cell_sigma or pipeline_args.per_neighbor_sigma
+    _sigma_init = (pipeline_args.interp_sigma_scale if _use_adaptive
+                   else _resolve_global_sigma(model, pipeline_args))
     model.set_interpolation_mode(
         False,
-        sigma=pipeline_args.interp_sigma_scale,
+        sigma=_sigma_init,
         sigma_v=pipeline_args.interp_sigma_v,
         per_cell_sigma=pipeline_args.per_cell_sigma,
         per_neighbor_sigma=pipeline_args.per_neighbor_sigma,
@@ -559,7 +581,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 model.point_adjacency,
                 model.point_adjacency_offsets,
             )
-            sigma = pipeline_args.interp_sigma_scale * cell_radius.median().item()
+            sigma = (pipeline_args.interp_sigma_abs if pipeline_args.interp_sigma_abs > 0
+                     else pipeline_args.interp_sigma_scale * cell_radius.median().item())
             sigma_v = pipeline_args.interp_sigma_v
 
             # Slice visualizations
@@ -1198,18 +1221,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                     if pipeline_args.interpolation_start >= 0:
                         use_adaptive = pipeline_args.per_cell_sigma or pipeline_args.per_neighbor_sigma
-                        if use_adaptive:
-                            # Pass raw scale factor — kernel multiplies by per-cell radius
-                            sigma = pipeline_args.interp_sigma_scale
-                        elif pipeline_args.interp_sigma_abs > 0:
-                            sigma = pipeline_args.interp_sigma_abs
-                        else:
-                            _, cell_radius = radfoam.farthest_neighbor(
-                                model.primal_points,
-                                model.point_adjacency,
-                                model.point_adjacency_offsets,
-                            )
-                            sigma = pipeline_args.interp_sigma_scale * cell_radius.median().item()
+                        sigma = (pipeline_args.interp_sigma_scale if use_adaptive
+                                 else _resolve_global_sigma(model, pipeline_args))
                         model.set_interpolation_mode(
                             False, sigma=sigma, sigma_v=pipeline_args.interp_sigma_v,
                             per_cell_sigma=pipeline_args.per_cell_sigma,
@@ -1289,7 +1302,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 model.point_adjacency,
                 model.point_adjacency_offsets,
             )
-            interp_sigma = pipeline_args.interp_sigma_scale * cell_radius.median().item()
+            interp_sigma = (pipeline_args.interp_sigma_abs if pipeline_args.interp_sigma_abs > 0
+                            else pipeline_args.interp_sigma_scale * cell_radius.median().item())
             interp_sigma_v = pipeline_args.interp_sigma_v
 
         field = load_density_field(model_path)

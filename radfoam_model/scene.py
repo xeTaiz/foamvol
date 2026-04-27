@@ -964,6 +964,10 @@ class CTScene(torch.nn.Module):
         adj = self.point_adjacency.long()
         N = points.shape[0]
 
+        # Intentionally uses scale × median(radius), not interp_sigma_abs.
+        # Pruning quality is relative to local mesh density: a cell is redundant when its
+        # neighbors (at the current mesh resolution) predict it well. Fixing to a physical
+        # absolute sigma would penalize fine-mesh regions more aggressively than coarse ones.
         sigma = sigma_scale * cell_radius.median().item()
         sigma_sq = sigma ** 2
 
