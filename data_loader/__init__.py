@@ -13,6 +13,8 @@ from .lodopab import LoDoPaBDataset
 from .two_detectct import TwoDeteCTDataset
 from .more import MOREDataset
 from .aapm_mayo import AAPMMayoDataset
+from .inveon_ct import InveonDataset
+from .acr_dicomctpd import ACRPhantomDataset
 from .targeted_sampler import build_targeted_batch
 
 
@@ -63,6 +65,8 @@ dataset_dict = {
     "two_detectct": TwoDeteCTDataset,
     "more": MOREDataset,
     "aapm_mayo": AAPMMayoDataset,
+    "inveon_ct": InveonDataset,
+    "acr_phantom": ACRPhantomDataset,
 }
 
 
