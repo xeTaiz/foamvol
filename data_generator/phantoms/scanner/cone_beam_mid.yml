@@ -1,0 +1,48 @@
+# Mode
+mode: cone
+filter: null
+
+# System configuration
+DSD: 7.0
+DSO: 5.0
+
+# Detector parameters
+nDetector:
+- 512
+- 512
+sDetector:
+- 4.0
+- 4.0
+
+# Image parameters
+nVoxel:
+- 256
+- 256
+- 256
+sVoxel:
+- 2.0
+- 2.0
+- 2.0
+
+# Offsets
+offOrigin:
+- 0
+- 0
+- 0
+offDetector:
+- 0
+- 0
+
+# Auxiliary
+accuracy: 0.5
+
+# Angles
+totalAngle: 360.0
+startAngle: 0.0
+
+# Mid noise: Poisson 5e5 (5x more photons than default), Gaussian std 5 (vs default 10)
+noise: true
+possion_noise: 500000
+gaussian_noise:
+- 0
+- 5
