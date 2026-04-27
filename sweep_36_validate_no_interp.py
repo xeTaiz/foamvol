@@ -23,7 +23,7 @@ Stage B — single-factor ablations vs best427 baseline:
   B4 bf:       bilateral filter σ schedules
   B5 pruning:  redundancy_cap variants + variance criterion
   B6 loss:     l2 vs l1
-  B7 fdk:      FDK init + refvol regularization (chest only — no FDK for pepper)
+  B7 refvol:   reference volume regularization (output/init/{chest,pepper}/model.pt)
 
 Usage:
     python sweep_36_validate_no_interp.py --list
@@ -44,9 +44,10 @@ import sys
 import yaml
 
 SWEEP_DIR    = "output/sweep36_validate_no_interp"
-CHEST_DATA   = "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone"
-PEPPER_DATA  = "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone"
-CHEST_FDK    = "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone/traditional/fdk/ct_pred.npy"
+CHEST_DATA      = "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone"
+PEPPER_DATA     = "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone"
+CHEST_INIT_PT   = "output/init/chest/model.pt"
+PEPPER_INIT_PT  = "output/init/pepper/model.pt"
 
 # Post-hoc σ per dataset (from eval_sigma_sweep.py on sweep 35 raw checkpoints)
 EVAL_SIGMA = {
@@ -275,20 +276,14 @@ ALL_RUNS.update(_both(
 # ── Stage B6: loss function ───────────────────────────────────────────────────
 ALL_RUNS.update(_both("loss-l2", loss_type="l2"))
 
-# ── Stage B7: FDK init + refvol (chest only — no pepper FDK) ─────────────────
-ALL_RUNS["chest-fdk-init"] = base_config(
-    data_path=CHEST_DATA,
-    init_volume_path=CHEST_FDK,
-    init_density=0.0,
-)
-ALL_RUNS["chest-fdk-refvol"] = base_config(
-    data_path=CHEST_DATA,
-    init_volume_path=CHEST_FDK,
-    init_density=0.0,
-    ref_volume_path=CHEST_FDK,
+# ── Stage B7: refvol regularization (scratch init, .pt reference) ─────────────
+ALL_RUNS.update(_both(
+    "refvol-w1e3",
     ref_volume_weight=1e-3,
     ref_volume_start=0,
-)
+))
+ALL_RUNS["chest-refvol-w1e3"]["ref_volume_path"] = CHEST_INIT_PT
+ALL_RUNS["pepper-refvol-w1e3"]["ref_volume_path"] = PEPPER_INIT_PT
 
 
 # ── Infrastructure ─────────────────────────────────────────────────────────────
