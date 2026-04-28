@@ -198,11 +198,19 @@ for cap, ctag in [(0.01, "cap01"), (0.05, "cap05"), (0.10, "cap10")]:
         prune_hops=1,
     ))
 
-# prune_hops=2 at cap=0.03 (sweep-36 winner cap); re-run at best cap after B results
+# prune_hops=2 at cap=0.03 (sweep-36 winner cap)
 ALL_RUNS.update(_both(
     "pruning-var-h2-cap03",
     prune_variance_criterion=True,
     redundancy_cap=0.03,
+    prune_hops=2,
+))
+
+# prune_hops=2 at cap=0.05 (B results: cap=0.05 best on pepper, competitive on chest)
+ALL_RUNS.update(_both(
+    "pruning-var-h2-cap05",
+    prune_variance_criterion=True,
+    redundancy_cap=0.05,
     prune_hops=2,
 ))
 
