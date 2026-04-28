@@ -19,22 +19,23 @@ EDGE_PAIRS = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
 # Row index = 4-bit mask of which vertices are inside (density >= threshold).
 # Each row: [t0_e0, t0_e1, t0_e2,  t1_e0, t1_e1, t1_e2]
 #   where values are edge indices 0..5 (from EDGE_PAIRS), -1 = no triangle.
-# Winding: cases 1..7 have normals pointing toward the "outside" region;
-#           cases 8..14 are their bitwise complements with reversed winding.
+# Winding convention: canonical negatively-oriented tet (det((v1-v0,v2-v0,v3-v0)) < 0),
+# normals point outward (away from the inside/high-density region).
+# Tets with positive det have their output triangles flipped in marching_tets().
 _TRI_TABLE = [
     [-1, -1, -1,  -1, -1, -1],  # 0:  all outside
     [ 0,  2,  1,  -1, -1, -1],  # 1:  v0 in
     [ 0,  3,  4,  -1, -1, -1],  # 2:  v1 in
-    [ 1,  2,  4,   1,  4,  3],  # 3:  v0,v1 in
-    [ 1,  3,  5,  -1, -1, -1],  # 4:  v2 in
+    [ 1,  3,  4,   1,  4,  2],  # 3:  v0,v1 in
+    [ 1,  5,  3,  -1, -1, -1],  # 4:  v2 in
     [ 0,  2,  5,   0,  5,  3],  # 5:  v0,v2 in
     [ 0,  1,  5,   0,  5,  4],  # 6:  v1,v2 in
-    [ 2,  4,  5,  -1, -1, -1],  # 7:  v0,v1,v2 in
-    [ 2,  5,  4,  -1, -1, -1],  # 8:  v3 in
+    [ 2,  5,  4,  -1, -1, -1],  # 7:  v0,v1,v2 in
+    [ 2,  4,  5,  -1, -1, -1],  # 8:  v3 in
     [ 0,  5,  1,   0,  4,  5],  # 9:  v0,v3 in
     [ 0,  5,  2,   0,  3,  5],  # 10: v1,v3 in
-    [ 1,  5,  3,  -1, -1, -1],  # 11: v0,v1,v3 in
-    [ 1,  4,  2,   1,  3,  4],  # 12: v2,v3 in
+    [ 1,  3,  5,  -1, -1, -1],  # 11: v0,v1,v3 in
+    [ 1,  2,  4,   1,  4,  3],  # 12: v2,v3 in
     [ 0,  4,  3,  -1, -1, -1],  # 13: v0,v2,v3 in
     [ 0,  1,  2,  -1, -1, -1],  # 14: v1,v2,v3 in
     [-1, -1, -1,  -1, -1, -1],  # 15: all inside
@@ -97,6 +98,15 @@ def marching_tets(points, density, tets, threshold, density_fn=None):
     T = tets_l.shape[0]
     tet_d = density[tets_l]   # (T, 4) activated density at tet vertices
     tet_p = points[tets_l]    # (T, 4, 3)
+
+    # Per-tet orientation: det((v1-v0, v2-v0, v3-v0)).
+    # The triangulation does not guarantee consistent orientation, so we detect
+    # positively-oriented tets and flip their output triangle winding below.
+    e1 = tet_p[:, 1] - tet_p[:, 0]
+    e2 = tet_p[:, 2] - tet_p[:, 0]
+    e3 = tet_p[:, 3] - tet_p[:, 0]
+    tet_det = (torch.linalg.cross(e1, e2) * e3).sum(dim=-1)  # (T,)
+    tet_flipped = tet_det > 0  # canonical convention is det < 0
 
     # Case index: bitmask of which local vertices are inside
     inside = tet_d >= threshold  # (T, 4) bool
@@ -178,6 +188,14 @@ def marching_tets(points, density, tets, threshold, density_fn=None):
         )
 
     faces = inverse.reshape(F_count, 3)  # (F, 3) vertex indices
+
+    # Flip winding for triangles from positively-oriented tets so all normals
+    # are consistent with the canonical (det < 0) convention used by _TRI_TABLE.
+    flip_mask = tet_flipped[all_tris[:, 0]]  # (F_count,)
+    if flip_mask.any():
+        faces[flip_mask, 1], faces[flip_mask, 2] = (
+            faces[flip_mask, 2].clone(), faces[flip_mask, 1].clone()
+        )
 
     return unique_pos.cpu().numpy(), faces.cpu().numpy().astype(np.int64)
 
