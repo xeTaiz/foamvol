@@ -2,11 +2,13 @@
 
 import torch
 
+from .utils import bilinear_proj_lookup
+
 VIEWS_PER_CELL = 10
 
 
 def build_targeted_batch(cell_weights, points, cell_radii,
-                         train_rays_gpu, train_projections_gpu,
+                         train_rays_gpu, proj_nchw,
                          beam_type, beam_geom,
                          n_target_rays):
     """Build a single targeted batch entirely on GPU.
@@ -16,7 +18,7 @@ def build_targeted_batch(cell_weights, points, cell_radii,
         points: (N, 3) cell positions on GPU
         cell_radii: (N,) cell radii on GPU
         train_rays_gpu: (total_rays, 6) flat training rays on GPU
-        train_projections_gpu: (total_rays, C) flat projections on GPU
+        proj_nchw: (num_angles, det_h, det_w, 1) projections on GPU
         beam_type: "parallel" or "cone"
         beam_geom: dict with geometry constants (all on GPU):
             num_angles, det_h, det_w, and beam-specific params
@@ -57,8 +59,14 @@ def build_targeted_batch(cell_weights, points, cell_radii,
 
         pixel_size = beam_geom["pixel_size"]
         extent = pixel_size * det_w
-        iu = ((u / extent + 0.5) * det_w).long().clamp(0, det_w - 1)
-        iv = ((v / extent + 0.5) * det_h).long().clamp(0, det_h - 1)
+        px = (u / extent + 0.5) * det_w
+        py = (v / extent + 0.5) * det_h
+
+        iu = px.long().clamp(0, det_w - 1)
+        iv = py.long().clamp(0, det_h - 1)
+        flat_idx = (angle_idx * (det_h * det_w) + iv * det_w + iu).clamp(0, total_rays - 1)
+        proj = bilinear_proj_lookup(proj_nchw, angle_idx, px, py)
+        return train_rays_gpu[flat_idx], proj
 
     elif beam_type == "cone":
         c2ws = beam_geom["c2ws"]  # (num_angles, 4, 4) on GPU
@@ -77,10 +85,16 @@ def build_targeted_batch(cell_weights, points, cell_radii,
 
         iu = px.long().clamp(0, det_w - 1)
         iv = py.long().clamp(0, det_h - 1)
+        flat_idx = (angle_idx * (det_h * det_w) + iv * det_w + iu).clamp(0, total_rays - 1)
+        proj = bilinear_proj_lookup(proj_nchw, angle_idx, px, py)
+        return train_rays_gpu[flat_idx], proj
 
     else:
         flat_idx = torch.randint(0, total_rays, (n_rays,), device=cell_weights.device)
-        return train_rays_gpu[flat_idx], train_projections_gpu[flat_idx]
-
-    flat_idx = (angle_idx * (det_h * det_w) + iv * det_w + iu).clamp(0, total_rays - 1)
-    return train_rays_gpu[flat_idx], train_projections_gpu[flat_idx]
+        N, H, W = proj_nchw.shape[:3]
+        view = flat_idx // (H * W)
+        rem = flat_idx % (H * W)
+        iy = rem // W
+        ix = rem % W
+        proj = proj_nchw[view, iy, ix]
+        return train_rays_gpu[flat_idx], proj
