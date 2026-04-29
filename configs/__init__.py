@@ -88,6 +88,7 @@ class PipelineParams(ParamGroup):
         self.high_error_start = -1      # iteration to start (-1 = same as densify_from)
         self.log_percent = 5          # log metrics every N% of iterations
         self.diag_percent = 10        # log diagnostics/slices every N% of iterations
+        self.diag = False             # enable mid-training diag logs (always logs once after training)
         super().__init__(parser, "Setting Pipeline parameters")
 
 
