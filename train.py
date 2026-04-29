@@ -895,13 +895,14 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         # Log initial state (step 0, before any optimization)
         if not pipeline_args.debug:
             test_m, _ = log_basic(0)
-            log_diag(0, test_images=test_m)
+            if pipeline_args.diag:
+                log_diag(0, test_images=test_m)
             log_volume_slices(model, writer, gt_volume, 0, experiment_name)
 
         _loss_cpu = None
         with tqdm.trange(pipeline_args.iterations) as train:
             for i in train:
-                return_diag = (i % diag_interval == diag_interval - 1 and not pipeline_args.debug)
+                return_diag = (pipeline_args.diag and i % diag_interval == diag_interval - 1 and not pipeline_args.debug)
                 proj_output, contribution, hit_count, _, _ = model(ray_batch, return_contribution=return_diag)
 
                 loss = loss_fn(proj_output, proj_batch)
@@ -1103,7 +1104,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     _last_test_m, _ = log_basic(i, loss_val=loss.item(), tv_loss_val=tv_loss_val,
                                                 tv_scale_val=tv_scale_val)
 
-                if i % diag_interval == diag_interval - 1 and not pipeline_args.debug:
+                if pipeline_args.diag and i % diag_interval == diag_interval - 1 and not pipeline_args.debug:
                     # If log_basic didn't just run at this step, run it now for images
                     if i % log_interval != log_interval - 1:
                         _last_test_m, _ = log_basic(i)
