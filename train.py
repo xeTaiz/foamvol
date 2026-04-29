@@ -16,6 +16,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from skimage.measure import marching_cubes
 from scipy.spatial import KDTree
@@ -310,6 +313,42 @@ def _resolve_global_sigma(model, pipeline_args):
         model.primal_points, model.point_adjacency, model.point_adjacency_offsets,
     )
     return pipeline_args.interp_sigma_scale * cr.median().item()
+
+
+@torch.no_grad()
+def _log_grad_distribution(writer, step, point_error):
+    """Log position-gradient distribution diagnostics at a densification step.
+
+    Logs six quantile ratios as scalars and a sorted-magnitude curve as a figure.
+    Ratios are scale-invariant, so they measure distribution shape independent of
+    the absolute gradient level (immune to uniform optimizer drift).
+    """
+    g = point_error.detach().cpu().float().squeeze()
+    eps = 1e-12
+    quantiles = torch.quantile(g, torch.tensor([0.1, 0.5, 0.8, 0.9, 0.99]))
+    q10, q50, q80, q90, q99 = quantiles.tolist()
+
+    writer.add_scalar("densify/ratio_q99_q90", q99 / max(q90, eps), step)
+    writer.add_scalar("densify/ratio_q99_q80", q99 / max(q80, eps), step)
+    writer.add_scalar("densify/ratio_q99_q50", q99 / max(q50, eps), step)
+    writer.add_scalar("densify/ratio_q99_q10", q99 / max(q10, eps), step)
+    writer.add_scalar("densify/ratio_q90_q10", q90 / max(q10, eps), step)
+
+    sorted_g = torch.sort(g)[0].numpy()
+    x = np.arange(len(sorted_g))
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(x, sorted_g, lw=0.8)
+    ax.axhline(q10, ls="-",  color="blue",   lw=1.0, label=f"q10={q10:.3g}")
+    ax.axhline(q90, ls="--", color="orange", lw=1.0, label=f"q90={q90:.3g}")
+    ax.axhline(q99, ls=":",  color="red",    lw=1.0, label=f"q99={q99:.3g}")
+    ax.set_yscale("log")
+    ax.set_xlabel("cell rank")
+    ax.set_ylabel("|grad|")
+    ax.legend(fontsize=8)
+    fig.suptitle(f"grad distribution  step={step}  N={len(sorted_g)}")
+    fig.tight_layout()
+    writer.add_figure("densify/grad_distribution", fig, step)
+    plt.close(fig)
 
 
 def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
@@ -1176,6 +1215,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     if not pipeline_args.debug and densify_stats is not None:
                         for key, val in densify_stats.items():
                             writer.add_scalar(f"densify/{key}", val, i)
+                        _log_grad_distribution(writer, i, point_error)
 
                     model.update_triangulation(incremental=False)
                     triangulation_update_period = 1
@@ -1269,6 +1309,9 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 if viewer is not None and viewer.is_closed():
                     break
 
+        _train_duration = time.time() - _train_start_time
+        print(f"Training time: {_train_duration:.1f}s ({_train_duration / 60:.2f}min)")
+        writer.add_scalar("train/training_time_seconds", _train_duration, i)
         if not pipeline_args.debug:
             model.save_ply(f"{out_dir}/scene.ply")
             model.save_pt(f"{out_dir}/model.pt")
@@ -1277,14 +1320,15 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     train_loop(viewer=None)
 
     iters = pipeline_args.iterations
-    _train_duration = time.time() - _train_start_time
-    print(f"Training time: {_train_duration:.1f}s ({_train_duration / 60:.2f}min)")
-    writer.add_scalar("train/training_time_seconds", _train_duration, iters)
-
     if not pipeline_args.debug:
         # Final basic + diag logging
         test_metrics, train_metrics = log_basic(iters)
         slice_metrics = log_diag(iters, test_images=test_metrics)
+        point_error_final, _ = model.collect_error_map(
+            train_data_handler,
+            contrast_alpha=pipeline_args.contrast_alpha,
+        )
+        _log_grad_distribution(writer, iters, point_error_final)
 
         with open(f"{out_dir}/metrics.txt", "w") as f:
             f.write(f"Test  RMSE: {test_metrics['rmse']:.6f}\n")
