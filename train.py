@@ -1,4 +1,5 @@
 import os
+import time
 import uuid
 import yaml
 import gc
@@ -900,6 +901,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
             log_volume_slices(model, writer, gt_volume, 0, experiment_name)
 
         _loss_cpu = None
+        _train_start_time = time.time()
         with tqdm.trange(pipeline_args.iterations) as train:
             for i in train:
                 return_diag = (pipeline_args.diag and i % diag_interval == diag_interval - 1 and not pipeline_args.debug)
@@ -1275,6 +1277,9 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     train_loop(viewer=None)
 
     iters = pipeline_args.iterations
+    _train_duration = time.time() - _train_start_time
+    print(f"Training time: {_train_duration:.1f}s ({_train_duration / 60:.2f}min)")
+    writer.add_scalar("train/training_time_seconds", _train_duration, iters)
 
     if not pipeline_args.debug:
         # Final basic + diag logging
