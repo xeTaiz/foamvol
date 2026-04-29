@@ -251,7 +251,6 @@ class DataHandler:
 
         # Pool lasts one epoch — sample at 256², expand to all 4 pixels of 2×2
         pool_size_lo = int(self._he_fraction * N * H * W) // 4
-        pool_size_lo = min(pool_size_lo, sub_weights.shape[0])
         pool_sub = torch.multinomial(sub_weights, pool_size_lo, replacement=True)
         lowres_flat = candidate_idx[pool_sub]  # indices into (N*eh*ew)
 
