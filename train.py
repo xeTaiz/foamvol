@@ -1308,7 +1308,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 if viewer is not None and viewer.is_closed():
                     break
 
-       if not pipeline_args.debug:
+        if not pipeline_args.debug:
             model.save_ply(f"{out_dir}/scene.ply")
             model.save_pt(f"{out_dir}/model.pt")
         del data_iterator
