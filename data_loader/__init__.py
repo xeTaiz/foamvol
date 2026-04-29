@@ -16,45 +16,58 @@ from .aapm_mayo import AAPMMayoDataset
 from .inveon_ct import InveonDataset
 from .acr_dicomctpd import ACRPhantomDataset
 from .targeted_sampler import build_targeted_batch
+from .utils import bilinear_proj_lookup
 
 
 def jitter_rays_parallel(rays, pixel_size):
-    """Perturb parallel-beam ray origins by uniform random offset within one pixel."""
+    """Perturb parallel-beam ray origins by uniform random offset within one pixel.
+
+    Returns (jittered_rays, du_pix, dv_pix) where du/dv are in [-0.5, 0.5].
+    """
     dirs = rays[..., 3:6]
-    # Perpendicular axis in XY plane
     perp = torch.stack([-dirs[..., 1], dirs[..., 0], torch.zeros_like(dirs[..., 0])], dim=-1)
     vert = torch.zeros_like(dirs)
     vert[..., 2] = 1.0
-    ju = (torch.rand(rays.shape[:-1], device=rays.device) - 0.5) * pixel_size
-    jv = (torch.rand(rays.shape[:-1], device=rays.device) - 0.5) * pixel_size
+    du_pix = torch.rand(rays.shape[:-1], device=rays.device) - 0.5
+    dv_pix = torch.rand(rays.shape[:-1], device=rays.device) - 0.5
     jittered = rays.clone()
-    jittered[..., :3] += ju.unsqueeze(-1) * perp + jv.unsqueeze(-1) * vert
-    return jittered
+    jittered[..., :3] += (du_pix * pixel_size).unsqueeze(-1) * perp + (dv_pix * pixel_size).unsqueeze(-1) * vert
+    return jittered, du_pix, dv_pix
 
 
 def jitter_rays_cone(rays, pixel_ang_size):
-    """Perturb cone-beam ray directions by uniform random offset within one pixel's angular extent."""
+    """Perturb cone-beam ray directions by uniform random offset within one pixel's angular extent.
+
+    Returns (jittered_rays, du_pix, dv_pix) where du/dv are in [-0.5, 0.5].
+    """
     dirs = rays[..., 3:6]
-    # Build a local frame: "right" and "up" perpendicular to each ray direction
-    # Use world-up (0,0,1) as reference; fall back to (1,0,0) for vertical rays
     world_up = torch.zeros_like(dirs)
     world_up[..., 2] = 1.0
     right = torch.cross(dirs, world_up, dim=-1)
     right_norm = right.norm(dim=-1, keepdim=True)
-    # Handle degenerate case (ray parallel to world-up)
     fallback = torch.zeros_like(dirs)
     fallback[..., 0] = 1.0
     right = torch.where(right_norm > 1e-6, right, torch.cross(dirs, fallback, dim=-1))
     right = right / right.norm(dim=-1, keepdim=True)
     up = torch.cross(right, dirs, dim=-1)
     up = up / up.norm(dim=-1, keepdim=True)
-    # Uniform angular jitter within pixel bounds
-    ju = (torch.rand(rays.shape[:-1], device=rays.device) - 0.5) * pixel_ang_size[0]
-    jv = (torch.rand(rays.shape[:-1], device=rays.device) - 0.5) * pixel_ang_size[1]
+    du_pix = torch.rand(rays.shape[:-1], device=rays.device) - 0.5
+    dv_pix = torch.rand(rays.shape[:-1], device=rays.device) - 0.5
     jittered = rays.clone()
-    new_dirs = dirs + ju.unsqueeze(-1) * right + jv.unsqueeze(-1) * up
+    new_dirs = dirs + (du_pix * pixel_ang_size[0]).unsqueeze(-1) * right + (dv_pix * pixel_ang_size[1]).unsqueeze(-1) * up
     jittered[..., 3:6] = new_dirs / new_dirs.norm(dim=-1, keepdim=True)
-    return jittered
+    return jittered, du_pix, dv_pix
+
+
+def _apply_jitter(rays, beam_type, pixel_size, pixel_ang_size, device):
+    """Apply jitter for the given beam type. Returns (jittered_rays, du_pix, dv_pix)."""
+    if beam_type == "parallel" and pixel_size is not None:
+        return jitter_rays_parallel(rays, pixel_size)
+    elif beam_type == "cone" and pixel_ang_size is not None:
+        return jitter_rays_cone(rays, pixel_ang_size)
+    else:
+        zero = torch.zeros(rays.shape[0], device=device)
+        return rays, zero, zero
 
 
 dataset_dict = {
@@ -116,12 +129,15 @@ class DataHandler:
             )
             self.batch_size = self.rays_per_batch
 
-            # GPU copies for targeted sampling
+            num_angles, det_h, det_w, _ = self.rays.shape
+
+            # GPU tensors — sole source of truth for training
             self._train_rays_gpu = self.train_rays.to(self.device, non_blocking=True)
             self._train_projections_gpu = self.train_projections.to(self.device, non_blocking=True)
+            # View-shaped projection tensor for bilinear lookup
+            self._proj_nchw_gpu = self._train_projections_gpu.reshape(num_angles, det_h, det_w, 1)
 
             # Pre-compute beam geometry lookup tables on GPU
-            num_angles, det_h, det_w, _ = self.rays.shape
             self._beam_geom = {
                 "num_angles": num_angles,
                 "det_h": det_h,
@@ -134,6 +150,19 @@ class DataHandler:
                 self._beam_geom["c2ws"] = self.c2ws.to(self.device, non_blocking=True)
                 self._beam_geom["fx"] = self.fx
                 self._beam_geom["fy"] = self.fy
+
+    def _sample_uniform_batch(self, batch_size):
+        """Sample a random batch of rays with bilinear GT. Returns (rays, proj, flat_idx)."""
+        N, H, W = self.rays.shape[:3]
+        flat_idx = torch.randint(0, N * H * W, (batch_size,), device=self.device)
+        rays = self._train_rays_gpu[flat_idx]
+        view = flat_idx // (H * W)
+        rem = flat_idx % (H * W)
+        iy = rem // W
+        ix = rem % W
+        rays, du_pix, dv_pix = _apply_jitter(rays, self.beam_type, self.pixel_size, self.pixel_ang_size, self.device)
+        proj = bilinear_proj_lookup(self._proj_nchw_gpu, view, ix.float() + du_pix, iy.float() + dv_pix)
+        return rays, proj, flat_idx
 
     def update_targeting(self, cell_weights, points, cell_radii,
                          targeted_fraction=0.2):
@@ -254,12 +283,13 @@ class DataHandler:
         flat_idx = self._he_pool[start:end]
         self._he_pool_cursor = end
         rays = self._train_rays_gpu[flat_idx]
-        proj = self._train_projections_gpu[flat_idx]
-        # Apply jitter
-        if self.beam_type == "parallel" and self.pixel_size is not None:
-            rays = jitter_rays_parallel(rays, self.pixel_size)
-        elif self.beam_type == "cone" and self.pixel_ang_size is not None:
-            rays = jitter_rays_cone(rays, self.pixel_ang_size)
+        H, W = self._he_det_h, self._he_det_w
+        view = flat_idx // (H * W)
+        rem = flat_idx % (H * W)
+        iy = rem // W
+        ix = rem % W
+        rays, du_pix, dv_pix = _apply_jitter(rays, self.beam_type, self.pixel_size, self.pixel_ang_size, self.device)
+        proj = bilinear_proj_lookup(self._proj_nchw_gpu, view, ix.float() + du_pix, iy.float() + dv_pix)
         return rays, proj
 
     def set_batch_size(self, new_batch_size):
@@ -271,65 +301,24 @@ class DataHandler:
 
     def get_high_error_iter(self):
         """Iterator yielding (uniform_rays + high_error_rays, uniform_proj + high_error_proj)."""
-        ray_batch_fetcher = radfoam.BatchFetcher(
-            self.train_rays, self.batch_size, shuffle=True
-        )
-        proj_batch_fetcher = radfoam.BatchFetcher(
-            self.train_projections, self.batch_size, shuffle=True
-        )
-
         while True:
-            u_rays = ray_batch_fetcher.next()
-            u_proj = proj_batch_fetcher.next()
-            if self.beam_type == "parallel" and self.pixel_size is not None:
-                u_rays = jitter_rays_parallel(u_rays, self.pixel_size)
-            elif self.beam_type == "cone" and self.pixel_ang_size is not None:
-                u_rays = jitter_rays_cone(u_rays, self.pixel_ang_size)
+            u_rays, u_proj, _ = self._sample_uniform_batch(self.batch_size)
             he_rays, he_proj = self._get_high_error_batch()
             yield torch.cat([u_rays, he_rays], 0), torch.cat([u_proj, he_proj], 0)
 
     def get_iter(self):
-        ray_batch_fetcher = radfoam.BatchFetcher(
-            self.train_rays, self.batch_size, shuffle=True
-        )
-        proj_batch_fetcher = radfoam.BatchFetcher(
-            self.train_projections, self.batch_size, shuffle=True
-        )
-
         while True:
-            ray_batch = ray_batch_fetcher.next()
-            proj_batch = proj_batch_fetcher.next()
-            if self.beam_type == "parallel" and self.pixel_size is not None:
-                ray_batch = jitter_rays_parallel(ray_batch, self.pixel_size)
-            elif self.beam_type == "cone" and self.pixel_ang_size is not None:
-                ray_batch = jitter_rays_cone(ray_batch, self.pixel_ang_size)
-            yield ray_batch, proj_batch
+            rays, proj, _ = self._sample_uniform_batch(self.batch_size)
+            yield rays, proj
 
     def get_targeted_iter(self):
-        """Iterator yielding (uniform_rays + targeted_rays, uniform_proj + targeted_proj).
-
-        Uniform rays come from BatchFetcher (CPU→GPU async).
-        Targeted rays are built entirely on GPU each iteration.
-        """
-        ray_batch_fetcher = radfoam.BatchFetcher(
-            self.train_rays, self.batch_size, shuffle=True
-        )
-        proj_batch_fetcher = radfoam.BatchFetcher(
-            self.train_projections, self.batch_size, shuffle=True
-        )
-
+        """Iterator yielding (uniform_rays + targeted_rays, uniform_proj + targeted_proj)."""
         while True:
-            u_rays = ray_batch_fetcher.next()
-            u_proj = proj_batch_fetcher.next()
-            if self.beam_type == "parallel" and self.pixel_size is not None:
-                u_rays = jitter_rays_parallel(u_rays, self.pixel_size)
-            elif self.beam_type == "cone" and self.pixel_ang_size is not None:
-                u_rays = jitter_rays_cone(u_rays, self.pixel_ang_size)
-            # Build targeted batch entirely on GPU
+            u_rays, u_proj, _ = self._sample_uniform_batch(self.batch_size)
             t_rays, t_proj = build_targeted_batch(
                 self._target_weights, self._target_points,
                 self._target_radii,
-                self._train_rays_gpu, self._train_projections_gpu,
+                self._train_rays_gpu, self._proj_nchw_gpu,
                 self.beam_type, self._beam_geom,
                 self._targeted_batch_size,
             )
