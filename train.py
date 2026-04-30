@@ -667,7 +667,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
             visualize_cell_heatmap(cd_slices, writer_fn=log_fig_hm)
 
             # Gradient agreement weight map (only populated when grad_smooth_hops > 0)
-            if hasattr(model, "_last_grad_weights"):
+            if (hasattr(model, "_last_grad_weights")
+                    and model._last_grad_weights.shape[0] == model.primal_points.shape[0]):
                 visualize_grad_weights(
                     model.primal_points.detach().cpu(),
                     model._last_grad_weights,
