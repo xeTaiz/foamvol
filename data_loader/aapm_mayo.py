@@ -64,7 +64,7 @@ def _detect_layout(data_dir, split):
 
     # DICOM: look for patient subdirs containing *.dcm or *.IMA files
     patient_dirs = []
-    for entry in sorted(os.scandir(data_dir)):
+    for entry in sorted(os.scandir(data_dir), key=lambda e: e.name):
         if not entry.is_dir():
             continue
         dcm_files = (
