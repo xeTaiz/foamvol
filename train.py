@@ -1221,6 +1221,9 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         ref_guided_densify=getattr(pipeline_args, 'ref_guided_densify', False),
                         ref_guided_eps=getattr(pipeline_args, 'ref_guided_eps', 0.05),
                         grad_thresh=pipeline_args.densify_grad_thresh,
+                        var_thresh=pipeline_args.densify_var_thresh,
+                        var_power=pipeline_args.densify_var_power,
+                        var_hops=pipeline_args.densify_var_hops,
                     )
 
                     if not pipeline_args.debug and densify_stats is not None:
@@ -1353,6 +1356,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
             f.write(f"Train PSNR: {train_metrics['psnr']:.4f}\n")
             f.write(f"Train SSIM: {train_metrics['ssim']:.6f}\n")
             f.write(f"Train Time: {_train_duration:.1f}s\n")
+            f.write(f"Num Cells: {model.primal_points.shape[0]}\n")
 
         if slice_metrics is not None:
             with open(f"{out_dir}/metrics.txt", "a") as f:
