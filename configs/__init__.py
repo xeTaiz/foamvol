@@ -46,6 +46,9 @@ class PipelineParams(ParamGroup):
         self.densify_until = 6_000
         self.densify_factor = 1.15
         self.densify_grad_thresh = 0.0  # >0: gradient-only threshold mode (fixed intervals, hard final_points cap)
+        self.densify_var_thresh = 0.0   # >0: AND-gate on neighborhood variance (requires grad_thresh > 0)
+        self.densify_var_power = 0.0    # exponent on var in score (0 = gate only, >0 biases sampling)
+        self.densify_var_hops = 1       # k-hop neighborhood depth for variance gate
         self.gradient_fraction = 0.4
         self.idw_fraction = 0.3
         self.entropy_fraction = 0.3

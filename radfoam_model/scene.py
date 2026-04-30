@@ -1518,6 +1518,7 @@ class CTScene(torch.nn.Module):
         variance_pruning=False, prune_hops=1,
         ref_guided_pruning=False, ref_guided_densify=False, ref_guided_eps=0.05,
         grad_thresh=0.0,
+        var_thresh=0.0, var_power=0.0, var_hops=1,
     ):
         with torch.no_grad():
             num_curr_points = self.primal_points.shape[0]
@@ -1530,8 +1531,16 @@ class CTScene(torch.nn.Module):
 
             # Threshold mode: cap budget by eligible count and remaining final_points headroom.
             eligible_count = num_curr_points
+            eligible_mask = None
+            cell_var = None
             if grad_thresh > 0:
-                eligible_count = int((primal_error_accum > grad_thresh).sum().item())
+                grad_mask = primal_error_accum > grad_thresh
+                if var_thresh > 0:
+                    cell_var = self.compute_neighborhood_variance(cell_radius=None, hops=var_hops)
+                    eligible_mask = grad_mask & (cell_var > var_thresh)
+                else:
+                    eligible_mask = grad_mask
+                eligible_count = int(eligible_mask.sum().item())
                 num_new_points = min(
                     int((upsample_factor - 1) * num_curr_points),
                     eligible_count,
@@ -1755,8 +1764,10 @@ class CTScene(torch.nn.Module):
             # --- Gradient-based sampling (position error × cell radius) ---
             if num_gradient_points > 0:
                 grad_weight = primal_error_accum * cell_radius
-                if grad_thresh > 0:
-                    grad_weight = grad_weight * (primal_error_accum > grad_thresh).float()
+                if eligible_mask is not None:
+                    if var_power > 0 and cell_var is not None:
+                        grad_weight = grad_weight * cell_var.clamp(min=1e-12) ** var_power
+                    grad_weight = grad_weight * eligible_mask.float()
                 if ref_factor is not None:
                     grad_weight = grad_weight * ref_factor
                 grad_inds = torch.multinomial(
