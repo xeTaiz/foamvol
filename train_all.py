@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Train across all R2-Gaussian datasets, optionally with multiple configs.
+"""Train across R2-Gaussian and 3D non-R2 datasets, optionally with multiple configs.
 
-Recursively discovers datasets (directories containing proj_train/) under
---data-root. Multiple configs produce a (configs × datasets) job pool that
-workers split round-robin.
+Recursively discovers R2 datasets (directories containing proj_train/) under
+--data-root.  Additional 3D DICOM datasets (MORE, AAPM-Mayo) are discovered
+via --more-root and --mayo-root, enumerating patients automatically.
+
+Multiple configs produce a (configs × datasets) job pool that workers split
+round-robin.
 
 Output layout:
     output/<name>/<config_slug>/<dataset>/metrics.txt
 
 Usage:
-    # single config, all datasets
+    # single config, all R2 datasets
     python train_all.py -c configs/r2fast.yaml --name myrun
 
     # multiple configs — Cartesian product
@@ -18,16 +21,22 @@ Usage:
     # worker splitting (round-robin over entire job pool)
     python train_all.py -c configs/thresh_*.yaml --name sweep25 --worker 1 --of 4
 
+    # include MORE and AAPM-Mayo subsets
+    python train_all.py -c configs/fixed_final --name fixed_3d \\
+        --more-root /mnt/hdd/more_subset --mayo-root /mnt/hdd/LDCT_Mayo_subset
+
     # summarize (no -c needed; auto-discovers all config slugs under output/<name>/)
     python train_all.py --name sweep25 --summarize
 
-    # list discovered datasets
-    python train_all.py --list --data-root r2_data
+    # list discovered datasets (all sources)
+    python train_all.py --list --data-root r2_data \\
+        --more-root /mnt/hdd/more_subset --mayo-root /mnt/hdd/LDCT_Mayo_subset
 """
 
 import argparse
 import csv
 import fnmatch
+import glob
 import os
 import re
 import subprocess
@@ -37,7 +46,7 @@ DATA_ROOT = "r2_data/synthetic_dataset/cone_ntrain_75_angle_360"
 
 
 def discover_datasets(data_roots):
-    """Recursively find dataset directories (those containing proj_train/)."""
+    """Recursively find R2-Gaussian dataset directories (those containing proj_train/)."""
     datasets = []
     for data_root in data_roots:
         for dirpath, dirnames, _filenames in os.walk(data_root):
@@ -47,6 +56,61 @@ def discover_datasets(data_roots):
                 dirnames.clear()
     datasets.sort(key=lambda x: x[1])
     return datasets
+
+
+def discover_more(root):
+    """Enumerate MORE DICOM studies, replicating MOREDataset._detect_layout sort order.
+
+    Mirrors data_loader/more.py:65-77: sort by organ dir then patient dir,
+    preferring full_1mm over full_3mm. Returns list of (ds_name, extra_args).
+    sample_index values here match what the loader assigns at runtime.
+    """
+    entries = []
+    idx = 0
+    for organ_entry in sorted(os.scandir(root), key=lambda e: e.name):
+        if not organ_entry.is_dir():
+            continue
+        for patient_entry in sorted(os.scandir(organ_entry.path), key=lambda e: e.name):
+            if not patient_entry.is_dir():
+                continue
+            series_1mm = os.path.join(patient_entry.path, "full_1mm")
+            series_3mm = os.path.join(patient_entry.path, "full_3mm")
+            if os.path.isdir(series_1mm) and glob.glob(os.path.join(series_1mm, "*.dcm")):
+                thickness = "1mm"
+            elif os.path.isdir(series_3mm) and glob.glob(os.path.join(series_3mm, "*.dcm")):
+                thickness = "3mm"
+            else:
+                continue
+            ds_name = f"more/{organ_entry.name}/{patient_entry.name}_{thickness}"
+            extra_args = {"data_path": root, "dataset": "more", "sample_index": idx}
+            entries.append((ds_name, extra_args))
+            idx += 1
+    return entries
+
+
+def discover_aapm_mayo(root):
+    """Enumerate AAPM-Mayo DICOM patients, replicating AAPMMayoDataset._detect_layout order.
+
+    Mirrors data_loader/aapm_mayo.py:66-77: sorted top-level patient dirs that
+    contain *.dcm or *.IMA files. Returns list of (ds_name, extra_args).
+    """
+    patient_dirs = []
+    for entry in sorted(os.scandir(root), key=lambda e: e.name):
+        if not entry.is_dir():
+            continue
+        dcm_files = (
+            glob.glob(os.path.join(entry.path, "**", "*.dcm"), recursive=True)
+            or glob.glob(os.path.join(entry.path, "**", "*.IMA"), recursive=True)
+        )
+        if dcm_files:
+            patient_dirs.append(entry.name)
+
+    entries = []
+    for i, patient_id in enumerate(patient_dirs):
+        ds_name = f"mayo/{patient_id}"
+        extra_args = {"data_path": root, "dataset": "aapm_mayo", "sample_index": i}
+        entries.append((ds_name, extra_args))
+    return entries
 
 
 def filter_datasets(datasets, patterns):
@@ -93,8 +157,12 @@ def parse_metrics(path):
     return metrics
 
 
-def run_dataset(data_root, ds_name, config_file, run_name):
-    """Run train.py on one (config, dataset) pair. Returns True on success."""
+def run_dataset(ds_name, config_file, run_name, extra_args):
+    """Run train.py on one (config, dataset) pair. Returns True on success.
+
+    extra_args: dict of CLI overrides forwarded to train.py, e.g.
+        {"data_path": "/mnt/hdd/...", "dataset": "more", "sample_index": 3}
+    """
     mpath = os.path.join("output", run_name, ds_name, "metrics.txt")
 
     if os.path.exists(mpath):
@@ -105,8 +173,10 @@ def run_dataset(data_root, ds_name, config_file, run_name):
         sys.executable, "train.py",
         "-c", config_file,
         "--experiment_name", f"{run_name}/{ds_name}",
-        "--data_path", os.path.join(data_root, ds_name),
     ]
+    for k, v in extra_args.items():
+        cmd += [f"--{k}", str(v)]
+
     print(f"[RUN]  {run_name}/{ds_name}")
     result = subprocess.run(cmd, cwd=os.path.dirname(os.path.abspath(__file__)))
 
@@ -131,10 +201,10 @@ def collect_summary(run_name, jobs=None):
     run_dir = os.path.join("output", run_name)
 
     if jobs is not None:
-        # (config_file, slug, data_root, ds_name)
-        pairs = [(slug, ds_name) for _, slug, _, ds_name in jobs]
+        # (config_file, slug, ds_name, extra_args)
+        pairs = [(slug, ds_name) for _, slug, ds_name, _ in jobs]
     else:
-        # Auto-discover: output/<run_name>/<slug>/<dataset>/metrics.txt
+        # Auto-discover: recurse under output/<run_name>/<slug>/**/metrics.txt
         pairs = []
         if not os.path.isdir(run_dir):
             print(f"[WARN] {run_dir} does not exist")
@@ -143,9 +213,10 @@ def collect_summary(run_name, jobs=None):
             slug_dir = os.path.join(run_dir, slug)
             if not os.path.isdir(slug_dir):
                 continue
-            for ds in sorted(os.listdir(slug_dir)):
-                if os.path.isfile(os.path.join(slug_dir, ds, "metrics.txt")):
-                    pairs.append((slug, ds))
+            for dirpath, _, filenames in os.walk(slug_dir):
+                if "metrics.txt" in filenames:
+                    ds_name = os.path.relpath(dirpath, slug_dir)
+                    pairs.append((slug, ds_name))
 
     rows = []
     for slug, ds_name in pairs:
@@ -198,12 +269,14 @@ def collect_summary(run_name, jobs=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train across all R2-Gaussian datasets",
+        description="Train across R2-Gaussian and 3D non-R2 CT datasets",
         epilog=(
             "Examples:\n"
             "  python train_all.py -c configs/r2fast.yaml --name myrun\n"
             "  python train_all.py -c configs/thresh_100.yaml configs/thresh_500.yaml --name sweep25\n"
             "  python train_all.py -c configs/thresh_*.yaml --name sweep25 --worker 1 --of 4\n"
+            "  python train_all.py -c configs/fixed_final --name fixed_3d \\\n"
+            "      --more-root /mnt/hdd/more_subset --mayo-root /mnt/hdd/LDCT_Mayo_subset\n"
             "  python train_all.py --name sweep25 --summarize\n"
             "  python train_all.py --list --data-root r2_data\n"
         ),
@@ -222,11 +295,15 @@ def main():
     parser.add_argument("--list", action="store_true",
                         help="Print all dataset names and exit")
     parser.add_argument("--datasets", nargs="+", metavar="DS",
-                        help="Run only specific datasets by exact relative path")
+                        help="Run only specific R2 datasets by exact relative path")
     parser.add_argument("--filter", nargs="+", metavar="PAT",
-                        help="Keep datasets matching any pattern (substring or glob)")
+                        help="Keep R2 datasets matching any pattern (substring or glob)")
     parser.add_argument("--data-root", nargs="+", default=[DATA_ROOT], metavar="DIR",
-                        help=f"Data root path(s) to scan (default: {DATA_ROOT})")
+                        help=f"R2-Gaussian data root path(s) to scan (default: {DATA_ROOT})")
+    parser.add_argument("--more-root", metavar="DIR",
+                        help="Root of a MORE DICOM subset folder; enumerates all patients")
+    parser.add_argument("--mayo-root", metavar="DIR",
+                        help="Root of an AAPM-Mayo DICOM subset folder; enumerates all patients")
     args = parser.parse_args()
 
     if (args.worker is None) != (args.num_workers is None):
@@ -234,7 +311,7 @@ def main():
     if args.worker is not None and not (1 <= args.worker <= args.num_workers):
         parser.error(f"--worker must be between 1 and {args.num_workers}")
 
-    # Discover and filter datasets
+    # --- R2-Gaussian jobs ---
     all_datasets = discover_datasets(args.data_root)
     datasets = all_datasets
     if args.filter:
@@ -246,11 +323,27 @@ def main():
         for u in selected - found:
             print(f"[WARN] Unknown dataset: {u}")
 
+    # (ds_name, extra_args) for non-R2 datasets
+    non_r2_entries = []
+    if args.more_root:
+        entries = discover_more(args.more_root)
+        print(f"Discovered {len(entries)} MORE patients under {args.more_root}")
+        non_r2_entries.extend(entries)
+    if args.mayo_root:
+        entries = discover_aapm_mayo(args.mayo_root)
+        print(f"Discovered {len(entries)} AAPM-Mayo patients under {args.mayo_root}")
+        non_r2_entries.extend(entries)
+
     if args.list:
-        roots_str = ", ".join(args.data_root)
-        print(f"\n{len(datasets)} datasets under {roots_str}:")
+        total = len(datasets) + len(non_r2_entries)
+        print(f"\n{len(datasets)} R2 datasets:")
         for _root, rel in datasets:
             print(f"  {rel}")
+        if non_r2_entries:
+            print(f"\n{len(non_r2_entries)} non-R2 datasets:")
+            for ds_name, ea in non_r2_entries:
+                print(f"  {ds_name}  (dataset={ea['dataset']} sample_index={ea['sample_index']})")
+        print(f"\n{total} total")
         return
 
     if not args.name:
@@ -269,14 +362,23 @@ def main():
     if not configs:
         parser.error("No .yaml files found in the provided --config paths")
 
-    # Build job pool: (config_file, slug, data_root, ds_name)
-    all_jobs = [
-        (cfg, config_slug(cfg), root, ds)
+    # Build job pool: (config_file, slug, ds_name, extra_args)
+    # R2 jobs: extra_args contains only data_path (derived from root + ds)
+    r2_jobs = [
+        (cfg, config_slug(cfg), ds, {"data_path": os.path.join(root, ds)})
         for cfg in configs
         for root, ds in datasets
     ]
+    # Non-R2 jobs: extra_args contains data_path, dataset, sample_index
+    non_r2_jobs = [
+        (cfg, config_slug(cfg), ds_name, extra_args)
+        for cfg in configs
+        for ds_name, extra_args in non_r2_entries
+    ]
+    all_jobs = r2_jobs + non_r2_jobs
 
-    print(f"{len(configs)} config(s) × {len(datasets)} datasets = {len(all_jobs)} jobs total")
+    n_ds = len(datasets) + len(non_r2_entries)
+    print(f"{len(configs)} config(s) × {n_ds} datasets = {len(all_jobs)} jobs total")
 
     # Worker splitting (round-robin over entire pool)
     if args.worker is not None:
@@ -286,8 +388,8 @@ def main():
         my_jobs = all_jobs
 
     if not args.summarize:
-        for cfg, slug, root, ds in my_jobs:
-            run_dataset(root, ds, cfg, f"{args.name}/{slug}")
+        for cfg, slug, ds_name, extra_args in my_jobs:
+            run_dataset(ds_name, cfg, f"{args.name}/{slug}", extra_args)
 
     collect_summary(args.name, jobs=all_jobs)
 
