@@ -103,7 +103,7 @@ interpolation_start: -1
 interp_ramp: False
 interp_sigma_abs: 0.010
 interp_sigma_scale: 1.0
-interp_sigma_v: 0.10
+interp_sigma_v: 0.05 #0.10
 per_cell_sigma: False
 per_neighbor_sigma: False
 bf_start: -1

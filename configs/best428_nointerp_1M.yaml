@@ -12,7 +12,7 @@
 # Training
 iterations: 10000
 rays_per_batch: 1_000_000
-rays_per_batch_late: 8_000_000
+rays_per_batch_late: 4_000_000
 rays_per_batch_late_start: 9000
 init_points: 64000
 final_points: 1024000
@@ -103,7 +103,7 @@ interpolation_start: -1
 interp_ramp: False
 interp_sigma_abs: 0.010
 interp_sigma_scale: 1.0
-interp_sigma_v: 0.10
+interp_sigma_v: 0.05
 per_cell_sigma: False
 per_neighbor_sigma: False
 bf_start: -1
