@@ -1338,6 +1338,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
             f.write(f"Train PSNR: {train_metrics['psnr']:.4f}\n")
             f.write(f"Train SSIM: {train_metrics['ssim']:.6f}\n")
             f.write(f"Train Time: {_train_duration:.1f}s\n")
+            f.write(f"Num Cells: {model.primal_points.shape[0]}\n")
 
         if slice_metrics is not None:
             with open(f"{out_dir}/metrics.txt", "a") as f:
