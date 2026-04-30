@@ -45,6 +45,7 @@ class PipelineParams(ParamGroup):
         self.densify_from = 1_000
         self.densify_until = 6_000
         self.densify_factor = 1.15
+        self.densify_grad_thresh = 0.0  # >0: gradient-only threshold mode (fixed intervals, hard final_points cap)
         self.gradient_fraction = 0.4
         self.idw_fraction = 0.3
         self.entropy_fraction = 0.3

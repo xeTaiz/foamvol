@@ -1517,6 +1517,7 @@ class CTScene(torch.nn.Module):
         sigma_scale=0.5, sigma_v=0.1,
         variance_pruning=False, prune_hops=1,
         ref_guided_pruning=False, ref_guided_densify=False, ref_guided_eps=0.05,
+        grad_thresh=0.0,
     ):
         with torch.no_grad():
             num_curr_points = self.primal_points.shape[0]
@@ -1526,6 +1527,16 @@ class CTScene(torch.nn.Module):
             ref_w = self._sample_ref_weight_at_points() if (ref_guided_pruning or ref_guided_densify) else None
 
             primal_error_accum = point_error.clip(min=0).squeeze()
+
+            # Threshold mode: cap budget by eligible count and remaining final_points headroom.
+            eligible_count = num_curr_points
+            if grad_thresh > 0:
+                eligible_count = int((primal_error_accum > grad_thresh).sum().item())
+                num_new_points = min(
+                    int((upsample_factor - 1) * num_curr_points),
+                    eligible_count,
+                    max(0, self.num_final_points - num_curr_points),
+                )
             points, _, point_adjacency, point_adjacency_offsets, *_ = (
                 self.get_trace_data()
             )
@@ -1658,9 +1669,15 @@ class CTScene(torch.nn.Module):
             )
 
             ################### Split budget ########################
-            num_gradient_points = int(gradient_fraction * num_new_points)
-            num_idw_points = int(idw_fraction * num_new_points)
-            num_entropy_points = num_new_points - num_gradient_points - num_idw_points
+            if grad_thresh > 0:
+                # Threshold mode: gradient-only, IDW and entropy disabled.
+                num_gradient_points = num_new_points
+                num_idw_points = 0
+                num_entropy_points = 0
+            else:
+                num_gradient_points = int(gradient_fraction * num_new_points)
+                num_idw_points = int(idw_fraction * num_new_points)
+                num_entropy_points = num_new_points - num_gradient_points - num_idw_points
 
             sampled_points_list = []
             sampled_inds_list = []
@@ -1738,6 +1755,8 @@ class CTScene(torch.nn.Module):
             # --- Gradient-based sampling (position error × cell radius) ---
             if num_gradient_points > 0:
                 grad_weight = primal_error_accum * cell_radius
+                if grad_thresh > 0:
+                    grad_weight = grad_weight * (primal_error_accum > grad_thresh).float()
                 if ref_factor is not None:
                     grad_weight = grad_weight * ref_factor
                 grad_inds = torch.multinomial(
@@ -1862,6 +1881,8 @@ class CTScene(torch.nn.Module):
                 "added_gradient": n_added_gradient,
                 "added_idw": n_added_idw,
                 "added_entropy": n_added_entropy,
+                "thresh_eligible": eligible_count,
+                "thresh_n_sample": num_new_points,
                 "filtered_duplicates": n_filtered_dupes,
                 "points_after": self.primal_points.shape[0],
             }
