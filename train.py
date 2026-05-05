@@ -667,7 +667,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
             visualize_cell_heatmap(cd_slices, writer_fn=log_fig_hm)
 
             # Gradient agreement weight map (only populated when grad_smooth_hops > 0)
-            if hasattr(model, "_last_grad_weights"):
+            if (hasattr(model, "_last_grad_weights")
+                    and model._last_grad_weights.shape[0] == model.primal_points.shape[0]):
                 visualize_grad_weights(
                     model.primal_points.detach().cpu(),
                     model._last_grad_weights,
@@ -931,6 +932,17 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         iters_since_update = 1
         iters_since_densification = 0
         next_densification_after = 1
+
+        # Fixed-interval schedule for threshold mode (computed once, never adjusted).
+        if pipeline_args.densify_grad_thresh > 0:
+            _K = math.ceil(
+                math.log(model_args.final_points / model_args.init_points)
+                / math.log(pipeline_args.densify_factor)
+            )
+            _fixed_interval = max(
+                1,
+                (pipeline_args.densify_until - pipeline_args.densify_from) // _K,
+            )
 
         # Log initial state (step 0, before any optimization)
         if not pipeline_args.debug:
@@ -1209,6 +1221,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         ref_guided_pruning=getattr(pipeline_args, 'ref_guided_pruning', False),
                         ref_guided_densify=getattr(pipeline_args, 'ref_guided_densify', False),
                         ref_guided_eps=getattr(pipeline_args, 'ref_guided_eps', 0.05),
+                        grad_thresh=pipeline_args.densify_grad_thresh,
+                        var_thresh=pipeline_args.densify_var_thresh,
+                        var_power=pipeline_args.densify_var_power,
+                        var_hops=pipeline_args.densify_var_hops,
                     )
 
                     if not pipeline_args.debug and densify_stats is not None:
@@ -1237,22 +1253,25 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                             data_iterator = train_data_handler.get_targeted_iter()
                             ray_batch, proj_batch = next(data_iterator)
 
-                    # Linear growth
                     iters_since_densification = 0
-                    next_densification_after = int(
-                        (
-                            (pipeline_args.densify_factor - 1)
-                            * model.primal_points.shape[0]
-                            * (
-                                pipeline_args.densify_until
-                                - pipeline_args.densify_from
+                    if pipeline_args.densify_grad_thresh > 0:
+                        next_densification_after = _fixed_interval
+                    else:
+                        # Adaptive: maintain linear-growth pacing.
+                        next_densification_after = int(
+                            (
+                                (pipeline_args.densify_factor - 1)
+                                * model.primal_points.shape[0]
+                                * (
+                                    pipeline_args.densify_until
+                                    - pipeline_args.densify_from
+                                )
                             )
+                            / (model.num_final_points - model.num_init_points)
                         )
-                        / (model.num_final_points - model.num_init_points)
-                    )
-                    next_densification_after = max(
-                        next_densification_after, 100
-                    )
+                        next_densification_after = max(
+                            next_densification_after, 100
+                        )
 
                 if i == pipeline_args.densify_until:
                     model.update_triangulation(incremental=False)
