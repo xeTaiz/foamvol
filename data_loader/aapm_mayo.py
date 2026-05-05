@@ -131,6 +131,17 @@ def _load_dicom_patient(patient_dir):
         slices_with_pos.append((z, density))
 
     slices_with_pos.sort(key=lambda x: x[0])
+
+    # Filter to the most common shape (drops localizer/scout images with different dims)
+    from collections import Counter
+    shape_counts = Counter(s[1].shape for s in slices_with_pos)
+    dominant_shape, dominant_count = shape_counts.most_common(1)[0]
+    print(f"[DICOM] {patient_dir}: dominant shape {dominant_shape} ({dominant_count}/{len(slices_with_pos)} slices)")
+    discarded = [(shape, count) for shape, count in shape_counts.items() if shape != dominant_shape]
+    for shape, count in discarded:
+        print(f"[DICOM]   discarding {count} slice(s) with shape {shape}")
+    slices_with_pos = [s for s in slices_with_pos if s[1].shape == dominant_shape]
+
     vol = np.stack([s[1] for s in slices_with_pos], axis=0)   # (N, H, W)
 
     # Resize to IMG_SIZE if needed
