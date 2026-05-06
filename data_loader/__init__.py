@@ -243,14 +243,17 @@ class DataHandler:
 
         # Work at 256² — apply power scaling and filter to above median
         weights = self._he_error_map.float().reshape(-1)  # (N*eh*ew,)
-        weights = weights.clamp(min=1e-8) ** self._he_power
+        # nan/inf from corrupted loss steps → treat as 0 (uniform fallback)
+        weights = weights.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0).clamp(min=1e-8) ** self._he_power
         median = weights.median()
         candidate_idx = (weights >= median).nonzero(as_tuple=True)[0]
         sub_weights = weights[candidate_idx]
         sub_weights = sub_weights / sub_weights.sum()
 
         # Pool lasts one epoch — sample at 256², expand to all 4 pixels of 2×2
-        pool_size_lo = int(self._he_fraction * N * H * W) // 4
+        # Ensure pool is always at least as large as one batch (handles small datasets)
+        min_pool_lo = (self._he_batch_size + 3) // 4
+        pool_size_lo = max(min_pool_lo, int(self._he_fraction * N * H * W) // 4)
         pool_sub = torch.multinomial(sub_weights, pool_size_lo, replacement=True)
         lowres_flat = candidate_idx[pool_sub]  # indices into (N*eh*ew)
 
