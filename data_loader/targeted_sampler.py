@@ -68,7 +68,7 @@ def build_targeted_batch(cell_weights, points, cell_radii,
         proj = bilinear_proj_lookup(proj_nchw, angle_idx, px, py)
         return train_rays_gpu[flat_idx], proj
 
-    elif beam_type == "cone":
+    elif beam_type == "cone" and "c2ws" in beam_geom:
         c2ws = beam_geom["c2ws"]  # (num_angles, 4, 4) on GPU
         fx = beam_geom["fx"]
         fy = beam_geom["fy"]
