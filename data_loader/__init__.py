@@ -247,6 +247,9 @@ class DataHandler:
         weights = weights.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0).clamp(min=1e-8) ** self._he_power
         median = weights.median()
         candidate_idx = (weights >= median).nonzero(as_tuple=True)[0]
+        if candidate_idx.shape[0] > 2**24:
+            keep = torch.randperm(candidate_idx.shape[0], device=candidate_idx.device)[:2**24]
+            candidate_idx = candidate_idx[keep]
         sub_weights = weights[candidate_idx]
         sub_weights = sub_weights / sub_weights.sum()
 
