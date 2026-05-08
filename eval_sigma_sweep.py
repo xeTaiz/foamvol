@@ -144,7 +144,20 @@ def main():
                         default=DEFAULT_GRID_SPATIAL, metavar="S")
     parser.add_argument("--grid-sigma-v", nargs="+", type=float,
                         default=DEFAULT_GRID_SIGMA_V, metavar="V")
+    parser.add_argument("--pairs", nargs="+", metavar="S:V",
+                        help="Explicit (sigma_s:sigma_v) pairs instead of cross-product grid. "
+                             "Example: --pairs 0.008:1.00 0.020:0.35 0.060:0.10")
     args = parser.parse_args()
+
+    if args.pairs:
+        try:
+            sigma_pairs = [tuple(float(x) for x in p.split(":")) for p in args.pairs]
+            if any(len(p) != 2 for p in sigma_pairs):
+                raise ValueError
+        except ValueError:
+            parser.error("--pairs values must be formatted as S:V (e.g. 0.020:0.35)")
+    else:
+        sigma_pairs = [(s, v) for s in args.grid_spatial for v in args.grid_sigma_v]
 
     config_path = os.path.abspath(args.config)
     run_dir = os.path.dirname(config_path)
@@ -182,8 +195,11 @@ def main():
     vmax = float(gt_volume.max())
 
     print(f"GT volume: {gt_volume.shape}  vmax={vmax:.3f}")
-    n_combos = len(args.grid_spatial) * len(args.grid_sigma_v)
-    print(f"Combos: {n_combos}  ({len(args.grid_spatial)} σ_s × {len(args.grid_sigma_v)} σ_v)")
+    n_combos = len(sigma_pairs)
+    if args.pairs:
+        print(f"Combos: {n_combos}  (explicit --pairs)")
+    else:
+        print(f"Combos: {n_combos}  ({len(args.grid_spatial)} σ_s × {len(args.grid_sigma_v)} σ_v)")
 
     # ── Field + cell radius ─────────────────────────────────────────────────
     print("\nLoading field...")
@@ -309,113 +325,112 @@ def main():
     rows = []
     print(f"\nSweeping {n_combos} σ combos...")
 
-    for sigma_s in args.grid_spatial:
-        for sigma_v in args.grid_sigma_v:
-            scale_equiv = sigma_s / median_cr if median_cr > 0 else float("nan")
-            combo_name = f"s{sigma_s:.3f}_v{sigma_v:.2f}"
-            print(f"  {combo_name}  (scale_equiv={scale_equiv:.2f})", flush=True)
+    for sigma_s, sigma_v in sigma_pairs:
+        scale_equiv = sigma_s / median_cr if median_cr > 0 else float("nan")
+        combo_name = f"s{sigma_s:.3f}_v{sigma_v:.2f}"
+        print(f"  {combo_name}  (scale_equiv={scale_equiv:.2f})", flush=True)
 
-            # IDW volume
-            _, idw_vol = voxelize_volumes(field, vol_res, 1.0,
-                                          sigma=sigma_s, sigma_v=sigma_v)
-            idw_vol_t = torch.from_numpy(idw_vol).float().cuda()
+        # IDW volume
+        _, idw_vol = voxelize_volumes(field, vol_res, 1.0,
+                                      sigma=sigma_s, sigma_v=sigma_v)
+        idw_vol_t = torch.from_numpy(idw_vol).float().cuda()
 
-            idw_psnr = compute_volume_psnr(idw_vol_t, vol_gt_t)
-            idw_ssim, _ = compute_volume_ssim(idw_vol_t, vol_gt_t)
-            idw_ssim3d = compute_volume_ssim_3d(idw_vol_t, vol_gt_t)
-            idw_dice, _ = compute_dice(idw_vol_t, vol_gt_t)
-            idw_surf = compute_surface_metrics(idw_vol_t, vol_gt_t)
-            idw_sobel_psnr = compute_volume_psnr(sobel_filter_3d(idw_vol_t), gt_sobel)
-            idw_sobel_ssim, _ = compute_volume_ssim(sobel_filter_3d(idw_vol_t), gt_sobel)
+        idw_psnr = compute_volume_psnr(idw_vol_t, vol_gt_t)
+        idw_ssim, _ = compute_volume_ssim(idw_vol_t, vol_gt_t)
+        idw_ssim3d = compute_volume_ssim_3d(idw_vol_t, vol_gt_t)
+        idw_dice, _ = compute_dice(idw_vol_t, vol_gt_t)
+        idw_surf = compute_surface_metrics(idw_vol_t, vol_gt_t)
+        idw_sobel_psnr = compute_volume_psnr(sobel_filter_3d(idw_vol_t), gt_sobel)
+        idw_sobel_ssim, _ = compute_volume_ssim(sobel_filter_3d(idw_vol_t), gt_sobel)
 
-            # IDW mesh
-            _ss, _sv = sigma_s, sigma_v
+        # IDW mesh
+        _ss, _sv = sigma_s, sigma_v
 
-            @torch.no_grad()
-            def _mesh_idw_fn(q,
-                             pts=_pts, mu=_mu, adj=_adj, adj_off=_adj_off,
-                             tree=_tree, ss=_ss, sv=_sv):
-                return idw_query(
-                    q, pts, adj, adj_off, tree, mu,
-                    sigma=ss, sigma_v=sv,
-                    per_cell_sigma=False, per_neighbor_sigma=False,
-                    cell_radius=None,
-                ).idw_result
+        @torch.no_grad()
+        def _mesh_idw_fn(q,
+                         pts=_pts, mu=_mu, adj=_adj, adj_off=_adj_off,
+                         tree=_tree, ss=_ss, sv=_sv):
+            return idw_query(
+                q, pts, adj, adj_off, tree, mu,
+                sigma=ss, sigma_v=sv,
+                per_cell_sigma=False, per_neighbor_sigma=False,
+                cell_radius=None,
+            ).idw_result
 
-            mesh_idw_surf = surface_metrics_vs_gt_volume(
-                _pts, _mu, _tets, gt_volume, density_fn=_mesh_idw_fn
-            )
+        mesh_idw_surf = surface_metrics_vs_gt_volume(
+            _pts, _mu, _tets, gt_volume, density_fn=_mesh_idw_fn
+        )
 
-            print(f"    IDW PSNR={idw_psnr:.4f}  Dice={idw_dice:.6f}  "
-                  f"MeshF1={mesh_idw_surf['f1_1v']:.4f}")
+        print(f"    IDW PSNR={idw_psnr:.4f}  Dice={idw_dice:.6f}  "
+              f"MeshF1={mesh_idw_surf['f1_1v']:.4f}")
 
-            # ── TB: per-combo sub-run ───────────────────────────────────────
-            combo_writer = SummaryWriter(os.path.join(tb_base, combo_name))
+        # ── TB: per-combo sub-run ───────────────────────────────────────
+        combo_writer = SummaryWriter(os.path.join(tb_base, combo_name))
 
-            idw_vol_metrics = {
-                "psnr": idw_psnr, "ssim": idw_ssim, "ssim3d": idw_ssim3d,
-                "dice": idw_dice,
-                "chamfer": idw_surf["chamfer"],
-                "hausdorff_95": idw_surf["hausdorff_95"],
-                "f1_1v": idw_surf["f1_1v"], "f1_2v": idw_surf["f1_2v"],
-                "sobel_psnr": idw_sobel_psnr, "sobel_ssim": idw_sobel_ssim,
-            }
-            idw_mesh_metrics = {
-                "chamfer": mesh_idw_surf["chamfer"],
-                "hausdorff_95": mesh_idw_surf["hausdorff_95"],
-                "f1_1v": mesh_idw_surf["f1_1v"], "f1_2v": mesh_idw_surf["f1_2v"],
-            }
-            _log_scalars(combo_writer, idw_vol_metrics, idw_mesh_metrics)
-            combo_writer.add_scalar("sigma/spatial",    sigma_s,     global_step=0)
-            combo_writer.add_scalar("sigma/value",      sigma_v,     global_step=0)
-            combo_writer.add_scalar("sigma/scale_equiv", scale_equiv, global_step=0)
+        idw_vol_metrics = {
+            "psnr": idw_psnr, "ssim": idw_ssim, "ssim3d": idw_ssim3d,
+            "dice": idw_dice,
+            "chamfer": idw_surf["chamfer"],
+            "hausdorff_95": idw_surf["hausdorff_95"],
+            "f1_1v": idw_surf["f1_1v"], "f1_2v": idw_surf["f1_2v"],
+            "sobel_psnr": idw_sobel_psnr, "sobel_ssim": idw_sobel_ssim,
+        }
+        idw_mesh_metrics = {
+            "chamfer": mesh_idw_surf["chamfer"],
+            "hausdorff_95": mesh_idw_surf["hausdorff_95"],
+            "f1_1v": mesh_idw_surf["f1_1v"], "f1_2v": mesh_idw_surf["f1_2v"],
+        }
+        _log_scalars(combo_writer, idw_vol_metrics, idw_mesh_metrics)
+        combo_writer.add_scalar("sigma/spatial",    sigma_s,     global_step=0)
+        combo_writer.add_scalar("sigma/value",      sigma_v,     global_step=0)
+        combo_writer.add_scalar("sigma/scale_equiv", scale_equiv, global_step=0)
 
-            # IDW slices from voxelized volume
-            idw_slices, _ = _extract_slices(idw_vol, gt_volume, res=vol_res)
+        # IDW slices from voxelized volume
+        idw_slices, _ = _extract_slices(idw_vol, gt_volume, res=vol_res)
 
-            visualize_slices(
-                d_slices, idw_slices, cd_slices,
-                gt_slices=gt_slices_list,
-                vmax=vmax,
-                writer_fn_interleaved=partial(
-                    combo_writer.add_figure, "slices_interleaved", global_step=0
-                ),
-                writer_fn_sobel=partial(
-                    combo_writer.add_figure, "slices_sobel", global_step=0
-                ),
-            )
+        visualize_slices(
+            d_slices, idw_slices, cd_slices,
+            gt_slices=gt_slices_list,
+            vmax=vmax,
+            writer_fn_interleaved=partial(
+                combo_writer.add_figure, "slices_interleaved", global_step=0
+            ),
+            writer_fn_sobel=partial(
+                combo_writer.add_figure, "slices_sobel", global_step=0
+            ),
+        )
 
-            # IDW mesh at representative threshold
-            idw_verts, idw_faces = marching_tets(
-                _pts, _mu, _tets, threshold=MESH_THRESHOLD, density_fn=_mesh_idw_fn
-            )
-            _log_mesh_to_tb(combo_writer, "mesh/idw", idw_verts, idw_faces)
+        # IDW mesh at representative threshold
+        idw_verts, idw_faces = marching_tets(
+            _pts, _mu, _tets, threshold=MESH_THRESHOLD, density_fn=_mesh_idw_fn
+        )
+        _log_mesh_to_tb(combo_writer, "mesh/idw", idw_verts, idw_faces)
 
-            combo_writer.close()
+        combo_writer.close()
 
-            # ── CSV row ─────────────────────────────────────────────────────
-            row = {
-                "sigma_s": sigma_s,
-                "sigma_v": sigma_v,
-                "scale_equiv": round(scale_equiv, 3),
-                **raw_vol_row,
-                **mesh_raw_row,
-                "vol_idw_psnr":         idw_psnr,
-                "vol_idw_ssim":         idw_ssim,
-                "vol_idw_ssim3d":       idw_ssim3d,
-                "vol_idw_dice":         idw_dice,
-                "vol_idw_chamfer":      idw_surf["chamfer"],
-                "vol_idw_hausdorff_95": idw_surf["hausdorff_95"],
-                "vol_idw_f1_1v":        idw_surf["f1_1v"],
-                "vol_idw_f1_2v":        idw_surf["f1_2v"],
-                "vol_idw_sobel_psnr":   idw_sobel_psnr,
-                "vol_idw_sobel_ssim":   idw_sobel_ssim,
-                "mesh_idw_chamfer":      mesh_idw_surf["chamfer"],
-                "mesh_idw_hausdorff_95": mesh_idw_surf["hausdorff_95"],
-                "mesh_idw_f1_1v":        mesh_idw_surf["f1_1v"],
-                "mesh_idw_f1_2v":        mesh_idw_surf["f1_2v"],
-            }
-            rows.append(row)
+        # ── CSV row ─────────────────────────────────────────────────────
+        row = {
+            "sigma_s": sigma_s,
+            "sigma_v": sigma_v,
+            "scale_equiv": round(scale_equiv, 3),
+            **raw_vol_row,
+            **mesh_raw_row,
+            "vol_idw_psnr":         idw_psnr,
+            "vol_idw_ssim":         idw_ssim,
+            "vol_idw_ssim3d":       idw_ssim3d,
+            "vol_idw_dice":         idw_dice,
+            "vol_idw_chamfer":      idw_surf["chamfer"],
+            "vol_idw_hausdorff_95": idw_surf["hausdorff_95"],
+            "vol_idw_f1_1v":        idw_surf["f1_1v"],
+            "vol_idw_f1_2v":        idw_surf["f1_2v"],
+            "vol_idw_sobel_psnr":   idw_sobel_psnr,
+            "vol_idw_sobel_ssim":   idw_sobel_ssim,
+            "mesh_idw_chamfer":      mesh_idw_surf["chamfer"],
+            "mesh_idw_hausdorff_95": mesh_idw_surf["hausdorff_95"],
+            "mesh_idw_f1_1v":        mesh_idw_surf["f1_1v"],
+            "mesh_idw_f1_2v":        mesh_idw_surf["f1_2v"],
+        }
+        rows.append(row)
 
     # ── CSV ─────────────────────────────────────────────────────────────────
     if rows:
