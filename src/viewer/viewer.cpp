@@ -628,11 +628,16 @@ struct ViewerPrivate : public Viewer {
     uint32_t ao_directions_count = 0;
     std::vector<uint8_t> points_cpu;
     std::vector<uint8_t> aabb_tree_cpu;
-    std::vector<float> tf_hist_linear;
-    std::vector<float> tf_hist_log;
+    std::vector<float> tf_hist_linear;   // raw counts per bin
+    std::vector<float> tf_hist_log;      // log1p(count) per bin
+    float tf_hist_max_lin  = 1.0f;
+    float tf_hist_q99_lin  = 1.0f;
+    float tf_hist_max_log  = 1.0f;
+    float tf_hist_q99_log  = 1.0f;
     static constexpr float TF_HIST_DOMAIN_MAX = 10.0f;
     bool tf_histogram_show = true;
     bool tf_histogram_log_y = true;
+    bool tf_histogram_q99  = false;
 
     // New members for fallback
     bool is_cuda_gl_interop_supported;
@@ -1182,6 +1187,8 @@ struct ViewerPrivate : public Viewer {
                     ImGui::Checkbox("Histogram", &tf_histogram_show);
                     ImGui::SameLine();
                     ImGui::Checkbox("Log Y", &tf_histogram_log_y);
+                    ImGui::SameLine();
+                    ImGui::Checkbox("q99", &tf_histogram_q99);
 
                     // Canvas for TF editor
                     const float canvas_w = 300.0f;
@@ -1214,6 +1221,10 @@ struct ViewerPrivate : public Viewer {
                     if (tf_histogram_show && !tf_hist_linear.empty()) {
                         const std::vector<float> &bins =
                             tf_histogram_log_y ? tf_hist_log : tf_hist_linear;
+                        float normalizer = tf_histogram_log_y
+                            ? (tf_histogram_q99 ? tf_hist_q99_log : tf_hist_max_log)
+                            : (tf_histogram_q99 ? tf_hist_q99_lin : tf_hist_max_lin);
+                        if (normalizer < 1e-6f) normalizer = 1.0f;
                         int N = (int)bins.size();
                         float dmin = vis_settings.tf_density_min;
                         float dmax = vis_settings.tf_density_max;
@@ -1228,9 +1239,10 @@ struct ViewerPrivate : public Viewer {
                                     continue;
                                 u0 = std::max(0.0f, u0);
                                 u1 = std::min(1.0f, u1);
+                                float h = std::min(bins[b] / normalizer, 1.0f);
                                 float x0 = canvas_pos.x + u0 * canvas_w;
                                 float x1 = canvas_pos.x + u1 * canvas_w;
-                                float y_top = canvas_end.y - bins[b] * canvas_h;
+                                float y_top = canvas_end.y - h * canvas_h;
                                 draw_list->AddRectFilled(
                                     ImVec2(x0, y_top), ImVec2(x1, canvas_end.y),
                                     IM_COL32(120, 140, 170, 90));
@@ -1665,7 +1677,7 @@ struct ViewerPrivate : public Viewer {
             // Build density histogram for TF editor
             if (pipeline->attribute_type() == Float32 &&
                 pipeline->attribute_dim() == 1) {
-                constexpr int N_BINS = 256;
+                constexpr int N_BINS = 1024;
                 constexpr float BETA = 10.0f;
                 std::vector<float> raw(num_points);
                 cuda_check(cuMemcpyDtoH(raw.data(),
@@ -1681,19 +1693,20 @@ struct ViewerPrivate : public Viewer {
                         tf_hist_linear[b] += 1.0f;
                 }
                 tf_hist_log.resize(N_BINS);
-                float max_lin = *std::max_element(tf_hist_linear.begin(),
-                                                  tf_hist_linear.end());
-                float max_log = 0.0f;
-                for (int i = 0; i < N_BINS; ++i) {
+                for (int i = 0; i < N_BINS; ++i)
                     tf_hist_log[i] = std::log1p(tf_hist_linear[i]);
-                    max_log = std::max(max_log, tf_hist_log[i]);
-                }
-                if (max_lin > 0.0f)
-                    for (auto &v : tf_hist_linear)
-                        v /= max_lin;
-                if (max_log > 0.0f)
-                    for (auto &v : tf_hist_log)
-                        v /= max_log;
+
+                // Precompute max and q99 for both variants
+                auto compute_max_q99 = [&](const std::vector<float> &v,
+                                           float &out_max, float &out_q99) {
+                    out_max = *std::max_element(v.begin(), v.end());
+                    std::vector<float> sorted = v;
+                    std::sort(sorted.begin(), sorted.end());
+                    out_q99 = sorted[(int)(0.99f * (N_BINS - 1))];
+                    if (out_q99 < 1e-6f) out_q99 = out_max;
+                };
+                compute_max_q99(tf_hist_linear, tf_hist_max_lin, tf_hist_q99_lin);
+                compute_max_q99(tf_hist_log,    tf_hist_max_log, tf_hist_q99_log);
             }
 
             prefetch_adjacent_diff(
