@@ -56,6 +56,10 @@ struct VisualizationSettings {
     float phong_diffuse;
     float phong_specular;
     float phong_shininess;
+    bool ao_enabled;
+    uint32_t ao_num_dirs;
+    float ao_max_distance;
+    float ao_strength;
 };
 
 inline VisualizationSettings default_visualization_settings() {
@@ -81,6 +85,10 @@ inline VisualizationSettings default_visualization_settings() {
     settings.phong_diffuse = 0.7f;
     settings.phong_specular = 0.3f;
     settings.phong_shininess = 32.0f;
+    settings.ao_enabled = false;
+    settings.ao_num_dirs = 32;
+    settings.ao_max_distance = 0.05f;
+    settings.ao_strength = 1.0f;
     return settings;
 }
 
@@ -159,6 +167,7 @@ class Pipeline {
                                      float *activated,
                                      uint32_t start_index,
                                      uint64_t output_surface,
+                                     const float *ao_directions = nullptr,
                                      const void *stream = nullptr) {}
 
     // Stub for viewer compatibility

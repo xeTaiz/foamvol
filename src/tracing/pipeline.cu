@@ -1070,6 +1070,92 @@ void prefetch_adjacent_diff(const Vec3f *points,
                           adjacent_diff);
 }
 
+__device__ __forceinline__ uint32_t wang_hash(uint32_t k) {
+    k = (k ^ 61u) ^ (k >> 16);
+    k *= 9u;
+    k = k ^ (k >> 4);
+    k *= 0x27d4eb2du;
+    k = k ^ (k >> 15);
+    return k;
+}
+
+__device__ __forceinline__ Vec3f rotate_yx(const Vec3f &v, float a, float b) {
+    float ca = cosf(a), sa = sinf(a);
+    float cb = cosf(b), sb = sinf(b);
+    float x1 = v[0];
+    float y1 = cb * v[1] - sb * v[2];
+    float z1 = sb * v[1] + cb * v[2];
+    return Vec3f(ca * x1 + sa * z1, y1, -sa * x1 + ca * z1);
+}
+
+__device__ __forceinline__ float compute_ao(
+        uint32_t cell_idx,
+        const Vec3f &x_sample,
+        const Vec3f *__restrict__ points,
+        const float *__restrict__ activated,
+        const uint32_t *__restrict__ point_adjacency,
+        const uint32_t *__restrict__ point_adjacency_offsets,
+        const Vec4h *__restrict__ adjacent_diff,
+        const float *__restrict__ ao_directions,
+        uint32_t num_dirs,
+        float max_dist,
+        bool use_tf,
+        float tf_density_min,
+        float tf_density_max,
+        float tf_opacity_scale,
+        TransferFunctionTable tf_table) {
+    uint32_t h = wang_hash(cell_idx);
+    float ang_a = (h & 0xFFFFu) * (6.2831853f / 65536.0f);
+    float ang_b = ((h >> 16) & 0xFFFFu) * (6.2831853f / 65536.0f);
+
+    float vis_sum = 0.0f;
+    for (uint32_t k = 0; k < num_dirs; ++k) {
+        Vec3f base(ao_directions[3 * k + 0],
+                   ao_directions[3 * k + 1],
+                   ao_directions[3 * k + 2]);
+        Vec3f d = rotate_yx(base, ang_a, ang_b);
+
+        Ray ao_ray;
+        ao_ray.origin = x_sample;
+        ao_ray.direction = d;
+
+        float tau = 0.0f;
+        auto ao_functor = [&](uint32_t pi, float t0, float t1,
+                              const Vec3f & /*cp*/, const Vec3f & /*np*/) {
+            if (t0 >= max_dist)
+                return false;
+            float dt = fminf(t1, max_dist) - t0;
+            if (dt <= 0.0f)
+                return false;
+            float mu = activated[pi];
+            float opac;
+            if (use_tf) {
+                float range = tf_density_max - tf_density_min;
+                float v = (range > 1e-8f)
+                              ? fmaxf(0.0f, fminf((mu - tf_density_min) / range, 1.0f))
+                              : 0.0f;
+                Vec3f rgb_tmp;
+                float tf_opacity;
+                sample_transfer_function(v, tf_table, rgb_tmp, tf_opacity);
+                opac = tf_opacity * tf_opacity_scale;
+            } else {
+                opac = mu;
+            }
+            tau += opac * dt;
+            if (tau > 4.6f)
+                return false;
+            return t1 < max_dist;
+        };
+
+        trace<128, 4>(ao_ray, points, point_adjacency,
+                      point_adjacency_offsets, adjacent_diff,
+                      cell_idx, 64u, ao_functor);
+
+        vis_sum += expf(-tau);
+    }
+    return vis_sum / float(num_dirs);
+}
+
 __global__ void ct_visualization(TraceSettings settings,
                                   VisualizationSettings vis_settings,
                                   Camera camera,
@@ -1080,6 +1166,7 @@ __global__ void ct_visualization(TraceSettings settings,
                                   const uint32_t *__restrict__ point_adjacency,
                                   const uint32_t *__restrict__ point_adjacency_offsets,
                                   const Vec4h *__restrict__ adjacent_diff,
+                                  const float *__restrict__ ao_directions,
                                   uint32_t start_index,
                                   CUsurfObject output_surface) {
 
@@ -1215,6 +1302,19 @@ __global__ void ct_visualization(TraceSettings settings,
             float v = fminf(mu * den_scale, 1.0f);
             rgb = colormap(v, cmap, cmap_table);
             alpha = 1.0f - expf(-mu * delta_t);
+        }
+
+        if (vis_settings.ao_enabled && alpha > 1e-2f && ao_directions != nullptr) {
+            float t_mid = 0.5f * (t_0 + t_1);
+            Vec3f x_sample = ray.origin + t_mid * ray.direction;
+            float ao = compute_ao(point_idx, x_sample,
+                                  points, activated, point_adjacency,
+                                  point_adjacency_offsets, adjacent_diff,
+                                  ao_directions, vis_settings.ao_num_dirs,
+                                  vis_settings.ao_max_distance,
+                                  use_tf, tf_density_min, tf_density_max,
+                                  tf_opacity_scale, tf_table);
+            rgb = rgb * (1.0f - vis_settings.ao_strength + vis_settings.ao_strength * ao);
         }
 
         float next_transmittance = transmittance * (1.0f - alpha);
@@ -1529,6 +1629,7 @@ class CUDADensityPipeline : public Pipeline {
                              float *activated,
                              uint32_t start_index,
                              uint64_t output_surface,
+                             const float *ao_directions = nullptr,
                              const void *stream = nullptr) override {
 
         CUstream cu_stream = 0;
@@ -1562,6 +1663,7 @@ class CUDADensityPipeline : public Pipeline {
             reinterpret_cast<const uint32_t *>(point_adjacency),
             reinterpret_cast<const uint32_t *>(point_adjacency_offsets),
             reinterpret_cast<const Vec4h *>(adjacent_points),
+            ao_directions,
             start_index,
             static_cast<CUsurfObject>(output_surface));
     }

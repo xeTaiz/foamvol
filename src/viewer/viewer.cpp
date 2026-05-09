@@ -624,6 +624,8 @@ struct ViewerPrivate : public Viewer {
     CUDAArray<uint8_t> point_adjacency_offsets_buffer;
     CUDAArray<uint8_t> adjacent_diff_buffer;
     CUDAArray<float> activated_buffer;
+    CUDAArray<float> ao_directions_buffer;
+    uint32_t ao_directions_count = 0;
     std::vector<uint8_t> points_cpu;
     std::vector<uint8_t> aabb_tree_cpu;
 
@@ -1363,6 +1365,24 @@ struct ViewerPrivate : public Viewer {
                                        ImGuiSliderFlags_Logarithmic |
                                            ImGuiSliderFlags_NoRoundToFormat);
                 }
+                ImGui::SeparatorText("Ambient Occlusion");
+                ImGui::Checkbox("AO enabled", &vis_settings.ao_enabled);
+                if (vis_settings.ao_enabled) {
+                    ImGui::SliderFloat("AO strength",
+                                       &vis_settings.ao_strength,
+                                       0.0f, 1.0f, "%.2f");
+                    int n = (int)vis_settings.ao_num_dirs;
+                    if (ImGui::SliderInt("AO directions", &n, 4, 256,
+                                        "%d", ImGuiSliderFlags_Logarithmic)) {
+                        vis_settings.ao_num_dirs = (uint32_t)n;
+                    }
+                    ImGui::SliderFloat("AO radius",
+                                       &vis_settings.ao_max_distance,
+                                       0.001f, 0.5f, "%.4f",
+                                       ImGuiSliderFlags_Logarithmic |
+                                           ImGuiSliderFlags_NoRoundToFormat);
+                }
+
                 ImGui::ColorEdit3(
                     "Background color",
                     reinterpret_cast<float *>(&vis_settings.bg_color));
@@ -1397,6 +1417,32 @@ struct ViewerPrivate : public Viewer {
                 res_desc.res.array.hArray = output_array;
                 cuda_check(cuSurfObjectCreate(&output_surface, &res_desc));
 
+                if (vis_settings.ao_enabled &&
+                    vis_settings.ao_num_dirs != ao_directions_count) {
+                    int n = (int)vis_settings.ao_num_dirs;
+                    std::vector<float> tmp(3 * n);
+                    const float ga = M_PI * (3.0f - sqrtf(5.0f));
+                    for (int k = 0; k < n; ++k) {
+                        float z = (n == 1) ? 1.0f : 1.0f - 2.0f * k / float(n - 1);
+                        float r = sqrtf(fmaxf(0.0f, 1.0f - z * z));
+                        float phi = ga * k;
+                        tmp[3 * k + 0] = r * cosf(phi);
+                        tmp[3 * k + 1] = r * sinf(phi);
+                        tmp[3 * k + 2] = z;
+                    }
+                    ao_directions_buffer.resize(tmp.size());
+                    cuda_check(cuMemcpyHtoD(
+                        (CUdeviceptr)ao_directions_buffer.begin(),
+                        tmp.data(),
+                        tmp.size() * sizeof(float)));
+                    ao_directions_count = (uint32_t)n;
+                }
+
+                const float *ao_dirs_ptr =
+                    (vis_settings.ao_enabled && ao_directions_count > 0)
+                        ? ao_directions_buffer.begin()
+                        : nullptr;
+
                 pipeline->trace_visualization(
                     settings,
                     vis_settings,
@@ -1413,6 +1459,7 @@ struct ViewerPrivate : public Viewer {
                     activated_buffer.begin(),
                     start_index,
                     output_surface,
+                    ao_dirs_ptr,
                     &cuda_stream);
 
                 if (is_cuda_gl_interop_supported) {
