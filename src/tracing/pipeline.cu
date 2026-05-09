@@ -1170,6 +1170,46 @@ __global__ void ct_visualization(TraceSettings settings,
             float tf_opacity;
             sample_transfer_function(v, tf_table, rgb, tf_opacity);
             alpha = 1.0f - expf(-tf_opacity * tf_opacity_scale * delta_t);
+
+            if (vis_settings.phong_enabled) {
+                // Gradient via cell adjacency: least-squares style sum of
+                // one-sided directional derivatives weighted by 1/dist²
+                Vec3f grad = Vec3f::Zero();
+                float mu_self = activated[point_idx];
+                uint32_t ga0 = point_adjacency_offsets[point_idx];
+                uint32_t ga1 = point_adjacency_offsets[point_idx + 1];
+                for (uint32_t j = ga0; j < ga1; ++j) {
+                    Vec4h adj_h = adjacent_diff[j];
+                    Vec3f offset(__half2float(adj_h[0]),
+                                 __half2float(adj_h[1]),
+                                 __half2float(adj_h[2]));
+                    float r2 = offset.squaredNorm();
+                    if (r2 > 1e-12f) {
+                        float dmu = activated[point_adjacency[j]] - mu_self;
+                        grad += dmu * offset / r2;
+                    }
+                }
+
+                float gn = grad.norm();
+                float lighting = vis_settings.phong_ambient;
+                if (gn > 1e-6f) {
+                    // Fixed world-space light direction (upper-right-front)
+                    const Vec3f light_dir =
+                        Vec3f(1.0f, 1.0f, 1.0f) / sqrtf(3.0f);
+                    Vec3f N = -grad / gn;
+                    float NdotL = fmaxf(N.dot(light_dir), 0.0f);
+                    // Blinn-Phong: H = (L + V).normalized()
+                    Vec3f V = -ray.direction;
+                    Vec3f H = (light_dir + V).normalized();
+                    float NdotH = fmaxf(N.dot(H), 0.0f);
+                    float spec = (NdotL > 0.0f)
+                                     ? powf(NdotH, vis_settings.phong_shininess)
+                                     : 0.0f;
+                    lighting += vis_settings.phong_diffuse * NdotL
+                              + vis_settings.phong_specular * spec;
+                }
+                rgb = rgb * lighting;
+            }
         } else {
             // Original colormap path
             float v = fminf(mu * den_scale, 1.0f);

@@ -1081,6 +1081,25 @@ struct ViewerPrivate : public Viewer {
                 }
 
                 if (vis_settings.use_transfer_function) {
+                    ImGui::SeparatorText("Phong Shading");
+                    ImGui::Checkbox("Phong shading", &vis_settings.phong_enabled);
+                    if (vis_settings.phong_enabled) {
+                        ImGui::SliderFloat("Ambient",
+                                           &vis_settings.phong_ambient,
+                                           0.0f, 1.0f, "%.2f");
+                        ImGui::SliderFloat("Diffuse",
+                                           &vis_settings.phong_diffuse,
+                                           0.0f, 1.0f, "%.2f");
+                        ImGui::SliderFloat("Specular",
+                                           &vis_settings.phong_specular,
+                                           0.0f, 1.0f, "%.2f");
+                        ImGui::SliderFloat("Shininess",
+                                           &vis_settings.phong_shininess,
+                                           1.0f, 256.0f, "%.1f",
+                                           ImGuiSliderFlags_Logarithmic |
+                                               ImGuiSliderFlags_NoRoundToFormat);
+                    }
+
                     // Transfer function editor
                     ImGui::SeparatorText("Transfer Function");
 
