@@ -628,6 +628,11 @@ struct ViewerPrivate : public Viewer {
     uint32_t ao_directions_count = 0;
     std::vector<uint8_t> points_cpu;
     std::vector<uint8_t> aabb_tree_cpu;
+    std::vector<float> tf_hist_linear;
+    std::vector<float> tf_hist_log;
+    static constexpr float TF_HIST_DOMAIN_MAX = 10.0f;
+    bool tf_histogram_show = true;
+    bool tf_histogram_log_y = true;
 
     // New members for fallback
     bool is_cuda_gl_interop_supported;
@@ -1065,22 +1070,6 @@ struct ViewerPrivate : public Viewer {
                 ImGui::Checkbox("Use Transfer Function",
                                 &vis_settings.use_transfer_function);
 
-                // Activation controls (always visible)
-                ImGui::SliderFloat("Activation scale",
-                                   &vis_settings.activation_scale,
-                                   0.01f,
-                                   10.0f,
-                                   "%.3f",
-                                   ImGuiSliderFlags_Logarithmic |
-                                       ImGuiSliderFlags_NoRoundToFormat);
-                ImGui::SliderFloat("Activation beta",
-                                   &vis_settings.activation_beta,
-                                   0.1f,
-                                   100.0f,
-                                   "%.2f",
-                                   ImGuiSliderFlags_Logarithmic |
-                                       ImGuiSliderFlags_NoRoundToFormat);
-
                 ImGui::SeparatorText("Interpolation");
                 ImGui::Checkbox("IDW interpolation",
                                 &vis_settings.idw_interpolation);
@@ -1190,6 +1179,9 @@ struct ViewerPrivate : public Viewer {
                                        1.0f, 1000.0f, "%.1f",
                                        ImGuiSliderFlags_Logarithmic |
                                            ImGuiSliderFlags_NoRoundToFormat);
+                    ImGui::Checkbox("Histogram", &tf_histogram_show);
+                    ImGui::SameLine();
+                    ImGui::Checkbox("Log Y", &tf_histogram_log_y);
 
                     // Canvas for TF editor
                     const float canvas_w = 300.0f;
@@ -1216,6 +1208,34 @@ struct ViewerPrivate : public Viewer {
                         draw_list->AddLine(ImVec2(canvas_pos.x, gy),
                                            ImVec2(canvas_end.x, gy),
                                            IM_COL32(60, 60, 60, 255));
+                    }
+
+                    // Density histogram background
+                    if (tf_histogram_show && !tf_hist_linear.empty()) {
+                        const std::vector<float> &bins =
+                            tf_histogram_log_y ? tf_hist_log : tf_hist_linear;
+                        int N = (int)bins.size();
+                        float dmin = vis_settings.tf_density_min;
+                        float dmax = vis_settings.tf_density_max;
+                        float window = dmax - dmin;
+                        if (window > 1e-6f) {
+                            for (int b = 0; b < N; ++b) {
+                                float d0 = (float)b / N * TF_HIST_DOMAIN_MAX;
+                                float d1 = (float)(b + 1) / N * TF_HIST_DOMAIN_MAX;
+                                float u0 = (d0 - dmin) / window;
+                                float u1 = (d1 - dmin) / window;
+                                if (u1 <= 0.0f || u0 >= 1.0f)
+                                    continue;
+                                u0 = std::max(0.0f, u0);
+                                u1 = std::min(1.0f, u1);
+                                float x0 = canvas_pos.x + u0 * canvas_w;
+                                float x1 = canvas_pos.x + u1 * canvas_w;
+                                float y_top = canvas_end.y - bins[b] * canvas_h;
+                                draw_list->AddRectFilled(
+                                    ImVec2(x0, y_top), ImVec2(x1, canvas_end.y),
+                                    IM_COL32(120, 140, 170, 90));
+                            }
+                        }
                     }
 
                     // Draw filled opacity curve from baked texture
@@ -1641,6 +1661,40 @@ struct ViewerPrivate : public Viewer {
                                     coord_bytes));
             cuda_check(cuMemcpyDtoH(
                 aabb_tree_cpu.data(), (CUdeviceptr)aabb_tree, aabb_tree_bytes));
+
+            // Build density histogram for TF editor
+            if (pipeline->attribute_type() == Float32 &&
+                pipeline->attribute_dim() == 1) {
+                constexpr int N_BINS = 256;
+                constexpr float BETA = 10.0f;
+                std::vector<float> raw(num_points);
+                cuda_check(cuMemcpyDtoH(raw.data(),
+                                        (CUdeviceptr)attrs_buffer.begin(),
+                                        num_points * sizeof(float)));
+                tf_hist_linear.assign(N_BINS, 0.0f);
+                for (float r : raw) {
+                    float mu = (BETA * r > 20.0f)
+                                   ? r
+                                   : std::log1p(std::exp(BETA * r)) / BETA;
+                    int b = (int)(mu / TF_HIST_DOMAIN_MAX * N_BINS);
+                    if (b >= 0 && b < N_BINS)
+                        tf_hist_linear[b] += 1.0f;
+                }
+                tf_hist_log.resize(N_BINS);
+                float max_lin = *std::max_element(tf_hist_linear.begin(),
+                                                  tf_hist_linear.end());
+                float max_log = 0.0f;
+                for (int i = 0; i < N_BINS; ++i) {
+                    tf_hist_log[i] = std::log1p(tf_hist_linear[i]);
+                    max_log = std::max(max_log, tf_hist_log[i]);
+                }
+                if (max_lin > 0.0f)
+                    for (auto &v : tf_hist_linear)
+                        v /= max_lin;
+                if (max_log > 0.0f)
+                    for (auto &v : tf_hist_log)
+                        v /= max_log;
+            }
 
             prefetch_adjacent_diff(
                 reinterpret_cast<const Vec3f *>(coords),
