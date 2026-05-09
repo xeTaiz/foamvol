@@ -323,6 +323,11 @@ def main():
 
     # ── σ sweep ─────────────────────────────────────────────────────────────
     rows = []
+    best_psnr_val = float("-inf")
+    best_psnr_row = None
+    best_psnr_vol = None
+    best_meshf1_val = float("-inf")
+    best_meshf1_row = None
     print(f"\nSweeping {n_combos} σ combos...")
 
     for sigma_s, sigma_v in sigma_pairs:
@@ -432,6 +437,15 @@ def main():
         }
         rows.append(row)
 
+        # Track best vol-PSNR and best mesh-F1 rows for post-sweep artifacts.
+        if idw_psnr > best_psnr_val:
+            best_psnr_val = idw_psnr
+            best_psnr_row = row
+            best_psnr_vol = idw_vol.copy()
+        if mesh_idw_surf["f1_1v"] > best_meshf1_val:
+            best_meshf1_val = mesh_idw_surf["f1_1v"]
+            best_meshf1_row = row
+
     # ── CSV ─────────────────────────────────────────────────────────────────
     if rows:
         fieldnames = list(rows[0].keys())
@@ -441,6 +455,33 @@ def main():
             writer.writerows(rows)
         print(f"\nWrote {len(rows)} rows → {out_csv}")
         print(f"TB logs → {tb_base}/")
+
+        # ── best_sigmas.txt ─────────────────────────────────────────────────
+        best_txt = os.path.join(run_dir, "best_sigmas.txt")
+        with open(best_txt, "w") as f:
+            if best_psnr_row is not None:
+                f.write(
+                    f"best_vol_psnr:  sigma_s={best_psnr_row['sigma_s']}"
+                    f"  sigma_v={best_psnr_row['sigma_v']}"
+                    f"  vol_idw_psnr={best_psnr_row['vol_idw_psnr']:.4f}"
+                    f"  vol_idw_ssim={best_psnr_row['vol_idw_ssim']:.6f}"
+                    f"  vol_idw_f1_1v={best_psnr_row['vol_idw_f1_1v']:.6f}\n"
+                )
+            if best_meshf1_row is not None:
+                f.write(
+                    f"best_mesh_surf: sigma_s={best_meshf1_row['sigma_s']}"
+                    f"  sigma_v={best_meshf1_row['sigma_v']}"
+                    f"  mesh_idw_f1_1v={best_meshf1_row['mesh_idw_f1_1v']:.6f}"
+                    f"  mesh_idw_chamfer={best_meshf1_row['mesh_idw_chamfer']:.4f}"
+                    f"  mesh_idw_hd95={best_meshf1_row['mesh_idw_hausdorff_95']:.4f}\n"
+                )
+        print(f"Best sigmas → {best_txt}")
+
+        # ── best_vol.npy (256³ IDW volume at best-PSNR sigma) ───────────────
+        if best_psnr_vol is not None:
+            best_vol_path = os.path.join(run_dir, "best_vol.npy")
+            np.save(best_vol_path, best_psnr_vol.astype(np.float32))
+            print(f"Best vol    → {best_vol_path}  shape={best_psnr_vol.shape}")
     else:
         print("[WARN] No rows produced — check σ grid args.")
 

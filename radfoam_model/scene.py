@@ -1678,15 +1678,9 @@ class CTScene(torch.nn.Module):
             )
 
             ################### Split budget ########################
-            if grad_thresh > 0:
-                # Threshold mode: gradient-only, IDW and entropy disabled.
-                num_gradient_points = num_new_points
-                num_idw_points = 0
-                num_entropy_points = 0
-            else:
-                num_gradient_points = int(gradient_fraction * num_new_points)
-                num_idw_points = int(idw_fraction * num_new_points)
-                num_entropy_points = num_new_points - num_gradient_points - num_idw_points
+            num_gradient_points = int(gradient_fraction * num_new_points)
+            num_idw_points = int(idw_fraction * num_new_points)
+            num_entropy_points = num_new_points - num_gradient_points - num_idw_points
 
             sampled_points_list = []
             sampled_inds_list = []
@@ -1790,11 +1784,17 @@ class CTScene(torch.nn.Module):
                 if ref_w is not None and ref_factor is not None:
                     edge_ref = 0.5 * (ref_factor[src] + ref_factor[tgt])
                     mean_ref_w_idw = (1.0 - edge_ref).mean().item()
-                n_added_idw += _sample_edges(idw_weight, num_idw_points, "idw")
+                gated_idw_weight = idw_weight
+                if eligible_mask is not None:
+                    edge_eligible = (eligible_mask[src] | eligible_mask[tgt]).float()
+                    gated_idw_weight = idw_weight * edge_eligible
+                n_added_idw += _sample_edges(gated_idw_weight, num_idw_points, "idw")
 
             # --- Entropy-based sampling (neighbor density entropy × cell radius) ---
             if num_entropy_points > 0:
                 entropy_weight = cell_entropy * cell_radius.squeeze()
+                if eligible_mask is not None:
+                    entropy_weight = entropy_weight * eligible_mask.float()
                 num_viable = (entropy_weight > 0).sum().item()
                 if num_viable >= num_entropy_points:
                     entropy_inds = torch.multinomial(
