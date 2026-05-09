@@ -651,6 +651,21 @@ __global__ void precompute_activated_density(
     }
 }
 
+__global__ void precompute_activated_density_vis(
+    const float *__restrict__ density,
+    float *__restrict__ activated,
+    uint32_t num_points,
+    float beta,
+    float scale) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_points)
+        return;
+    float raw = density[i];
+    activated[i] = (beta * raw > 20.0f)
+                       ? scale * raw
+                       : scale * logf(1.0f + expf(beta * raw)) / beta;
+}
+
 template <int block_size>
 __global__ void ct_interp_forward(TraceSettings settings,
                                    const Vec3f *__restrict__ points,
@@ -1061,7 +1076,7 @@ __global__ void ct_visualization(TraceSettings settings,
                                   CMapTable cmap_table,
                                   TransferFunctionTable tf_table,
                                   const Vec3f *__restrict__ points,
-                                  const float *__restrict__ density,
+                                  const float *__restrict__ activated,
                                   const uint32_t *__restrict__ point_adjacency,
                                   const uint32_t *__restrict__ point_adjacency_offsets,
                                   const Vec4h *__restrict__ adjacent_diff,
@@ -1077,8 +1092,6 @@ __global__ void ct_visualization(TraceSettings settings,
     Ray ray = cast_ray(camera, i, j);
     ray.direction /= ray.direction.norm();
 
-    float beta = vis_settings.activation_beta;
-    float act_scale = vis_settings.activation_scale;
     float den_scale = vis_settings.density_scale;
     ColorMap cmap = vis_settings.color_map;
     float depth_quantile = vis_settings.depth_quantile;
@@ -1098,15 +1111,51 @@ __global__ void ct_visualization(TraceSettings settings,
                        float t_1,
                        const Vec3f &current_point,
                        const Vec3f &next_point) {
-        float raw = density[point_idx];
         float delta_t = fmaxf(t_1 - t_0, 0.0f);
 
-        // Softplus activation with numerical stability
         float mu;
-        if (beta * raw > 20.0f) {
-            mu = act_scale * raw;
+        if (vis_settings.idw_interpolation) {
+            constexpr float volume_extent = 1.05f;
+            constexpr float w_floor = 1e-6f;
+            constexpr float eps = 1e-7f;
+
+            float t_mid = 0.5f * (t_0 + t_1);
+            Vec3f x_mid = ray.origin + t_mid * ray.direction;
+
+            if (fabsf(x_mid[0]) > volume_extent ||
+                fabsf(x_mid[1]) > volume_extent ||
+                fabsf(x_mid[2]) > volume_extent) {
+                return true;
+            }
+
+            float sigma_sq = vis_settings.idw_sigma * vis_settings.idw_sigma;
+            float sigma_v_sq = vis_settings.idw_sigma_v * vis_settings.idw_sigma_v;
+
+            float mu_ref = activated[point_idx];
+            Vec3f diff_self = x_mid - current_point;
+            float w_self = expf(-diff_self.squaredNorm() / sigma_sq);
+            float w_sum = w_self + w_floor;
+            float mu_w = (w_self + w_floor) * mu_ref;
+
+            uint32_t a0 = point_adjacency_offsets[point_idx];
+            uint32_t a1 = point_adjacency_offsets[point_idx + 1];
+            for (uint32_t j = a0; j < a1; ++j) {
+                uint32_t nb = point_adjacency[j];
+                float mu_nb = activated[nb];
+                Vec4h adj_h = adjacent_diff[j];
+                Vec3f offset(__half2float(adj_h[0]),
+                             __half2float(adj_h[1]),
+                             __half2float(adj_h[2]));
+                Vec3f diff_nb = diff_self - offset;
+                float dmu = mu_nb - mu_ref;
+                float w_nb = expf(-diff_nb.squaredNorm() / sigma_sq
+                                  - dmu * dmu / sigma_v_sq);
+                w_sum += w_nb + w_floor;
+                mu_w += (w_nb + w_floor) * mu_nb;
+            }
+            mu = fmaxf(0.0f, mu_w / fmaxf(w_sum, eps));
         } else {
-            mu = act_scale * logf(1.0f + expf(beta * raw)) / beta;
+            mu = activated[point_idx];
         }
 
         Vec3f rgb;
@@ -1437,18 +1486,30 @@ class CUDADensityPipeline : public Pipeline {
                              const void *point_adjacency,
                              const void *point_adjacency_offsets,
                              const void *adjacent_points,
+                             float *activated,
                              uint32_t start_index,
                              uint64_t output_surface,
                              const void *stream = nullptr) override {
-
-        dim3 block(16, 16);
-        dim3 grid((camera.width + block.x - 1) / block.x,
-                  (camera.height + block.y - 1) / block.y);
 
         CUstream cu_stream = 0;
         if (stream) {
             cu_stream = *reinterpret_cast<const CUstream *>(stream);
         }
+
+        constexpr uint32_t block_size_1d = 128;
+        launch_kernel_1d<block_size_1d>(
+            precompute_activated_density_vis,
+            num_points,
+            stream,
+            reinterpret_cast<const float *>(attributes),
+            activated,
+            num_points,
+            vis_settings.activation_beta,
+            vis_settings.activation_scale);
+
+        dim3 block(16, 16);
+        dim3 grid((camera.width + block.x - 1) / block.x,
+                  (camera.height + block.y - 1) / block.y);
 
         ct_visualization<<<grid, block, 0, cu_stream>>>(
             settings,
@@ -1457,7 +1518,7 @@ class CUDADensityPipeline : public Pipeline {
             cmap_table,
             tf_table,
             reinterpret_cast<const Vec3f *>(points),
-            reinterpret_cast<const float *>(attributes),
+            activated,
             reinterpret_cast<const uint32_t *>(point_adjacency),
             reinterpret_cast<const uint32_t *>(point_adjacency_offsets),
             reinterpret_cast<const Vec4h *>(adjacent_points),

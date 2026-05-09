@@ -623,6 +623,7 @@ struct ViewerPrivate : public Viewer {
     CUDAArray<uint8_t> point_adjacency_buffer;
     CUDAArray<uint8_t> point_adjacency_offsets_buffer;
     CUDAArray<uint8_t> adjacent_diff_buffer;
+    CUDAArray<float> activated_buffer;
     std::vector<uint8_t> points_cpu;
     std::vector<uint8_t> aabb_tree_cpu;
 
@@ -1059,6 +1060,26 @@ struct ViewerPrivate : public Viewer {
                                    ImGuiSliderFlags_Logarithmic |
                                        ImGuiSliderFlags_NoRoundToFormat);
 
+                ImGui::SeparatorText("Interpolation");
+                ImGui::Checkbox("IDW interpolation",
+                                &vis_settings.idw_interpolation);
+                if (vis_settings.idw_interpolation) {
+                    ImGui::SliderFloat("IDW sigma",
+                                       &vis_settings.idw_sigma,
+                                       1e-4f,
+                                       1.0f,
+                                       "%.5f",
+                                       ImGuiSliderFlags_Logarithmic |
+                                           ImGuiSliderFlags_NoRoundToFormat);
+                    ImGui::SliderFloat("IDW sigma_v",
+                                       &vis_settings.idw_sigma_v,
+                                       1e-3f,
+                                       10.0f,
+                                       "%.4f",
+                                       ImGuiSliderFlags_Logarithmic |
+                                           ImGuiSliderFlags_NoRoundToFormat);
+                }
+
                 if (vis_settings.use_transfer_function) {
                     // Transfer function editor
                     ImGui::SeparatorText("Transfer Function");
@@ -1315,6 +1336,7 @@ struct ViewerPrivate : public Viewer {
                     point_adjacency_buffer.begin(),
                     point_adjacency_offsets_buffer.begin(),
                     adjacent_diff_buffer.begin(),
+                    activated_buffer.begin(),
                     start_index,
                     output_surface,
                     &cuda_stream);
@@ -1455,6 +1477,7 @@ struct ViewerPrivate : public Viewer {
             point_adjacency_offsets_buffer.resize(
                 point_adjacency_offsets_bytes);
             adjacent_diff_buffer.resize(adjacent_diff_bytes);
+            activated_buffer.resize(num_points);
 
             points_cpu.resize(coord_bytes);
             aabb_tree_cpu.resize(aabb_tree_bytes);
