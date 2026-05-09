@@ -112,7 +112,7 @@ def query_density(field, coordinates):
 
 
 def _idw_query(query, field, activated, sigma, sigma_v, global_max_k=None,
-               per_cell_sigma=False, per_neighbor_sigma=False):
+               per_cell_sigma=False, per_neighbor_sigma=False, hop=1):
     """Core bilateral IDW for a batch of query points. Thin wrapper around scene.idw_query."""
     return idw_query(
         query, field["points"], field["adjacency"], field["adjacency_offsets"],
@@ -121,11 +121,12 @@ def _idw_query(query, field, activated, sigma, sigma_v, global_max_k=None,
         per_cell_sigma=per_cell_sigma,
         per_neighbor_sigma=per_neighbor_sigma,
         cell_radius=field.get("cell_radius"),
+        hop=hop,
     )
 
 
 def sample_idw(field, coordinates, sigma=0.01, sigma_v=None,
-               per_cell_sigma=False, per_neighbor_sigma=False):
+               per_cell_sigma=False, per_neighbor_sigma=False, hop=1):
     """Inverse-distance weighted interpolation over Voronoi neighbors.
 
     For each query point, finds the containing cell, gathers its Voronoi
@@ -166,7 +167,8 @@ def sample_idw(field, coordinates, sigma=0.01, sigma_v=None,
         res = _idw_query(coords_flat[start:end], field, activated,
                          sigma, sigma_v, global_max_k,
                          per_cell_sigma=per_cell_sigma,
-                         per_neighbor_sigma=per_neighbor_sigma)
+                         per_neighbor_sigma=per_neighbor_sigma,
+                         hop=hop)
         result[start:end] = res.idw_result
 
     return torch.nan_to_num(result).reshape(original_shape).cpu().numpy()
@@ -740,7 +742,7 @@ def load_r2_volume(data_path):
     return None
 
 
-def voxelize_volumes(field, resolution, extent, sigma, sigma_v):
+def voxelize_volumes(field, resolution, extent, sigma, sigma_v, hop=1):
     """Voxelize the field into two 3D volumes in one pass.
 
     Raw volume: softplus(density[nearest_cell]) — constant per Voronoi cell.
@@ -775,7 +777,7 @@ def voxelize_volumes(field, resolution, extent, sigma, sigma_v):
     for start in range(0, num_voxels, batch_size):
         end = min(start + batch_size, num_voxels)
         res = _idw_query(coords_flat[start:end], field, activated,
-                         sigma, sigma_v, global_max_k)
+                         sigma, sigma_v, global_max_k, hop=hop)
         raw_vol[start:end] = activated[res.nn_idx]
         idw_vol[start:end] = torch.nan_to_num(res.idw_result)
 

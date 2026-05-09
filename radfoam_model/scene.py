@@ -28,7 +28,7 @@ IDWResult = namedtuple("IDWResult", [
 def idw_query(query, points, adjacency, adjacency_offsets, aabb_tree,
               activated, sigma, sigma_v, global_max_k=None,
               per_cell_sigma=False, per_neighbor_sigma=False,
-              cell_radius=None):
+              cell_radius=None, hop=1):
     """Bilateral IDW interpolation for a batch of query points.
 
     Matches the CUDA kernel: exp(-d²/σ²) spatial × exp(-Δμ²/σ_v²) bilateral.
@@ -46,6 +46,7 @@ def idw_query(query, points, adjacency, adjacency_offsets, aabb_tree,
         per_cell_sigma: if True, sigma is a scale factor × cell_radius
         per_neighbor_sigma: each neighbor slot uses its own cell's radius
         cell_radius: (N,) required when per_cell_sigma=True
+        hop: neighborhood depth (1=direct neighbors only, 2=include neighbors-of-neighbors)
 
     Returns:
         IDWResult namedtuple
@@ -74,6 +75,40 @@ def idw_query(query, points, adjacency, adjacency_offsets, aabb_tree,
     flat_offsets = flat_offsets.clamp(max=adj.shape[0] - 1)
     pad_idx[:, 1:] = adj[flat_offsets]
     valid[:, 1:] = has_k
+
+    if hop == 2:
+        K1 = global_max_k
+        K2_max = global_max_k
+
+        # Gather 2-hop candidates: for each valid 1-hop neighbor, expand its CSR row
+        one_hop_nbs = pad_idx[:, 1:]      # (B, K1)
+        one_hop_valid = valid[:, 1:]      # (B, K1)
+
+        hop2_starts = adj_off[one_hop_nbs]  # (B, K1)
+        hop2_counts = adj_off[one_hop_nbs + 1] - hop2_starts  # (B, K1)
+        hop2_counts = hop2_counts * one_hop_valid.long()
+
+        k_range2 = torch.arange(K2_max, device=device)
+        has_k2 = hop2_counts.unsqueeze(2) > k_range2[None, None, :]         # (B, K1, K2_max)
+        flat_off2 = (hop2_starts.unsqueeze(2) + k_range2[None, None, :]).clamp(max=adj.shape[0] - 1)
+        pad_idx_2 = adj[flat_off2].view(B, K1 * K2_max)                     # (B, K1*K2_max)
+        valid_2 = has_k2.view(B, K1 * K2_max)
+
+        pad_idx = torch.cat([pad_idx, pad_idx_2], dim=1)  # (B, 1+K1+K1*K2_max)
+        valid = torch.cat([valid, valid_2], dim=1)
+
+        # Strict dedup: mark any slot whose index already appeared in an earlier slot as invalid.
+        # Invalid slots get unique sentinels above N so they never match valid indices.
+        M_total = pad_idx.shape[1]
+        N_pts = points.shape[0]
+        col_ids = torch.arange(M_total, device=device).unsqueeze(0).expand(B, M_total)
+        pad_safe = torch.where(valid, pad_idx, N_pts + col_ids)
+        sorted_safe, sort_order = pad_safe.sort(dim=1, stable=True)
+        is_dup = torch.zeros(B, M_total, dtype=torch.bool, device=device)
+        is_dup[:, 1:] = sorted_safe[:, 1:] == sorted_safe[:, :-1]
+        _, unsort = sort_order.sort(dim=1, stable=True)
+        is_dup = is_dup.gather(1, unsort)
+        valid = valid & ~is_dup
 
     centers = points[pad_idx]
     diff = query.unsqueeze(1) - centers
@@ -374,7 +409,7 @@ class CTScene(torch.nn.Module):
         gz = F.conv3d(v, k.reshape(1, 1, 1, 1, 3), padding=(0, 0, 1))
         return (gx ** 2 + gy ** 2 + gz ** 2).sqrt().squeeze()
 
-    def _idw_voxelize(self, resolution=64, supersample=1, extent=1.0):
+    def _idw_voxelize(self, resolution=64, supersample=1, extent=1.0, hop=1):
         """Evaluate scene density on a regular voxel grid via IDW interpolation.
 
         Uses the same IDW parameters as inference-mode interpolation (_idw_sigma,
@@ -429,6 +464,7 @@ class CTScene(torch.nn.Module):
                 per_cell_sigma=per_cell_sigma,
                 per_neighbor_sigma=per_neighbor_sigma,
                 cell_radius=cell_radius,
+                hop=hop,
             )
             chunks.append(r.idw_result)
         sample_dens = torch.cat(chunks)  # (B,) with grad
