@@ -5,6 +5,7 @@ the Delaunay tet connectivity, with no voxelization step.
 
 Public API:
     marching_tets(points, density, tets, threshold) -> (vertices, faces)
+    taubin_smooth(vertices, faces, n_iters, lambda_, mu) -> (vertices, faces)
     write_ply(path, vertices, faces)
     surface_metrics_vs_gt_volume(points, density, tets, gt_volume, ...) -> dict
 """
@@ -198,6 +199,54 @@ def marching_tets(points, density, tets, threshold, density_fn=None):
         )
 
     return unique_pos.cpu().numpy(), faces.cpu().numpy().astype(np.int64)
+
+
+def taubin_smooth(vertices, faces, n_iters=20, lambda_=0.5, mu=-0.53):
+    """Taubin λ|μ smoothing of a triangle mesh (numpy in / numpy out).
+
+    Alternates a positive (λ) and negative (μ) umbrella Laplacian step each
+    iteration so the net frequency response is band-pass: high-frequency
+    faceting is removed while the overall shape does not shrink.
+
+    Args:
+        vertices: (V, 3) float32 numpy array
+        faces:    (F, 3) integer numpy array
+        n_iters:  number of full Taubin passes (each pass = 2 umbrella steps)
+        lambda_:  positive shrink weight (default 0.5)
+        mu:       negative inflate weight (default -0.53, must satisfy |mu|>lambda_)
+
+    Returns:
+        vertices: (V, 3) float32 numpy array (same topology, moved positions)
+        faces:    unchanged input faces array
+    """
+    if n_iters == 0 or len(faces) == 0:
+        return vertices, faces
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    V = len(vertices)
+    v = torch.from_numpy(np.asarray(vertices, dtype=np.float32)).to(device)  # (V, 3)
+    f = torch.from_numpy(np.asarray(faces, dtype=np.int64)).to(device)       # (F, 3)
+
+    # Directed edges in both directions: 6 edges per face → (6F, 2)
+    src = torch.cat([f[:, 0], f[:, 1], f[:, 2], f[:, 1], f[:, 2], f[:, 0]])
+    dst = torch.cat([f[:, 1], f[:, 2], f[:, 0], f[:, 0], f[:, 1], f[:, 2]])
+
+    # Degree per vertex: how many directed edges leave it (= how many neighbors)
+    deg = torch.zeros(V, device=device)
+    deg.scatter_add_(0, src, torch.ones(len(src), device=device))
+
+    def _umbrella_step(v, step):
+        # Neighbor position sum at each vertex
+        nb_sum = torch.zeros(V, 3, device=device)
+        nb_sum.scatter_add_(0, dst.unsqueeze(1).expand(-1, 3), v[src])
+        laplacian = nb_sum / deg.unsqueeze(1) - v
+        return v + step * laplacian
+
+    for _ in range(n_iters):
+        v = _umbrella_step(v, lambda_)
+        v = _umbrella_step(v, mu)
+
+    return v.cpu().numpy(), faces
 
 
 def surface_metrics_vs_gt_volume(
