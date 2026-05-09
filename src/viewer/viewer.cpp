@@ -1064,20 +1064,75 @@ struct ViewerPrivate : public Viewer {
                 ImGui::Checkbox("IDW interpolation",
                                 &vis_settings.idw_interpolation);
                 if (vis_settings.idw_interpolation) {
-                    ImGui::SliderFloat("IDW sigma",
-                                       &vis_settings.idw_sigma,
-                                       1e-4f,
-                                       1.0f,
-                                       "%.5f",
-                                       ImGuiSliderFlags_Logarithmic |
-                                           ImGuiSliderFlags_NoRoundToFormat);
-                    ImGui::SliderFloat("IDW sigma_v",
-                                       &vis_settings.idw_sigma_v,
-                                       1e-3f,
-                                       10.0f,
-                                       "%.4f",
-                                       ImGuiSliderFlags_Logarithmic |
-                                           ImGuiSliderFlags_NoRoundToFormat);
+                    // 2D sigma control: X = idw_sigma [1e-4, 1.0] log,
+                    //                  Y = idw_sigma_v [1e-3, 10.0] log, increases downward.
+                    const float canvas_w = 220.0f;
+                    const float canvas_h = 220.0f;
+                    constexpr float sig_min = 1e-4f, sig_max = 1.0f;
+                    constexpr float sigv_min = 1e-3f, sigv_max = 10.0f;
+                    const float log_sig_range = logf(sig_max / sig_min);
+                    const float log_sigv_range = logf(sigv_max / sigv_min);
+
+                    float nx = logf(vis_settings.idw_sigma / sig_min) / log_sig_range;
+                    float ny = logf(vis_settings.idw_sigma_v / sigv_min) / log_sigv_range;
+                    nx = fmaxf(0.0f, fminf(1.0f, nx));
+                    ny = fmaxf(0.0f, fminf(1.0f, ny));
+
+                    ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
+                    ImVec2 canvas_end = ImVec2(canvas_pos.x + canvas_w,
+                                               canvas_pos.y + canvas_h);
+                    ImDrawList *draw_list = ImGui::GetWindowDrawList();
+
+                    draw_list->AddRectFilled(canvas_pos, canvas_end,
+                                             IM_COL32(30, 30, 30, 255));
+                    draw_list->AddRect(canvas_pos, canvas_end,
+                                       IM_COL32(100, 100, 100, 255));
+
+                    for (int g = 1; g < 4; ++g) {
+                        float gx = canvas_pos.x + canvas_w * g / 4.0f;
+                        float gy = canvas_pos.y + canvas_h * g / 4.0f;
+                        draw_list->AddLine(ImVec2(gx, canvas_pos.y),
+                                           ImVec2(gx, canvas_end.y),
+                                           IM_COL32(60, 60, 60, 255));
+                        draw_list->AddLine(ImVec2(canvas_pos.x, gy),
+                                           ImVec2(canvas_end.x, gy),
+                                           IM_COL32(60, 60, 60, 255));
+                    }
+
+                    draw_list->AddText(
+                        ImVec2(canvas_pos.x + 2, canvas_end.y - 14),
+                        IM_COL32(160, 160, 160, 255), "\xcf\x83 \xe2\x86\x92");
+                    draw_list->AddText(
+                        ImVec2(canvas_pos.x + 2, canvas_pos.y + 2),
+                        IM_COL32(160, 160, 160, 255), "\xcf\x83v \xe2\x86\x93");
+
+                    float dot_x = canvas_pos.x + nx * canvas_w;
+                    float dot_y = canvas_pos.y + ny * canvas_h;
+                    draw_list->AddCircleFilled(ImVec2(dot_x, dot_y), 6.0f,
+                                               IM_COL32(255, 200, 50, 255));
+                    draw_list->AddCircle(ImVec2(dot_x, dot_y), 6.0f,
+                                         IM_COL32(255, 255, 255, 200), 0, 1.5f);
+
+                    ImGui::InvisibleButton("idw_sigma_canvas",
+                                           ImVec2(canvas_w, canvas_h));
+
+                    if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+                        ImVec2 mouse = ImGui::GetIO().MousePos;
+                        float mx = (mouse.x - canvas_pos.x) / canvas_w;
+                        float my = (mouse.y - canvas_pos.y) / canvas_h;
+                        mx = fmaxf(0.0f, fminf(1.0f, mx));
+                        my = fmaxf(0.0f, fminf(1.0f, my));
+                        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                            vis_settings.idw_sigma =
+                                sig_min * expf(mx * log_sig_range);
+                            vis_settings.idw_sigma_v =
+                                sigv_min * expf(my * log_sigv_range);
+                        }
+                    }
+
+                    ImGui::Text("sigma: %.5f  sigma_v: %.4f",
+                                vis_settings.idw_sigma,
+                                vis_settings.idw_sigma_v);
                 }
 
                 if (vis_settings.use_transfer_function) {
