@@ -174,6 +174,137 @@ def sample_idw(field, coordinates, sigma=0.01, sigma_v=None,
     return torch.nan_to_num(result).reshape(original_shape).cpu().numpy()
 
 
+def _nn_sibson_batch(query, field, activated, k_samples=64, sample_radius_scale=1.5,
+                     sigma_v=None, global_max_k=None):
+    """Discrete Sibson natural-neighbor query for a batch of query points.
+
+    For each query Q, samples K points in a ball around Q.  A sample P belongs
+    to the "stolen" region of candidate i when Q is closer to P than any existing
+    candidate.  The fraction of stolen samples per candidate gives the Sibson weight.
+    """
+    device = query.device
+    B = query.shape[0]
+    adj = field["adjacency"].long()
+    adj_off = field["adjacency_offsets"].long()
+    points = field["points"]
+    cell_radius = field.get("cell_radius")
+
+    if global_max_k is None:
+        global_max_k = int((adj_off[1:] - adj_off[:-1]).max().item())
+
+    nn_idx = radfoam.nn(points, field["aabb_tree"], query).long()
+
+    counts = adj_off[nn_idx + 1] - adj_off[nn_idx]
+    offsets = adj_off[nn_idx]
+    M = global_max_k + 1
+
+    pad_idx = torch.zeros(B, M, dtype=torch.long, device=device)
+    valid = torch.zeros(B, M, dtype=torch.bool, device=device)
+    pad_idx[:, 0] = nn_idx
+    valid[:, 0] = True
+
+    k_range = torch.arange(global_max_k, device=device)
+    has_k = counts.unsqueeze(1) > k_range.unsqueeze(0)
+    flat_offsets = (offsets.unsqueeze(1) + k_range.unsqueeze(0)).clamp(max=adj.shape[0] - 1)
+    pad_idx[:, 1:] = adj[flat_offsets]
+    valid[:, 1:] = has_k
+
+    if cell_radius is not None:
+        r = sample_radius_scale * cell_radius[nn_idx]  # (B,)
+    else:
+        cand_pts = points[pad_idx]
+        d2 = (query.unsqueeze(1) - cand_pts).pow(2).sum(-1)
+        d2[~valid] = 0.0
+        r = sample_radius_scale * d2.max(dim=1).values.sqrt()
+
+    K = k_samples
+    direction = torch.randn(B, K, 3, device=device)
+    direction = direction / (direction.norm(dim=-1, keepdim=True) + 1e-8)
+    u = torch.rand(B, K, device=device).pow(1.0 / 3.0)
+    samples = query.unsqueeze(1) + direction * (u * r.unsqueeze(1)).unsqueeze(-1)  # (B, K, 3)
+
+    cand_centers = points[pad_idx]  # (B, M, 3)
+    # Find nearest candidate for each sample — serial over M to avoid (B,K,M,3) tensor
+    nearest_d2 = torch.full((B, K), float("inf"), device=device)
+    nearest_slot = torch.zeros(B, K, dtype=torch.long, device=device)
+    for m in range(M):
+        d2_m = (samples - cand_centers[:, m:m+1, :]).pow(2).sum(-1)  # (B, K)
+        d2_m = d2_m + (~valid[:, m]).float().unsqueeze(1) * 1e10
+        closer = d2_m < nearest_d2
+        nearest_d2 = torch.where(closer, d2_m, nearest_d2)
+        nearest_slot = torch.where(closer, torch.full_like(nearest_slot, m), nearest_slot)
+
+    dist_to_q_sq = (samples - query.unsqueeze(1)).pow(2).sum(-1)  # (B, K)
+    stolen = dist_to_q_sq < nearest_d2  # True when Q owns the sample
+
+    stolen_counts = torch.zeros(B, M, device=device)
+    stolen_counts.scatter_add_(1, nearest_slot, stolen.float())
+    stolen_counts = stolen_counts * valid.float()
+
+    total = stolen_counts.sum(dim=1, keepdim=True).clamp(min=1.0)
+    w = stolen_counts / total  # (B, M) Sibson weights
+
+    # Fallback to containing cell when no samples are stolen
+    no_stolen = stolen.sum(dim=1) == 0  # (B,)
+    if no_stolen.any():
+        w[no_stolen] = 0.0
+        w[no_stolen, 0] = 1.0
+
+    vals = activated[pad_idx]  # (B, M)
+    if sigma_v is not None:
+        ref_val = activated[nn_idx]
+        val_diff = vals - ref_val.unsqueeze(1)
+        w = w * torch.exp(-val_diff.pow(2) / (sigma_v * sigma_v)) * valid.float()
+        w = w / w.sum(dim=1, keepdim=True).clamp(min=1e-10)
+
+    result = (w * vals * valid.float()).sum(dim=1)
+    return torch.nan_to_num(result), nn_idx
+
+
+def sample_nn_sibson(field, coordinates, k_samples=64, sample_radius_scale=1.5, sigma_v=None):
+    """Discrete Sibson natural-neighbor interpolation over Voronoi cells.
+
+    Weights are determined by the fraction of randomly-sampled space that each
+    neighbor would lose to Q if Q were inserted into the Voronoi diagram — the
+    geometric definition of Sibson's natural-neighbor weights.  No spatial
+    bandwidth parameter is needed; the support set is the same as IDW (containing
+    cell + its Delaunay neighbors).
+
+    Args:
+        field: dict from load_density_field() or field_from_model()
+        coordinates: numpy or torch array of shape (..., 3)
+        k_samples: Monte Carlo samples per query point (more → lower variance)
+        sample_radius_scale: ball radius as multiple of cell_radius[containing cell]
+        sigma_v: optional bilateral value-similarity scale (None=disabled)
+
+    Returns:
+        numpy array of shape (...) with interpolated density values
+    """
+    original_shape = coordinates.shape[:-1]
+    if isinstance(coordinates, np.ndarray):
+        coordinates = torch.from_numpy(coordinates).float()
+    coords_flat = coordinates.reshape(-1, 3).to(field["device"])
+
+    activated = F.softplus(field["density_flat"], beta=10)
+    adj_off = field["adjacency_offsets"]
+    global_max_k = int((adj_off[1:] - adj_off[:-1]).max().item())
+
+    result = torch.zeros(coords_flat.shape[0], device=field["device"])
+    # Smaller batch than IDW: M serial passes over (B, K) tensors
+    batch_size = 4096
+
+    for start in range(0, coords_flat.shape[0], batch_size):
+        end = min(start + batch_size, coords_flat.shape[0])
+        res, _ = _nn_sibson_batch(
+            coords_flat[start:end], field, activated,
+            k_samples=k_samples, sample_radius_scale=sample_radius_scale,
+            sigma_v=sigma_v, global_max_k=global_max_k,
+        )
+        result[start:end] = res
+
+    return result.reshape(original_shape).cpu().numpy()
+
+
 def sample_idw_diagnostic(field, coordinates, sigma=0.001, sigma_v=None):
     """Like sample_idw but returns diagnostic channels.
 
