@@ -1042,6 +1042,25 @@ struct ViewerPrivate : public Viewer {
                 vis_settings.depth_quantile = percentile / 100.0f;
             }
 
+            ImGui::SeparatorText("Slicing");
+            {
+                Vec3f &smin = *vis_settings.slice_min;
+                Vec3f &smax = *vis_settings.slice_max;
+                ImGui::DragFloatRange2("X slice", &smin[0], &smax[0],
+                                       0.005f, -1.0f, 1.0f, "%.3f", "%.3f",
+                                       ImGuiSliderFlags_AlwaysClamp);
+                ImGui::DragFloatRange2("Y slice", &smin[1], &smax[1],
+                                       0.005f, -1.0f, 1.0f, "%.3f", "%.3f",
+                                       ImGuiSliderFlags_AlwaysClamp);
+                ImGui::DragFloatRange2("Z slice", &smin[2], &smax[2],
+                                       0.005f, -1.0f, 1.0f, "%.3f", "%.3f",
+                                       ImGuiSliderFlags_AlwaysClamp);
+                if (ImGui::Button("Reset slicing")) {
+                    smin = Vec3f(-1.0f, -1.0f, -1.0f);
+                    smax = Vec3f( 1.0f,  1.0f,  1.0f);
+                }
+            }
+
             if (vis_settings.mode == VisualizationMode::VolumeDensity) {
                 ImGui::Checkbox("Use Transfer Function",
                                 &vis_settings.use_transfer_function);

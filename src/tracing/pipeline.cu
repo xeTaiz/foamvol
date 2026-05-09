@@ -1179,6 +1179,21 @@ __global__ void ct_visualization(TraceSettings settings,
     Ray ray = cast_ray(camera, i, j);
     ray.direction /= ray.direction.norm();
 
+    // Slab-test against the slicing AABB; clip ray integration to [t_enter, t_exit]
+    const Vec3f s_min = *vis_settings.slice_min;
+    const Vec3f s_max = *vis_settings.slice_max;
+    float aabb_t_enter = -1e38f, aabb_t_exit = 1e38f;
+#pragma unroll
+    for (int ax = 0; ax < 3; ++ax) {
+        float inv_d = 1.0f / ray.direction[ax];
+        float t1 = (s_min[ax] - ray.origin[ax]) * inv_d;
+        float t2 = (s_max[ax] - ray.origin[ax]) * inv_d;
+        aabb_t_enter = fmaxf(aabb_t_enter, fminf(t1, t2));
+        aabb_t_exit  = fminf(aabb_t_exit,  fmaxf(t1, t2));
+    }
+    const float t_enter = fmaxf(aabb_t_enter, 0.0f);
+    const float t_exit  = aabb_t_exit;
+
     float den_scale = vis_settings.density_scale;
     ColorMap cmap = vis_settings.color_map;
     float depth_quantile = vis_settings.depth_quantile;
@@ -1198,27 +1213,25 @@ __global__ void ct_visualization(TraceSettings settings,
                        float t_1,
                        const Vec3f &current_point,
                        const Vec3f &next_point) {
-        float delta_t = fmaxf(t_1 - t_0, 0.0f);
+        // Clip segment to the slicing AABB
+        float tc_0 = fmaxf(t_0, t_enter);
+        float tc_1 = fminf(t_1, t_exit);
+        if (tc_0 >= tc_1)
+            return t_1 < t_exit;  // skip; stop once past cube exit
+        float delta_t = tc_1 - tc_0;
 
         float mu;
         if (vis_settings.idw_interpolation) {
-            constexpr float volume_extent = 1.05f;
             constexpr float w_floor = 1e-6f;
             constexpr float eps = 1e-7f;
             // Adaptive neighborhood thresholds: skip work when exp(-(r/sigma)^2) < 0.1
             // tau_const_sq = -ln(0.1) ~ 2.3026  -> skip all neighbors when r > 1.517*sigma
             // tau_2hop_sq  = tau_const_sq / 4    -> skip 2-hop when r > 0.758*sigma
-            constexpr float TAU_CONST_SQ = 2.302585f;
+            constexpr float TAU_CONST_SQ = 2.0f; // 2.302585f;
             constexpr float TAU_2HOP_SQ  = TAU_CONST_SQ * 0.25f;
 
-            float t_mid = 0.5f * (t_0 + t_1);
+            float t_mid = 0.5f * (tc_0 + tc_1);
             Vec3f x_mid = ray.origin + t_mid * ray.direction;
-
-            if (fabsf(x_mid[0]) > volume_extent ||
-                fabsf(x_mid[1]) > volume_extent ||
-                fabsf(x_mid[2]) > volume_extent) {
-                return true;
-            }
 
             float sigma_sq = vis_settings.idw_sigma * vis_settings.idw_sigma;
             float sigma_v_sq = vis_settings.idw_sigma_v * vis_settings.idw_sigma_v;
@@ -1367,7 +1380,7 @@ __global__ void ct_visualization(TraceSettings settings,
         }
 
         if (vis_settings.ao_enabled && alpha > 1e-2f && ao_directions != nullptr) {
-            float t_mid = 0.5f * (t_0 + t_1);
+            float t_mid = 0.5f * (tc_0 + tc_1);
             Vec3f x_sample = ray.origin + t_mid * ray.direction;
             float ao = compute_ao(point_idx, x_sample,
                                   points, activated, point_adjacency,
@@ -1385,16 +1398,16 @@ __global__ void ct_visualization(TraceSettings settings,
         if (!depth_quantile_passed && next_transmittance < depth_quantile) {
             depth_quantile_passed = true;
             if (mu > 1e-6f) {
-                depth = t_0 + logf(transmittance / depth_quantile) / mu;
+                depth = tc_0 + logf(transmittance / depth_quantile) / mu;
             } else {
-                depth = t_0;
+                depth = tc_0;
             }
         }
 
         color += transmittance * alpha * rgb;
         transmittance = next_transmittance;
 
-        return transmittance > settings.weight_threshold;
+        return transmittance > settings.weight_threshold && t_1 < t_exit;
     };
 
     uint32_t n = trace<128, 4>(ray,

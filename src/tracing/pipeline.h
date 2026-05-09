@@ -60,6 +60,8 @@ struct VisualizationSettings {
     uint32_t ao_num_dirs;
     float ao_max_distance;
     float ao_strength;
+    CVec3f slice_min;
+    CVec3f slice_max;
 };
 
 inline VisualizationSettings default_visualization_settings() {
@@ -89,6 +91,8 @@ inline VisualizationSettings default_visualization_settings() {
     settings.ao_num_dirs = 32;
     settings.ao_max_distance = 0.05f;
     settings.ao_strength = 1.0f;
+    settings.slice_min = Vec3f(-1.0f, -1.0f, -1.0f);
+    settings.slice_max = Vec3f( 1.0f,  1.0f,  1.0f);
     return settings;
 }
 
