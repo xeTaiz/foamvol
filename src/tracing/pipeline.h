@@ -193,4 +193,20 @@ class Pipeline {
 
 std::shared_ptr<Pipeline> create_ct_pipeline();
 
+/// @brief DVR of a voxel grid stored in a CUDA 3D texture (trilinear, normalized coords).
+/// vol_tex_handle is a cudaTextureObject_t cast to uint64_t.
+/// output_surface is a CUsurfObject cast to uint64_t.
+/// Reuses vis_settings.slice_min/max for ray clipping; no separate bbox.
+void launch_volume_visualization(const TraceSettings &trace_settings,
+                                 const VisualizationSettings &vis_settings,
+                                 int num_steps,
+                                 float voxel_eps,
+                                 const Camera &camera,
+                                 int x_offset,
+                                 CMapTable cmap_table,
+                                 TransferFunctionTable tf_table,
+                                 uint64_t vol_tex_handle,
+                                 uint64_t output_surface,
+                                 const void *stream = nullptr);
+
 } // namespace radfoam

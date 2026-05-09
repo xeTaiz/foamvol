@@ -10,6 +10,7 @@
 
 #include <GL/gl3w.h>
 #include <GLFW/glfw3.h>
+#include <cuda_runtime.h>
 #include <cudaGL.h>
 
 #include "imgui.h"
@@ -639,6 +640,15 @@ struct ViewerPrivate : public Viewer {
     bool tf_histogram_log_y = true;
     bool tf_histogram_q99  = false;
 
+    // Volume DVR members
+    cudaArray_t vol_array = nullptr;
+    cudaTextureObject_t vol_tex = 0;
+    bool has_volume = false;
+    bool show_foam = true;
+    bool show_vol = false;
+    uint32_t vol_w = 0, vol_h = 0, vol_d = 0;
+    int vol_num_steps = 256;
+
     // New members for fallback
     bool is_cuda_gl_interop_supported;
     std::vector<uint8_t> cpu_fallback_buffer;
@@ -769,12 +779,64 @@ struct ViewerPrivate : public Viewer {
 
     ~ViewerPrivate() {
         tf_state.cleanup_gpu();
+        if (vol_tex != 0) {
+            cudaDestroyTextureObject(vol_tex);
+            vol_tex = 0;
+        }
+        if (vol_array != nullptr) {
+            cudaFreeArray(vol_array);
+            vol_array = nullptr;
+        }
         if (is_cuda_gl_interop_supported) {
             cuda_check(cuGraphicsUnregisterResource(resource));
         }
         gl_check(glDeleteTextures(1, &texture));
         gl_check(glDeleteProgram(program));
         glfwDestroyWindow(window);
+    }
+
+    void update_volume(uint32_t width,
+                       uint32_t height,
+                       uint32_t depth,
+                       const void *d_data) override {
+        std::lock_guard<std::mutex> lock(scene_mutex);
+
+        if (vol_tex != 0) { cudaDestroyTextureObject(vol_tex); vol_tex = 0; }
+        if (vol_array != nullptr) { cudaFreeArray(vol_array); vol_array = nullptr; }
+
+        // C-contiguous (X,Y,Z) tensor: Z is fastest-varying (stride=1), so Z is
+        // the "width" (innermost) dimension for cudaMemcpy3D. Array extent must
+        // be (width=Z, height=Y, depth=X) so that tex3D(u,v,w) with u=Z-coord,
+        // v=Y-coord, w=X-coord reads back the right voxel.
+        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float>();
+        cudaExtent extent = make_cudaExtent(depth, height, width);
+        cudaMalloc3DArray(&vol_array, &channelDesc, extent);
+
+        cudaMemcpy3DParms params = {};
+        params.srcPtr = make_cudaPitchedPtr(const_cast<void *>(d_data),
+                                            depth * sizeof(float), depth, height);
+        params.dstArray = vol_array;
+        params.extent   = extent;
+        params.kind     = cudaMemcpyDeviceToDevice;
+        cudaMemcpy3D(&params);
+
+        cudaResourceDesc resDesc = {};
+        resDesc.resType = cudaResourceTypeArray;
+        resDesc.res.array.array = vol_array;
+
+        cudaTextureDesc texDesc = {};
+        texDesc.addressMode[0] = cudaAddressModeClamp;
+        texDesc.addressMode[1] = cudaAddressModeClamp;
+        texDesc.addressMode[2] = cudaAddressModeClamp;
+        texDesc.filterMode      = cudaFilterModeLinear;
+        texDesc.readMode        = cudaReadModeElementType;
+        texDesc.normalizedCoords = 1;
+
+        cudaCreateTextureObject(&vol_tex, &resDesc, &texDesc, nullptr);
+
+        vol_w = width; vol_h = height; vol_d = depth;
+        has_volume = true;
+        show_vol   = true;
     }
 
     Vec3f get_up_vector() const {
@@ -992,6 +1054,13 @@ struct ViewerPrivate : public Viewer {
             if (options.limit_framerate) {
                 ImGui::SliderInt(
                     "Max frame rate", &options.max_framerate, 1, 240);
+            }
+
+            ImGui::SeparatorText("Pane visibility");
+            ImGui::Checkbox("Show foam", &show_foam);
+            if (has_volume) {
+                ImGui::SameLine();
+                ImGui::Checkbox("Show volume", &show_vol);
             }
 
             ImGui::SeparatorText("Trace settings");
@@ -1439,15 +1508,48 @@ struct ViewerPrivate : public Viewer {
                     reinterpret_cast<float *>(&vis_settings.bg_color));
             }
 
+            if (has_volume) {
+                ImGui::SeparatorText("Volume DVR");
+                ImGui::SliderInt("Volume steps",
+                                 &vol_num_steps, 32, 2048, "%d",
+                                 ImGuiSliderFlags_Logarithmic);
+            }
+
+            // ---- Split-screen layout ----
+            bool foam_ready = num_point_adjacency > 0;
+            bool vol_ready  = has_volume && show_vol && vol_tex != 0;
+
+            int W = (int)camera.width, H = (int)camera.height;
+            int w_foam = 0, w_vol = 0, x_vol = 0;
+            if (show_foam && foam_ready && vol_ready) {
+                w_foam = W / 2; w_vol = W - w_foam; x_vol = w_foam;
+            } else if (show_foam && foam_ready) {
+                w_foam = W;
+            } else if (vol_ready) {
+                w_vol = W;
+            }
+
+            // Divider line drawn behind ImGui windows
+            if (w_foam > 0 && w_vol > 0) {
+                ImDrawList *dl = ImGui::GetBackgroundDrawList();
+                dl->AddLine(ImVec2((float)w_foam, 0.0f),
+                            ImVec2((float)w_foam, (float)H),
+                            IM_COL32(160, 160, 160, 200), 2.0f);
+            }
+
             gl_check(glViewport(0, 0, camera.width, camera.height));
             gl_check(glClear(GL_COLOR_BUFFER_BIT));
 
-            if (num_point_adjacency > 0) {
-                uint32_t start_index = nn_cpu(ScalarType::Float32,
-                                              points_cpu.data(),
-                                              aabb_tree_cpu.data(),
-                                              *camera.position,
-                                              num_points);
+            if (foam_ready || vol_ready) {
+                uint32_t start_index = 0;
+                if (foam_ready && w_foam > 0) {
+                    start_index = nn_cpu(ScalarType::Float32,
+                                         points_cpu.data(),
+                                         aabb_tree_cpu.data(),
+                                         *camera.position,
+                                         num_points);
+                }
+
                 CUarray output_array = nullptr;
                 CUsurfObject output_surface = 0;
                 if (is_cuda_gl_interop_supported) {
@@ -1468,6 +1570,7 @@ struct ViewerPrivate : public Viewer {
                 res_desc.res.array.hArray = output_array;
                 cuda_check(cuSurfObjectCreate(&output_surface, &res_desc));
 
+                // AO direction precompute (foam-only feature)
                 if (vis_settings.ao_enabled &&
                     vis_settings.ao_num_dirs != ao_directions_count) {
                     int n = (int)vis_settings.ao_num_dirs;
@@ -1494,24 +1597,49 @@ struct ViewerPrivate : public Viewer {
                         ? ao_directions_buffer.begin()
                         : nullptr;
 
-                pipeline->trace_visualization(
-                    settings,
-                    vis_settings,
-                    camera,
-                    cmap_table,
-                    tf_state.get_table(),
-                    num_points,
-                    num_point_adjacency,
-                    points_buffer.begin(),
-                    attrs_buffer.begin(),
-                    point_adjacency_buffer.begin(),
-                    point_adjacency_offsets_buffer.begin(),
-                    adjacent_diff_buffer.begin(),
-                    activated_buffer.begin(),
-                    start_index,
-                    output_surface,
-                    ao_dirs_ptr,
-                    &cuda_stream);
+                // Foam pass — writes to x in [0, w_foam)
+                if (foam_ready && w_foam > 0) {
+                    Camera cam_foam = camera;
+                    cam_foam.width = (uint32_t)w_foam;
+                    pipeline->trace_visualization(
+                        settings,
+                        vis_settings,
+                        cam_foam,
+                        cmap_table,
+                        tf_state.get_table(),
+                        num_points,
+                        num_point_adjacency,
+                        points_buffer.begin(),
+                        attrs_buffer.begin(),
+                        point_adjacency_buffer.begin(),
+                        point_adjacency_offsets_buffer.begin(),
+                        adjacent_diff_buffer.begin(),
+                        activated_buffer.begin(),
+                        start_index,
+                        output_surface,
+                        ao_dirs_ptr,
+                        &cuda_stream);
+                }
+
+                // Volume DVR pass — writes to x in [x_vol, x_vol + w_vol)
+                if (vol_ready && w_vol > 0) {
+                    Camera cam_vol = camera;
+                    cam_vol.width = (uint32_t)w_vol;
+                    uint32_t max_dim = std::max({vol_w, vol_h, vol_d});
+                    float voxel_eps = max_dim > 0 ? 1.0f / (float)max_dim : 0.004f;
+                    launch_volume_visualization(
+                        settings,
+                        vis_settings,
+                        vol_num_steps,
+                        voxel_eps,
+                        cam_vol,
+                        x_vol,
+                        cmap_table,
+                        tf_state.get_table(),
+                        (uint64_t)vol_tex,
+                        (uint64_t)output_surface,
+                        &cuda_stream);
+                }
 
                 if (is_cuda_gl_interop_supported) {
                     cuda_check(cuSurfObjectDestroy(output_surface));
@@ -1520,23 +1648,17 @@ struct ViewerPrivate : public Viewer {
                     cuda_check(cuStreamSynchronize(cuda_stream));
                     cuda_check(cuSurfObjectDestroy(output_surface));
 
-                    size_t buffer_size =
-                        camera.width * camera.height * 4; // RGBA8
-                    if (cpu_fallback_buffer.size() != buffer_size) {
+                    size_t buffer_size = camera.width * camera.height * 4;
+                    if (cpu_fallback_buffer.size() != buffer_size)
                         cpu_fallback_buffer.resize(buffer_size);
-                    }
 
                     CUDA_MEMCPY2D copyParam = {0};
-                    copyParam.srcXInBytes = 0;
-                    copyParam.srcY = 0;
                     copyParam.srcMemoryType = CU_MEMORYTYPE_ARRAY;
-                    copyParam.srcArray = output_array;
-                    copyParam.dstXInBytes = 0;
-                    copyParam.dstY = 0;
+                    copyParam.srcArray      = output_array;
                     copyParam.dstMemoryType = CU_MEMORYTYPE_HOST;
-                    copyParam.dstHost = cpu_fallback_buffer.data();
-                    copyParam.WidthInBytes = camera.width * 4;
-                    copyParam.Height = camera.height;
+                    copyParam.dstHost       = cpu_fallback_buffer.data();
+                    copyParam.WidthInBytes  = camera.width * 4;
+                    copyParam.Height        = camera.height;
                     cuda_check(cuMemcpy2D(&copyParam));
                     cuda_check(cuArrayDestroy(output_array));
                 }
@@ -1544,14 +1666,9 @@ struct ViewerPrivate : public Viewer {
                 gl_check(glBindTexture(GL_TEXTURE_2D, texture));
                 gl_check(glDrawArrays(GL_TRIANGLE_STRIP, 0, 4));
                 if (!is_cuda_gl_interop_supported) {
-                    gl_check(glTexImage2D(GL_TEXTURE_2D,
-                                          0,
-                                          GL_RGBA8,
-                                          camera.width,
-                                          camera.height,
-                                          0,
-                                          GL_RGBA,
-                                          GL_UNSIGNED_BYTE,
+                    gl_check(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
+                                          camera.width, camera.height, 0,
+                                          GL_RGBA, GL_UNSIGNED_BYTE,
                                           cpu_fallback_buffer.data()));
                 }
                 gl_check(glBindTexture(GL_TEXTURE_2D, 0));
