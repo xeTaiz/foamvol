@@ -1064,11 +1064,11 @@ struct ViewerPrivate : public Viewer {
                 ImGui::Checkbox("IDW interpolation",
                                 &vis_settings.idw_interpolation);
                 if (vis_settings.idw_interpolation) {
-                    // 2D sigma control: X = idw_sigma [1e-4, 1.0] log,
+                    // 2D sigma control: X = idw_sigma [1e-4, 10.0] log,
                     //                  Y = idw_sigma_v [1e-3, 10.0] log, increases downward.
                     const float canvas_w = 220.0f;
                     const float canvas_h = 220.0f;
-                    constexpr float sig_min = 1e-4f, sig_max = 1.0f;
+                    constexpr float sig_min = 1e-4f, sig_max = 10.0f;
                     constexpr float sigv_min = 1e-3f, sigv_max = 10.0f;
                     const float log_sig_range = logf(sig_max / sig_min);
                     const float log_sigv_range = logf(sigv_max / sigv_min);

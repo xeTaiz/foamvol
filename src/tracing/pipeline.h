@@ -67,7 +67,7 @@ inline VisualizationSettings default_visualization_settings() {
     settings.max_depth = 10.0f;
     settings.depth_quantile = 0.5f;
     settings.density_scale = 1.0f;
-    settings.activation_beta = 10.0f;
+    settings.activation_beta = 20.0f;
     settings.activation_scale = 1.0f;
     settings.use_transfer_function = false;
     settings.tf_density_min = 0.0f;
