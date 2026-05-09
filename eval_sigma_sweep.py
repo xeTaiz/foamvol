@@ -36,7 +36,6 @@ import argparse
 import csv
 import os
 import sys
-import types
 from functools import partial
 
 import numpy as np
@@ -48,7 +47,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import radfoam
 from torch.utils.tensorboard import SummaryWriter
-from radfoam_model.scene import CTScene, idw_query
+from radfoam_model.scene import CTScene, idw_query, load_model_for_mesh
 from radfoam_model.mesh import surface_metrics_vs_gt_volume, marching_tets
 from vis_foam import (
     load_density_field, load_gt_volume, voxelize_volumes,
@@ -71,36 +70,6 @@ SLICE_COORDS = [-0.2, 0.0, 0.2]
 MESH_THRESHOLD = 0.5   # single representative iso-value for TB mesh vis
 
 
-def _load_model_for_mesh(model_path, activation_scale=1.0, device="cuda"):
-    """Load a checkpoint into a live CTScene with a fresh triangulation.
-
-    load_pt restores points/density/adjacency but not the triangulation object.
-    We rebuild it by calling radfoam.Triangulation directly, apply any resulting
-    permutation to the parameters in-place (no optimizer needed), then call
-    update_triangulation(rebuild=False) to refresh adjacency/aabb_tree from the
-    new triangulation without hitting the permute_points → optimizer path.
-    """
-    args = types.SimpleNamespace(
-        init_points=64000,
-        final_points=512000,
-        activation_scale=activation_scale,
-        init_scale=1.05,
-        init_type="random",
-        init_density=0.0,
-    )
-    model = CTScene(args, device=torch.device(device))
-    model.load_pt(model_path)
-
-    with torch.no_grad():
-        pts = model.primal_points.detach().contiguous()
-        model.triangulation = radfoam.Triangulation(pts)
-        perm = model.triangulation.permutation().to(torch.long)
-        model.primal_points = torch.nn.Parameter(pts[perm])
-        model.density = torch.nn.Parameter(model.density.detach()[perm])
-
-    model.update_triangulation(rebuild=False)
-    model.eval()
-    return model
 
 
 def _extract_slices(volume_np, gt_volume_np, res=256):
@@ -258,7 +227,7 @@ def main():
 
     # ── Model for mesh metrics ──────────────────────────────────────────────
     print("\nLoading model for mesh metrics...")
-    model = _load_model_for_mesh(model_path, activation_scale=activation_scale)
+    model = load_model_for_mesh(model_path, activation_scale=activation_scale)
 
     _pts    = model.primal_points.detach()
     _mu     = model.get_primal_density().detach().squeeze(-1)

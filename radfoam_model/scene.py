@@ -2124,3 +2124,53 @@ class CTScene(torch.nn.Module):
             n = self._frozen_mask.sum().item()
             del self._frozen_mask
             print(f"[unfreeze] released {n} previously-frozen points")
+
+
+import types as _types
+
+
+def load_model_for_mesh(model_path, activation_scale=1.0, device="cuda"):
+    """Load a CTScene checkpoint ready for IDW mesh extraction.
+
+    Restores points/density, rebuilds the Delaunay triangulation (applying
+    the resulting permutation to parameters in-place), and refreshes
+    adjacency/aabb_tree so idw_query can be called immediately.
+
+    Returns a fully-initialized CTScene in eval mode.
+    """
+    args = _types.SimpleNamespace(
+        init_points=64000,
+        final_points=512000,
+        activation_scale=activation_scale,
+        init_scale=1.05,
+        init_type="random",
+        init_density=0.0,
+    )
+    model = CTScene(args, device=torch.device(device))
+    model.load_pt(model_path)
+
+    with torch.no_grad():
+        pts = model.primal_points.detach().contiguous()
+        try:
+            model.triangulation = radfoam.Triangulation(pts)
+        except radfoam.TriangulationFailedError as e:
+            if "duplicate" not in str(e):
+                raise
+            import numpy as np
+            _, keep_idx = np.unique(pts.cpu().numpy(), axis=0, return_index=True)
+            keep_idx = torch.from_numpy(np.sort(keep_idx)).to(pts.device)
+            print(f"Removed {pts.shape[0] - len(keep_idx)} duplicate points before triangulation")
+            pts = pts[keep_idx].contiguous()
+            model.primal_points = torch.nn.Parameter(pts)
+            model.density = torch.nn.Parameter(model.density.detach()[keep_idx])
+            for attr in ("density_grad", "density_peak", "delta_raw", "cov_raw"):
+                if hasattr(model, attr) and getattr(model, attr) is not None:
+                    setattr(model, attr, torch.nn.Parameter(getattr(model, attr).detach()[keep_idx]))
+            model.triangulation = radfoam.Triangulation(pts)
+        perm = model.triangulation.permutation().to(torch.long)
+        model.primal_points = torch.nn.Parameter(pts[perm])
+        model.density = torch.nn.Parameter(model.density.detach()[perm])
+
+    model.update_triangulation(rebuild=False)
+    model.eval()
+    return model
