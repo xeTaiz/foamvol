@@ -1463,6 +1463,204 @@ __global__ void ct_visualization(TraceSettings settings,
     surf2Dwrite(rgba, output_surface, i * 4, j);
 }
 
+// ---------------------------------------------------------------------------
+// Volume DVR kernel — trilinear-sampled voxel grid, same TF/Phong/slice as foam
+// ---------------------------------------------------------------------------
+
+__global__ void volume_visualization(TraceSettings trace_settings,
+                                     VisualizationSettings vis_settings,
+                                     int num_steps,
+                                     float voxel_eps,
+                                     Camera camera,
+                                     int x_offset,
+                                     CMapTable cmap_table,
+                                     TransferFunctionTable tf_table,
+                                     cudaTextureObject_t vol_tex,
+                                     CUsurfObject output_surface) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= camera.width || j >= camera.height)
+        return;
+
+    Ray ray = cast_ray(camera, i, j);
+    ray.direction = ray.direction.normalized();
+
+    // Slab test against slice AABB (same as foam)
+    const Vec3f s_min = *vis_settings.slice_min;
+    const Vec3f s_max = *vis_settings.slice_max;
+    float t_enter = -1e38f, t_exit = 1e38f;
+#pragma unroll
+    for (int ax = 0; ax < 3; ++ax) {
+        float inv_d = 1.0f / ray.direction[ax];
+        float t1 = (s_min[ax] - ray.origin[ax]) * inv_d;
+        float t2 = (s_max[ax] - ray.origin[ax]) * inv_d;
+        t_enter = fmaxf(t_enter, fminf(t1, t2));
+        t_exit  = fminf(t_exit,  fmaxf(t1, t2));
+    }
+    t_enter = fmaxf(t_enter, 0.0f);
+
+    Vec3f color = Vec3f::Zero();
+    float transmittance = 1.0f;
+    float depth = 0.0f;
+    bool depth_quantile_passed = false;
+    uint32_t steps_taken = 0;
+
+    bool use_tf = vis_settings.use_transfer_function;
+    float tf_density_min = vis_settings.tf_density_min;
+    float tf_density_max = vis_settings.tf_density_max;
+    float tf_opacity_scale = vis_settings.tf_opacity_scale;
+    float den_scale = vis_settings.density_scale;
+    float depth_quantile = vis_settings.depth_quantile;
+    ColorMap cmap = vis_settings.color_map;
+
+    if (t_exit > t_enter) {
+        float dt = (t_exit - t_enter) / (float)num_steps;
+
+        for (int k = 0; k < num_steps && transmittance > trace_settings.weight_threshold; ++k) {
+            float t = t_enter + (k + 0.5f) * dt;
+            Vec3f x = ray.origin + t * ray.direction;
+
+            // Map world [-1,1]^3 → texture [0,1]:
+            //   volume shape (X, Y, Z) stored C-contiguous →
+            //   cudaArray extent (width=Z, height=Y, depth=X)
+            //   tex3D(u, v, w): u→Z, v→Y, w→X
+            float u = (x.z() + 1.0f) * 0.5f;
+            float v = (x.y() + 1.0f) * 0.5f;
+            float w = (x.x() + 1.0f) * 0.5f;
+
+            float mu = tex3D<float>(vol_tex, u, v, w) * vis_settings.activation_scale;
+            steps_taken = (uint32_t)(k + 1);
+
+            Vec3f rgb;
+            float alpha;
+
+            if (use_tf) {
+                float range = tf_density_max - tf_density_min;
+                float val = (range > 1e-8f)
+                    ? fmaxf(0.0f, fminf((mu - tf_density_min) / range, 1.0f))
+                    : 0.0f;
+                float tf_opacity;
+                sample_transfer_function(val, tf_table, rgb, tf_opacity);
+                alpha = 1.0f - expf(-tf_opacity * tf_opacity_scale * dt);
+
+                if (vis_settings.phong_enabled) {
+                    // Central-difference gradient in world space.
+                    // u→Z, v→Y, w→X: each finite-diff axis maps to a world axis.
+                    float gz = tex3D<float>(vol_tex, u + voxel_eps, v, w)
+                             - tex3D<float>(vol_tex, u - voxel_eps, v, w);
+                    float gy = tex3D<float>(vol_tex, u, v + voxel_eps, w)
+                             - tex3D<float>(vol_tex, u, v - voxel_eps, w);
+                    float gx = tex3D<float>(vol_tex, u, v, w + voxel_eps)
+                             - tex3D<float>(vol_tex, u, v, w - voxel_eps);
+                    Vec3f grad(gx, gy, gz);
+
+                    float gn = grad.norm();
+                    float lighting = vis_settings.phong_ambient;
+                    if (gn > 1e-6f) {
+                        const Vec3f light_dir =
+                            Vec3f(1.0f, 1.0f, 1.0f) / sqrtf(3.0f);
+                        Vec3f N = -grad / gn;
+                        float NdotL = fmaxf(N.dot(light_dir), 0.0f);
+                        Vec3f V = -ray.direction;
+                        Vec3f H = (light_dir + V).normalized();
+                        float NdotH = fmaxf(N.dot(H), 0.0f);
+                        float spec = (NdotL > 0.0f)
+                            ? powf(NdotH, vis_settings.phong_shininess)
+                            : 0.0f;
+                        lighting += vis_settings.phong_diffuse * NdotL
+                                  + vis_settings.phong_specular * spec;
+                    }
+                    rgb = rgb * lighting;
+                }
+            } else {
+                float val = fminf(mu * den_scale, 1.0f);
+                rgb = colormap(val, cmap, cmap_table);
+                alpha = 1.0f - expf(-mu * dt);
+            }
+
+            float next_transmittance = transmittance * (1.0f - alpha);
+
+            if (!depth_quantile_passed && next_transmittance < depth_quantile) {
+                depth_quantile_passed = true;
+                depth = (mu > 1e-6f)
+                    ? t + logf(transmittance / depth_quantile) / mu
+                    : t;
+            }
+
+            color += transmittance * alpha * rgb;
+            transmittance = next_transmittance;
+        }
+    }
+
+    // Mode switch — mirrors ct_visualization output section
+    Vec3f out;
+    switch (vis_settings.mode) {
+    case VolumeDensity:
+    case RGB: {
+        Vec3f bg = *vis_settings.bg_color;
+        if (vis_settings.checker_bg) {
+            int ci = (i + x_offset) / 16;
+            int cj = j / 16;
+            bg = ((ci + cj) % 2 == 0) ? Vec3f(0.8f, 0.8f, 0.8f)
+                                       : Vec3f(0.6f, 0.6f, 0.6f);
+        }
+        out = color + transmittance * bg;
+        break;
+    }
+    case Depth: {
+        float val = depth / vis_settings.max_depth;
+        out = colormap(fminf(fmaxf(val, 0.0f), 1.0f), cmap, cmap_table);
+        break;
+    }
+    case Alpha: {
+        float opacity = 1.0f - transmittance;
+        out = Vec3f(opacity, opacity, opacity);
+        break;
+    }
+    case Intersections: {
+        float val = (steps_taken > 1) ? (float)(steps_taken - 1) / (float)num_steps : 0.0f;
+        out = colormap(fminf(fmaxf(val, 0.0f), 1.0f), cmap, cmap_table);
+        break;
+    }
+    default:
+        out = Vec3f::Zero();
+        break;
+    }
+
+    uint32_t rgba = make_rgba8(out[0], out[1], out[2], 1.0f);
+    surf2Dwrite(rgba, output_surface, (i + x_offset) * 4, j);
+}
+
+void launch_volume_visualization(const TraceSettings &trace_settings,
+                                 const VisualizationSettings &vis_settings,
+                                 int num_steps,
+                                 float voxel_eps,
+                                 const Camera &camera,
+                                 int x_offset,
+                                 CMapTable cmap_table,
+                                 TransferFunctionTable tf_table,
+                                 uint64_t vol_tex_handle,
+                                 uint64_t output_surface_handle,
+                                 const void *stream) {
+    CUstream cu_stream = stream ? *reinterpret_cast<const CUstream *>(stream) : 0;
+
+    dim3 block(16, 16);
+    dim3 grid((camera.width + block.x - 1) / block.x,
+              (camera.height + block.y - 1) / block.y);
+
+    volume_visualization<<<grid, block, 0, cu_stream>>>(
+        trace_settings,
+        vis_settings,
+        num_steps,
+        voxel_eps,
+        camera,
+        x_offset,
+        cmap_table,
+        tf_table,
+        static_cast<cudaTextureObject_t>(vol_tex_handle),
+        static_cast<CUsurfObject>(output_surface_handle));
+}
+
 class CUDADensityPipeline : public Pipeline {
   public:
     CUDADensityPipeline() = default;

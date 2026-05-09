@@ -104,6 +104,18 @@ void update_scene(Viewer &self,
                       aabb_tree.data_ptr());
 }
 
+void update_volume(Viewer &self, torch::Tensor volume_in) {
+    if (volume_in.dim() != 3)
+        throw std::runtime_error("volume must be a 3D tensor (X, Y, Z)");
+    torch::Tensor volume = volume_in.contiguous().to(torch::kFloat32);
+    if (volume.device().type() != at::kCUDA)
+        throw std::runtime_error("volume must be on a CUDA device");
+    self.update_volume((uint32_t)volume.size(0),
+                       (uint32_t)volume.size(1),
+                       (uint32_t)volume.size(2),
+                       volume.data_ptr());
+}
+
 py::object trace_forward(Pipeline &self,
                          torch::Tensor points_in,
                          torch::Tensor attributes_in,
@@ -629,6 +641,9 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("point_adjacency"),
              py::arg("point_adjacency_offsets"),
              py::arg("aabb_tree"))
+        .def("update_volume",
+             update_volume,
+             py::arg("volume"))
         .def("step", &Viewer::step)
         .def("is_closed", &Viewer::is_closed);
 

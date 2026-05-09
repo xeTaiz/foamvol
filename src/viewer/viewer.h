@@ -42,6 +42,13 @@ class Viewer {
                               const void *point_adjacency_offsets,
                               const void *aabb_tree) = 0;
 
+    /// @brief Upload a voxel volume (float32, shape X×Y×Z, device memory) for
+    ///        side-by-side rendering. The volume is assumed to occupy [-1,1]^3.
+    virtual void update_volume(uint32_t width,
+                               uint32_t height,
+                               uint32_t depth,
+                               const void *d_data) {}
+
     virtual void step(int iteration) = 0;
 
     virtual bool is_closed() const = 0;

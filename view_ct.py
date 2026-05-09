@@ -1,4 +1,5 @@
 import argparse
+import numpy as np
 import torch
 import radfoam
 
@@ -7,6 +8,11 @@ def main():
     parser = argparse.ArgumentParser(description="View a CT reconstruction")
     parser.add_argument(
         "--model", type=str, required=True, help="Path to model.pt file"
+    )
+    parser.add_argument(
+        "--volume", type=str, default=None,
+        help="Optional path to a .npy voxel volume for side-by-side comparison "
+             "(float32, shape X×Y×Z, occupying [-1,1]^3)",
     )
     parser.add_argument(
         "--camera_distance", type=float, default=30.0,
@@ -25,12 +31,20 @@ def main():
     aabb_tree = radfoam.build_aabb_tree(xyz)
     pipeline = radfoam.create_ct_pipeline()
 
+    volume = None
+    if args.volume is not None:
+        vol_np = np.load(args.volume).astype(np.float32)
+        volume = torch.from_numpy(vol_np).to(device).contiguous()
+        print(f"Loaded volume {vol_np.shape} from {args.volume}")
+
     camera_pos = torch.tensor([0.0, 0.0, args.camera_distance], dtype=torch.float32)
     camera_forward = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32)
     camera_up = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32)
 
     def callback(viewer):
         viewer.update_scene(xyz, density, adjacency, adjacency_offsets, aabb_tree)
+        if volume is not None:
+            viewer.update_volume(volume)
 
     orbit_target = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
 
