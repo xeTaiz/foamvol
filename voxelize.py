@@ -160,7 +160,7 @@ def save_slices(volume, gt_volume, output_path, extent):
 
 def voxelize(model_path, resolution, output_path, extent=1.0, blur_sigma=0.0,
              supersample=3, sigma=0.7, sigma_v=0.35, per_cell_sigma=True,
-             gt_path=None):
+             gt_path=None, hop=1):
     device = torch.device("cuda")
 
     scene_data = torch.load(model_path)
@@ -190,6 +190,7 @@ def voxelize(model_path, resolution, output_path, extent=1.0, blur_sigma=0.0,
             global_max_k=global_max_k,
             per_cell_sigma=per_cell_sigma,
             cell_radius=cell_radius,
+            hop=hop,
         )
         return torch.nan_to_num(res.idw_result)
 
@@ -279,6 +280,8 @@ def main():
                         help="Adaptive sigma per cell (default: True)")
     parser.add_argument("--gt", type=str, default=None,
                         help="Path to ground-truth volume (.npy) for PSNR/SSIM")
+    parser.add_argument("--hop", type=int, default=1, choices=[1, 2],
+                        help="IDW neighborhood depth (1=1-hop, 2=include neighbors-of-neighbors)")
     args = parser.parse_args()
 
     output = args.output
@@ -287,7 +290,7 @@ def main():
 
     voxelize(args.model, args.resolution, output, args.extent, args.blur_sigma,
              args.supersample, args.sigma, args.sigma_v, args.per_cell_sigma,
-             args.gt)
+             args.gt, args.hop)
 
 
 if __name__ == "__main__":
