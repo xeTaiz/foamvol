@@ -1205,6 +1205,11 @@ __global__ void ct_visualization(TraceSettings settings,
             constexpr float volume_extent = 1.05f;
             constexpr float w_floor = 1e-6f;
             constexpr float eps = 1e-7f;
+            // Adaptive neighborhood thresholds: skip work when exp(-(r/sigma)^2) < 0.1
+            // tau_const_sq = -ln(0.1) ~ 2.3026  -> skip all neighbors when r > 1.517*sigma
+            // tau_2hop_sq  = tau_const_sq / 4    -> skip 2-hop when r > 0.758*sigma
+            constexpr float TAU_CONST_SQ = 2.302585f;
+            constexpr float TAU_2HOP_SQ  = TAU_CONST_SQ * 0.25f;
 
             float t_mid = 0.5f * (t_0 + t_1);
             Vec3f x_mid = ray.origin + t_mid * ray.direction;
@@ -1220,27 +1225,84 @@ __global__ void ct_visualization(TraceSettings settings,
 
             float mu_ref = activated[point_idx];
             Vec3f diff_self = x_mid - current_point;
-            float w_self = expf(-diff_self.squaredNorm() / sigma_sq);
-            float w_sum = w_self + w_floor;
-            float mu_w = (w_self + w_floor) * mu_ref;
 
             uint32_t a0 = point_adjacency_offsets[point_idx];
             uint32_t a1 = point_adjacency_offsets[point_idx + 1];
+
+            // Pre-pass: compute cell radius squared as max squared distance to any neighbor
+            float r_sq = 0.f;
             for (uint32_t j = a0; j < a1; ++j) {
-                uint32_t nb = point_adjacency[j];
-                float mu_nb = activated[nb];
                 Vec4h adj_h = adjacent_diff[j];
-                Vec3f offset(__half2float(adj_h[0]),
-                             __half2float(adj_h[1]),
-                             __half2float(adj_h[2]));
-                Vec3f diff_nb = diff_self - offset;
-                float dmu = mu_nb - mu_ref;
-                float w_nb = expf(-diff_nb.squaredNorm() / sigma_sq
-                                  - dmu * dmu / sigma_v_sq);
-                w_sum += w_nb + w_floor;
-                mu_w += (w_nb + w_floor) * mu_nb;
+                float ox = __half2float(adj_h[0]);
+                float oy = __half2float(adj_h[1]);
+                float oz = __half2float(adj_h[2]);
+                r_sq = fmaxf(r_sq, ox * ox + oy * oy + oz * oz);
             }
-            mu = fmaxf(0.0f, mu_w / fmaxf(w_sum, eps));
+
+            if (r_sq > TAU_CONST_SQ * sigma_sq) {
+                // Cell is large relative to sigma: weight at 1-hop < 0.1, stay constant
+                mu = mu_ref;
+            } else {
+                float w_self = expf(-diff_self.squaredNorm() / sigma_sq);
+                float w_sum = w_self + w_floor;
+                float mu_w = (w_self + w_floor) * mu_ref;
+
+                // 1-hop loop — record neighbor indices for 2-hop dedup
+                uint32_t one_hop_ids[64];
+                int n_one_hop = 0;
+                bool skip_2hop = false;
+
+                for (uint32_t j = a0; j < a1; ++j) {
+                    uint32_t nb = point_adjacency[j];
+                    float mu_nb = activated[nb];
+                    Vec4h adj_h = adjacent_diff[j];
+                    Vec3f offset(__half2float(adj_h[0]),
+                                 __half2float(adj_h[1]),
+                                 __half2float(adj_h[2]));
+                    Vec3f diff_nb = diff_self - offset;
+                    float dmu = mu_nb - mu_ref;
+                    float w_nb = expf(-diff_nb.squaredNorm() / sigma_sq
+                                      - dmu * dmu / sigma_v_sq);
+                    w_sum += w_nb + w_floor;
+                    mu_w += (w_nb + w_floor) * mu_nb;
+
+                    if (n_one_hop < 64) {
+                        one_hop_ids[n_one_hop++] = nb;
+                    } else {
+                        skip_2hop = true;
+                    }
+                }
+
+                // 2-hop loop: only when cell is small enough relative to sigma
+                if (r_sq <= TAU_2HOP_SQ * sigma_sq && !skip_2hop) {
+                    for (int h = 0; h < n_one_hop; ++h) {
+                        uint32_t nb1 = one_hop_ids[h];
+                        uint32_t b0 = point_adjacency_offsets[nb1];
+                        uint32_t b1 = point_adjacency_offsets[nb1 + 1];
+                        for (uint32_t k = b0; k < b1; ++k) {
+                            uint32_t nb2 = point_adjacency[k];
+                            // Skip self and all 1-hop neighbors (strict dedup)
+                            if (nb2 == point_idx) continue;
+                            bool is_dup = false;
+                            for (int d = 0; d < n_one_hop; ++d) {
+                                if (one_hop_ids[d] == nb2) { is_dup = true; break; }
+                            }
+                            if (is_dup) continue;
+
+                            float mu_nb2 = activated[nb2];
+                            Vec3f p_nb2 = points[nb2];
+                            Vec3f diff2 = x_mid - p_nb2;
+                            float dmu2 = mu_nb2 - mu_ref;
+                            float w2 = expf(-diff2.squaredNorm() / sigma_sq
+                                           - dmu2 * dmu2 / sigma_v_sq);
+                            w_sum += w2 + w_floor;
+                            mu_w += (w2 + w_floor) * mu_nb2;
+                        }
+                    }
+                }
+
+                mu = fmaxf(0.0f, mu_w / fmaxf(w_sum, eps));
+            }
         } else {
             mu = activated[point_idx];
         }
