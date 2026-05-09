@@ -157,36 +157,51 @@ def parse_metrics(path):
     return metrics
 
 
-def run_dataset(ds_name, config_file, run_name, extra_args):
+def run_dataset(ds_name, config_file, run_name, extra_args, sigma_sweep=False):
     """Run train.py on one (config, dataset) pair. Returns True on success.
 
     extra_args: dict of CLI overrides forwarded to train.py, e.g.
         {"data_path": "/mnt/hdd/...", "dataset": "more", "sample_index": 3}
+    sigma_sweep: if True, run eval_sigma_sweep.py immediately after training.
     """
     mpath = os.path.join("output", run_name, ds_name, "metrics.txt")
 
     if os.path.exists(mpath):
         print(f"[SKIP] {run_name}/{ds_name} — metrics.txt already exists")
-        return True
+    else:
+        cmd = [
+            sys.executable, "train.py",
+            "-c", config_file,
+            "--experiment_name", f"{run_name}/{ds_name}",
+        ]
+        for k, v in extra_args.items():
+            cmd += [f"--{k}", str(v)]
 
-    cmd = [
-        sys.executable, "train.py",
-        "-c", config_file,
-        "--experiment_name", f"{run_name}/{ds_name}",
-    ]
-    for k, v in extra_args.items():
-        cmd += [f"--{k}", str(v)]
+        print(f"[RUN]  {run_name}/{ds_name}")
+        result = subprocess.run(cmd, cwd=os.path.dirname(os.path.abspath(__file__)))
 
-    print(f"[RUN]  {run_name}/{ds_name}")
-    result = subprocess.run(cmd, cwd=os.path.dirname(os.path.abspath(__file__)))
+        if result.returncode != 0:
+            print(f"[FAIL] {run_name}/{ds_name} exited with code {result.returncode}")
+            return False
 
-    if result.returncode != 0:
-        print(f"[FAIL] {run_name}/{ds_name} exited with code {result.returncode}")
-        return False
+        if not os.path.exists(mpath):
+            print(f"[WARN] {run_name}/{ds_name} finished but metrics.txt not found")
+            return False
 
-    if not os.path.exists(mpath):
-        print(f"[WARN] {run_name}/{ds_name} finished but metrics.txt not found")
-        return False
+    if sigma_sweep:
+        run_dir = os.path.join("output", run_name, ds_name)
+        sweep_csv = os.path.join(run_dir, "sigma_sweep.csv")
+        if os.path.exists(sweep_csv):
+            print(f"[SKIP-σ] sigma_sweep.csv already exists for {run_name}/{ds_name}")
+        else:
+            config_path = os.path.join(run_dir, "config.yaml")
+            print(f"[σ-SWEEP] {run_name}/{ds_name}")
+            sr = subprocess.run(
+                [sys.executable, "eval_sigma_sweep.py", "--config", config_path],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+            )
+            if sr.returncode != 0:
+                print(f"[WARN] sigma-sweep failed for {run_name}/{ds_name} (code {sr.returncode})")
 
     return True
 
@@ -304,6 +319,8 @@ def main():
                         help="Root of a MORE DICOM subset folder; enumerates all patients")
     parser.add_argument("--mayo-root", metavar="DIR",
                         help="Root of an AAPM-Mayo DICOM subset folder; enumerates all patients")
+    parser.add_argument("--sigma-sweep", action="store_true",
+                        help="Run eval_sigma_sweep.py on each run dir immediately after training")
     args = parser.parse_args()
 
     if (args.worker is None) != (args.num_workers is None):
@@ -389,7 +406,8 @@ def main():
 
     if not args.summarize:
         for cfg, slug, ds_name, extra_args in my_jobs:
-            run_dataset(ds_name, cfg, f"{args.name}/{slug}", extra_args)
+            run_dataset(ds_name, cfg, f"{args.name}/{slug}", extra_args,
+                        sigma_sweep=args.sigma_sweep)
 
     collect_summary(args.name, jobs=all_jobs)
 

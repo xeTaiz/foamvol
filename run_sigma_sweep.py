@@ -17,17 +17,15 @@ import os
 import subprocess
 import sys
 
-# 9 (sigma_s, sigma_v) pairs selected from 5-scene pilot sweep
+# 5 (sigma_s, sigma_v) pairs — post-2026-05 shortlist from 355-run sweep analysis.
+# PSNR/SSIM axis: high sigma_v (1-2) wins. Surface axis: low sigma_v (0.05) wins.
+# These five cover both axes and the most-balanced single point.
 SIGMA_PAIRS = [
-    (0.004, 0.05),   # sharpest bilateral
-    (0.008, 0.05),   # best surface metrics (pancreas/ctorg/chest)
-    (0.015, 0.05),   # slightly wider spatial, sharp bilateral
-    (0.008, 0.15),   # mild bilateral
-    (0.008, 0.40),   # moderate (best PSNR for ctorg)
-    (0.008, 1.00),   # good PSNR
-    (0.008, 2.00),   # best mean rank across scenes/metrics
-    (0.015, 2.00),   # best vol_CD for teapot
-    (0.025, 0.05),   # reference — widest useful sigma_s
+    (0.015, 2.00),  # PSNR/SSIM champ at 64k-128k; robust across families
+    (0.008, 2.00),  # PSNR champ at 256k+; CD champ at 512k+
+    (0.008, 0.05),  # mesh-CD / mesh-F1 champ (top-3 in 89% of runs)
+    (0.015, 0.05),  # vol-F1 / HD95 champ at low-mid budgets
+    (0.008, 1.00),  # most-balanced: PSNR top-3 + decent surface
 ]
 
 OUTPUT_ROOT = "output"
