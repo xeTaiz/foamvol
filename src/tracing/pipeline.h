@@ -51,6 +51,11 @@ struct VisualizationSettings {
     bool idw_interpolation;
     float idw_sigma;
     float idw_sigma_v;
+    bool phong_enabled;
+    float phong_ambient;
+    float phong_diffuse;
+    float phong_specular;
+    float phong_shininess;
 };
 
 inline VisualizationSettings default_visualization_settings() {
@@ -71,6 +76,11 @@ inline VisualizationSettings default_visualization_settings() {
     settings.idw_interpolation = false;
     settings.idw_sigma = 0.01f;
     settings.idw_sigma_v = 0.05f;
+    settings.phong_enabled = false;
+    settings.phong_ambient = 0.3f;
+    settings.phong_diffuse = 0.7f;
+    settings.phong_specular = 0.3f;
+    settings.phong_shininess = 32.0f;
     return settings;
 }
 
