@@ -21,7 +21,7 @@ struct TraceSettings {
 
 inline TraceSettings default_trace_settings() {
     TraceSettings settings;
-    settings.weight_threshold = 0.001f;
+    settings.weight_threshold = 0.01f;
     settings.max_intersections = 2048;
     return settings;
 }
@@ -48,6 +48,9 @@ struct VisualizationSettings {
     float tf_density_min;
     float tf_density_max;
     float tf_opacity_scale;
+    bool idw_interpolation;
+    float idw_sigma;
+    float idw_sigma_v;
 };
 
 inline VisualizationSettings default_visualization_settings() {
@@ -65,6 +68,9 @@ inline VisualizationSettings default_visualization_settings() {
     settings.tf_density_min = 0.0f;
     settings.tf_density_max = 1.0f;
     settings.tf_opacity_scale = 100.0f;
+    settings.idw_interpolation = false;
+    settings.idw_sigma = 0.01f;
+    settings.idw_sigma_v = 0.05f;
     return settings;
 }
 
@@ -140,6 +146,7 @@ class Pipeline {
                                      const void *point_adjacency,
                                      const void *point_adjacency_offsets,
                                      const void *adjacent_points,
+                                     float *activated,
                                      uint32_t start_index,
                                      uint64_t output_surface,
                                      const void *stream = nullptr) {}
