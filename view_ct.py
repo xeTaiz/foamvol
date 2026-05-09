@@ -9,7 +9,7 @@ def main():
         "--model", type=str, required=True, help="Path to model.pt file"
     )
     parser.add_argument(
-        "--camera_distance", type=float, default=60.0,
+        "--camera_distance", type=float, default=30.0,
         help="Initial camera distance from origin",
     )
     args = parser.parse_args()
@@ -27,7 +27,7 @@ def main():
 
     camera_pos = torch.tensor([0.0, 0.0, args.camera_distance], dtype=torch.float32)
     camera_forward = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32)
-    camera_up = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32)
+    camera_up = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32)
 
     def callback(viewer):
         viewer.update_scene(xyz, density, adjacency, adjacency_offsets, aabb_tree)
