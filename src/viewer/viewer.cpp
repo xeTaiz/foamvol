@@ -1085,7 +1085,7 @@ struct ViewerPrivate : public Viewer {
                 "Max intersections",
                 reinterpret_cast<int *>(&settings.max_intersections),
                 1,
-                1024,
+                65536,
                 "%d",
                 ImGuiSliderFlags_Logarithmic);
 

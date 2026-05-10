@@ -1185,7 +1185,8 @@ __global__ void ct_visualization(TraceSettings settings,
     float aabb_t_enter = -1e38f, aabb_t_exit = 1e38f;
 #pragma unroll
     for (int ax = 0; ax < 3; ++ax) {
-        float inv_d = 1.0f / ray.direction[ax];
+        float d = ray.direction[ax];
+        float inv_d = 1.0f / (fabsf(d) > 1e-20f ? d : copysignf(1e-20f, d));
         float t1 = (s_min[ax] - ray.origin[ax]) * inv_d;
         float t2 = (s_max[ax] - ray.origin[ax]) * inv_d;
         aabb_t_enter = fmaxf(aabb_t_enter, fminf(t1, t2));
@@ -1768,7 +1769,8 @@ __global__ void ct_bary_visualization(TraceSettings settings,
     float aabb_t_enter = -1e38f, aabb_t_exit = 1e38f;
 #pragma unroll
     for (int ax = 0; ax < 3; ++ax) {
-        float inv_d = 1.0f / ray.direction[ax];
+        float d = ray.direction[ax];
+        float inv_d = 1.0f / (fabsf(d) > 1e-20f ? d : copysignf(1e-20f, d));
         float t1 = (s_min[ax] - ray.origin[ax]) * inv_d;
         float t2 = (s_max[ax] - ray.origin[ax]) * inv_d;
         aabb_t_enter = fmaxf(aabb_t_enter, fminf(t1, t2));
@@ -1812,9 +1814,16 @@ __global__ void ct_bary_visualization(TraceSettings settings,
             float mu4[4];
             for (int k = 0; k < 4; k++) mu4[k] = activated[di[k]];
 
-            // Barycentric blend
+            // Clamp barycentric coords to [0,1] and renormalize to prevent
+            // extrapolation spikes from FP error near tet faces.
+            float Lc[4], lc_sum = 0.f;
+            for (int k = 0; k < 4; k++) { Lc[k] = fmaxf(Lm[k], 0.f); lc_sum += Lc[k]; }
+            if (lc_sum > 1e-10f) { for (int k = 0; k < 4; k++) Lc[k] /= lc_sum; }
+            else { for (int k = 0; k < 4; k++) Lc[k] = 0.25f; }
+
+            // Barycentric blend using clamped coords
             float mu_mid = 0.f;
-            for (int k = 0; k < 4; k++) mu_mid += Lm[k] * mu4[k];
+            for (int k = 0; k < 4; k++) mu_mid += Lc[k] * mu4[k];
 
             // Intra-tet bilateral reweight ("Tet A")
             if (sigma_v_intra > 0.f) {
@@ -1822,11 +1831,11 @@ __global__ void ct_bary_visualization(TraceSettings settings,
                 float w_sum = 0.f, w_mu = 0.f;
                 for (int k = 0; k < 4; k++) {
                     float dmu = mu4[k] - mu_ref;
-                    float wk = Lm[k] * expf(-dmu * dmu / sigv_sq);
+                    float wk = Lc[k] * expf(-dmu * dmu / sigv_sq);
                     w_sum += wk;
                     w_mu  += wk * mu4[k];
                 }
-                if (w_sum > 1e-12f) mu_mid = w_mu / w_sum;
+                if (w_sum > 1e-6f) mu_mid = w_mu / w_sum;
             }
 
             mu_mid = fmaxf(0.f, mu_mid);

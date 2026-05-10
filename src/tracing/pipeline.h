@@ -22,7 +22,7 @@ struct TraceSettings {
 inline TraceSettings default_trace_settings() {
     TraceSettings settings;
     settings.weight_threshold = 0.01f;
-    settings.max_intersections = 2048;
+    settings.max_intersections = 8192;
     return settings;
 }
 
