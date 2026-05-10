@@ -1738,6 +1738,59 @@ __global__ void smooth_density_graph_step(
 }
 
 // ---------------------------------------------------------------------------
+// Per-vertex normal precompute for smooth Phong in bary mode.
+// One thread per tet. Accumulates volume-weighted analytic tet gradient
+// (∇μ_tet = Σ μ_k n_k / det) into vertex_normal[di[k]] via atomicAdd.
+// Buffer must be pre-zeroed. Don't normalize — interpolate raw, then normalize
+// at sample time (magnitude carries density-gradient information).
+// ---------------------------------------------------------------------------
+__global__ void compute_vertex_normals_kernel(
+    uint32_t num_tets,
+    const uint32_t *__restrict__ tets,
+    const uint32_t *__restrict__ perm,
+    const Vec3f *__restrict__ points,
+    const float *__restrict__ activated,
+    Vec3f *__restrict__ vertex_normal)
+{
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_tets) return;
+
+    uint32_t di[4];
+    Vec3f v[4];
+    for (int k = 0; k < 4; k++) {
+        di[k] = perm[tets[tid * 4 + k]];
+        v[k]  = points[di[k]];
+    }
+
+    Vec3f e1 = v[1] - v[0], e2 = v[2] - v[0], e3 = v[3] - v[0];
+    Vec3f n1 = e2.cross(e3), n2 = e3.cross(e1), n3 = e1.cross(e2);
+    Vec3f n0 = -(n1 + n2 + n3);
+    float det = e1.dot(n1);
+    if (fabsf(det) < 1e-12f) return;
+
+    float inv_det = 1.0f / det;
+    float mu[4];
+    mu[0] = activated[di[0]]; mu[1] = activated[di[1]];
+    mu[2] = activated[di[2]]; mu[3] = activated[di[3]];
+    Vec3f ns[4];
+    ns[0] = n0; ns[1] = n1; ns[2] = n2; ns[3] = n3;
+
+    Vec3f g_tet = Vec3f::Zero();
+    for (int k = 0; k < 4; k++) g_tet += mu[k] * ns[k];
+    g_tet *= inv_det;
+
+    float vol    = fabsf(det) / 6.0f;
+    Vec3f contrib = g_tet * vol;
+
+    float *vn = reinterpret_cast<float *>(vertex_normal);
+    for (int k = 0; k < 4; k++) {
+        atomicAdd(&vn[di[k] * 3 + 0], contrib[0]);
+        atomicAdd(&vn[di[k] * 3 + 1], contrib[1]);
+        atomicAdd(&vn[di[k] * 3 + 2], contrib[2]);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Barycentric tet visualization kernel
 // ---------------------------------------------------------------------------
 __global__ void ct_bary_visualization(TraceSettings settings,
@@ -1754,6 +1807,7 @@ __global__ void ct_bary_visualization(TraceSettings settings,
                                        const uint32_t *__restrict__ tets,
                                        const uint32_t *__restrict__ tet_adj,
                                        const uint32_t *__restrict__ perm,
+                                       const Vec3f *__restrict__ vertex_normal,
                                        uint32_t start_tet,
                                        CUsurfObject output_surface) {
 
@@ -1851,33 +1905,16 @@ __global__ void ct_bary_visualization(TraceSettings settings,
                 sample_transfer_function(vv, tf_table, rgb, tf_opacity);
                 alpha = 1.0f - expf(-tf_opacity * tf_opacity_scale * delta_t);
 
-                if (vis_settings.phong_enabled) {
-                    // Representative cell: tet vertex with largest bary weight
-                    int k_max = 0;
-                    for (int k = 1; k < 4; k++)
-                        if (Lm[k] > Lm[k_max]) k_max = k;
-                    uint32_t rep = di[k_max];
-                    float mu_self = activated[rep];
-                    Vec3f grad = Vec3f::Zero();
-                    uint32_t ga0 = point_adjacency_offsets[rep];
-                    uint32_t ga1 = point_adjacency_offsets[rep + 1];
-                    for (uint32_t jj = ga0; jj < ga1; ++jj) {
-                        Vec4h adj_h = adjacent_diff[jj];
-                        Vec3f offset(__half2float(adj_h[0]),
-                                     __half2float(adj_h[1]),
-                                     __half2float(adj_h[2]));
-                        float r2 = offset.squaredNorm();
-                        if (r2 > 1e-12f) {
-                            float dmu = activated[point_adjacency[jj]] - mu_self;
-                            grad += dmu * offset / r2;
-                        }
-                    }
-                    float gn = grad.norm();
+                if (vis_settings.phong_enabled && vertex_normal != nullptr) {
+                    // Interpolate per-vertex normals by clamped barycentrics (C0 across faces).
+                    Vec3f N_raw = Vec3f::Zero();
+                    for (int k = 0; k < 4; k++) N_raw += Lc[k] * vertex_normal[di[k]];
+                    float Nn = N_raw.norm();
                     float lighting = vis_settings.phong_ambient;
-                    if (gn > 1e-6f) {
+                    if (Nn > 1e-6f) {
                         const Vec3f light_dir =
                             Vec3f(1.0f, 1.0f, 1.0f) / sqrtf(3.0f);
-                        Vec3f N = -grad / gn;
+                        Vec3f N = -N_raw / Nn;
                         float NdotL = fmaxf(N.dot(light_dir), 0.0f);
                         Vec3f V = -ray.direction;
                         Vec3f H = (light_dir + V).normalized();
@@ -1898,7 +1935,7 @@ __global__ void ct_bary_visualization(TraceSettings settings,
             if (vis_settings.ao_enabled && alpha > 1e-2f && ao_directions != nullptr) {
                 int k_max = 0;
                 for (int k = 1; k < 4; k++)
-                    if (Lm[k] > Lm[k_max]) k_max = k;
+                    if (Lc[k] > Lc[k_max]) k_max = k;
                 float t_mid = 0.5f * (t_0 + t_1);
                 Vec3f x_sample = ray.origin + t_mid * ray.direction;
                 float ao = compute_ao(di[k_max], x_sample,
@@ -1966,6 +2003,7 @@ __global__ void ct_bary_visualization(TraceSettings settings,
 class CUDADensityPipeline : public Pipeline {
   public:
     CUDAArray<float> smooth_scratch;
+    CUDAArray<float> vertex_normal_buffer; // 3 floats per point (Vec3f), bary+phong only
 
     CUDADensityPipeline() = default;
 
@@ -2270,6 +2308,26 @@ class CUDADensityPipeline : public Pipeline {
         // Step 3: dispatch renderer based on interpolation mode
         if (vis_settings.interpolation_mode == InterpolationMode::BarycentricTet
             && tets != nullptr && tet_adjacency != nullptr && permutation != nullptr) {
+
+            // Precompute per-vertex normals for smooth Phong (only when phong is active).
+            Vec3f *vn_ptr = nullptr;
+            if (vis_settings.phong_enabled && num_tets > 0) {
+                vertex_normal_buffer.resize(num_points * 3);
+                cuda_check(cuMemsetD32Async(
+                    (CUdeviceptr)vertex_normal_buffer.begin(), 0,
+                    num_points * 3, cu_stream));
+                constexpr uint32_t vn_block = 256;
+                compute_vertex_normals_kernel<<<
+                    (num_tets + vn_block - 1) / vn_block, vn_block, 0, cu_stream>>>(
+                    num_tets,
+                    tets,
+                    permutation,
+                    reinterpret_cast<const Vec3f *>(points),
+                    activated,
+                    reinterpret_cast<Vec3f *>(vertex_normal_buffer.begin()));
+                vn_ptr = reinterpret_cast<Vec3f *>(vertex_normal_buffer.begin());
+            }
+
             ct_bary_visualization<<<grid, block, 0, cu_stream>>>(
                 settings,
                 vis_settings,
@@ -2285,6 +2343,7 @@ class CUDADensityPipeline : public Pipeline {
                 tets,
                 tet_adjacency,
                 permutation,
+                vn_ptr,
                 start_tet,
                 static_cast<CUsurfObject>(output_surface));
         } else {
