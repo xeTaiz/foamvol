@@ -104,6 +104,38 @@ void update_scene(Viewer &self,
                       aabb_tree.data_ptr());
 }
 
+void update_tet_topology(Viewer &self,
+                         torch::Tensor tets_in,
+                         torch::Tensor tet_adjacency_in,
+                         torch::Tensor permutation_in,
+                         torch::Tensor inv_perm_in,
+                         torch::Tensor vert_to_tet_in) {
+    torch::Tensor tets = tets_in.contiguous();
+    torch::Tensor tet_adj = tet_adjacency_in.contiguous();
+    torch::Tensor perm = permutation_in.contiguous();
+    torch::Tensor inv_perm = inv_perm_in.contiguous();
+    torch::Tensor vert_to_tet = vert_to_tet_in.contiguous();
+
+    if (tets.device().type() != at::kCUDA)
+        throw std::runtime_error("tets must be on a CUDA device");
+    if (tet_adj.device().type() != at::kCUDA)
+        throw std::runtime_error("tet_adjacency must be on a CUDA device");
+    if (perm.device().type() != at::kCUDA)
+        throw std::runtime_error("permutation must be on a CUDA device");
+    if (inv_perm.device().type() != at::kCPU)
+        throw std::runtime_error("inv_perm must be on CPU");
+    if (vert_to_tet.device().type() != at::kCPU)
+        throw std::runtime_error("vert_to_tet must be on CPU");
+
+    uint32_t num_tets = tets.size(0);
+    self.update_tet_topology(num_tets,
+                             tets.data_ptr(),
+                             tet_adj.data_ptr(),
+                             perm.data_ptr(),
+                             reinterpret_cast<const uint32_t *>(inv_perm.data_ptr()),
+                             reinterpret_cast<const uint32_t *>(vert_to_tet.data_ptr()));
+}
+
 void update_volume(Viewer &self, torch::Tensor volume_in) {
     if (volume_in.dim() != 3)
         throw std::runtime_error("volume must be a 3D tensor (X, Y, Z)");
@@ -644,6 +676,13 @@ void init_pipeline_bindings(py::module &module) {
         .def("update_volume",
              update_volume,
              py::arg("volume"))
+        .def("update_tet_topology",
+             update_tet_topology,
+             py::arg("tets"),
+             py::arg("tet_adjacency"),
+             py::arg("permutation"),
+             py::arg("inv_perm"),
+             py::arg("vert_to_tet"))
         .def("step", &Viewer::step)
         .def("is_closed", &Viewer::is_closed);
 

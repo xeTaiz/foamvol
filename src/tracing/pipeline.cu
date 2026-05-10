@@ -1221,7 +1221,7 @@ __global__ void ct_visualization(TraceSettings settings,
         float delta_t = tc_1 - tc_0;
 
         float mu;
-        if (vis_settings.idw_interpolation) {
+        if (vis_settings.interpolation_mode == InterpolationMode::IDW) {
             constexpr float w_floor = 1e-6f;
             constexpr float eps = 1e-7f;
             // Adaptive neighborhood thresholds: skip work when exp(-(r/sigma)^2) < 0.1
@@ -1661,8 +1661,303 @@ void launch_volume_visualization(const TraceSettings &trace_settings,
         static_cast<CUsurfObject>(output_surface_handle));
 }
 
+// ---------------------------------------------------------------------------
+// Per-cell radius from adjacent_diff (sqrt of max squared edge length)
+// ---------------------------------------------------------------------------
+__global__ void compute_cell_radius_kernel(
+    uint32_t num_points,
+    const Vec4h *__restrict__ adjacent_diff,
+    const uint32_t *__restrict__ adj_offsets,
+    float *__restrict__ cell_radius) {
+
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_points) return;
+    uint32_t a0 = adj_offsets[i], a1 = adj_offsets[i + 1];
+    float r_sq = 1e-12f;
+    for (uint32_t j = a0; j < a1; ++j) {
+        Vec4h h = adjacent_diff[j];
+        float ox = __half2float(h[0]);
+        float oy = __half2float(h[1]);
+        float oz = __half2float(h[2]);
+        r_sq = fmaxf(r_sq, ox * ox + oy * oy + oz * oz);
+    }
+    cell_radius[i] = sqrtf(r_sq);
+}
+
+void compute_cell_radius(uint32_t num_points,
+                         const Vec4h *adjacent_diff,
+                         const uint32_t *adj_offsets,
+                         float *cell_radius,
+                         const void *stream) {
+    CUstream cu_stream = static_cast<CUstream>(const_cast<void *>(stream));
+    launch_kernel_1d<128>(compute_cell_radius_kernel, num_points, cu_stream,
+                          num_points, adjacent_diff, adj_offsets, cell_radius);
+}
+
+// ---------------------------------------------------------------------------
+// One iteration of bilateral Jacobi smoothing on the CSR Voronoi graph
+// ---------------------------------------------------------------------------
+// mu_out[i] = (mu_in[i] + alpha * sum_j w_ij * mu_in[j]) / (1 + alpha * sum_j w_ij)
+// w_ij = exp(-d_ij^2 / (sigma_s_scale * cell_radius[i])^2
+//          - (mu_in[j] - mu_in[i])^2 / sigma_v^2)
+__global__ void smooth_density_graph_step(
+    uint32_t num_points,
+    const float *__restrict__ mu_in,
+    float *__restrict__ mu_out,
+    const uint32_t *__restrict__ adj,
+    const uint32_t *__restrict__ adj_off,
+    const Vec4h *__restrict__ adjacent_diff,
+    const float *__restrict__ cell_radius,
+    float alpha,
+    float sigma_v_sq,
+    float sigma_s_scale) {
+
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_points) return;
+
+    float mu_i = mu_in[i];
+    float sigma_s = sigma_s_scale * fmaxf(cell_radius[i], 1e-8f);
+    float sigma_s_sq = sigma_s * sigma_s;
+
+    uint32_t a0 = adj_off[i], a1 = adj_off[i + 1];
+    float w_sum = 0.f, w_mu = 0.f;
+    for (uint32_t j = a0; j < a1; ++j) {
+        Vec4h h = adjacent_diff[j];
+        float ox = __half2float(h[0]);
+        float oy = __half2float(h[1]);
+        float oz = __half2float(h[2]);
+        float d_sq = ox * ox + oy * oy + oz * oz;
+        float mu_j = mu_in[adj[j]];
+        float dmu = mu_j - mu_i;
+        float w = expf(-d_sq / sigma_s_sq - dmu * dmu / sigma_v_sq);
+        w_sum += w;
+        w_mu += w * mu_j;
+    }
+    mu_out[i] = (mu_i + alpha * w_mu) / (1.f + alpha * w_sum);
+}
+
+// ---------------------------------------------------------------------------
+// Barycentric tet visualization kernel
+// ---------------------------------------------------------------------------
+__global__ void ct_bary_visualization(TraceSettings settings,
+                                       VisualizationSettings vis_settings,
+                                       Camera camera,
+                                       CMapTable cmap_table,
+                                       TransferFunctionTable tf_table,
+                                       const Vec3f *__restrict__ points,
+                                       const float *__restrict__ activated,
+                                       const uint32_t *__restrict__ point_adjacency,
+                                       const uint32_t *__restrict__ point_adjacency_offsets,
+                                       const Vec4h *__restrict__ adjacent_diff,
+                                       const float *__restrict__ ao_directions,
+                                       const uint32_t *__restrict__ tets,
+                                       const uint32_t *__restrict__ tet_adj,
+                                       const uint32_t *__restrict__ perm,
+                                       uint32_t start_tet,
+                                       CUsurfObject output_surface) {
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= camera.width || j >= camera.height) return;
+
+    Ray ray = cast_ray(camera, i, j);
+    ray.direction /= ray.direction.norm();
+
+    const Vec3f s_min = *vis_settings.slice_min;
+    const Vec3f s_max = *vis_settings.slice_max;
+    float aabb_t_enter = -1e38f, aabb_t_exit = 1e38f;
+#pragma unroll
+    for (int ax = 0; ax < 3; ++ax) {
+        float inv_d = 1.0f / ray.direction[ax];
+        float t1 = (s_min[ax] - ray.origin[ax]) * inv_d;
+        float t2 = (s_max[ax] - ray.origin[ax]) * inv_d;
+        aabb_t_enter = fmaxf(aabb_t_enter, fminf(t1, t2));
+        aabb_t_exit  = fminf(aabb_t_exit,  fmaxf(t1, t2));
+    }
+    const float t_enter = fmaxf(aabb_t_enter, 0.0f);
+    const float t_exit  = aabb_t_exit;
+
+    if (t_enter >= t_exit) {
+        Vec3f bg = *vis_settings.bg_color;
+        surf2Dwrite(make_rgba8(bg[0], bg[1], bg[2], 1.0f),
+                    output_surface, i * 4, j);
+        return;
+    }
+
+    float den_scale      = vis_settings.density_scale;
+    ColorMap cmap        = vis_settings.color_map;
+    float depth_quantile = vis_settings.depth_quantile;
+    bool use_tf          = vis_settings.use_transfer_function;
+    float tf_density_min  = vis_settings.tf_density_min;
+    float tf_density_max  = vis_settings.tf_density_max;
+    float tf_opacity_scale = vis_settings.tf_opacity_scale;
+    float sigma_v_intra  = vis_settings.sigma_v_intra;
+    float sigv_sq        = sigma_v_intra * sigma_v_intra + 1e-12f;
+
+    Vec3f color = Vec3f::Zero();
+    float transmittance = 1.0f;
+    float depth = 0.0f;
+    bool depth_quantile_passed = false;
+
+    uint32_t n = trace_tet(
+        ray, points, tets, tet_adj, perm,
+        start_tet, settings.max_intersections,
+        t_enter, t_exit,
+        [&](const Vec3f v[4], const uint32_t di[4],
+            const float Lm[4], float t_0, float t_1) -> bool {
+
+            float delta_t = t_1 - t_0;
+
+            // Gather vertex densities
+            float mu4[4];
+            for (int k = 0; k < 4; k++) mu4[k] = activated[di[k]];
+
+            // Barycentric blend
+            float mu_mid = 0.f;
+            for (int k = 0; k < 4; k++) mu_mid += Lm[k] * mu4[k];
+
+            // Intra-tet bilateral reweight ("Tet A")
+            if (sigma_v_intra > 0.f) {
+                float mu_ref = mu_mid;
+                float w_sum = 0.f, w_mu = 0.f;
+                for (int k = 0; k < 4; k++) {
+                    float dmu = mu4[k] - mu_ref;
+                    float wk = Lm[k] * expf(-dmu * dmu / sigv_sq);
+                    w_sum += wk;
+                    w_mu  += wk * mu4[k];
+                }
+                if (w_sum > 1e-12f) mu_mid = w_mu / w_sum;
+            }
+
+            mu_mid = fmaxf(0.f, mu_mid);
+
+            Vec3f rgb;
+            float alpha;
+            if (use_tf) {
+                float range = tf_density_max - tf_density_min;
+                float vv = (range > 1e-8f)
+                    ? fmaxf(0.0f, fminf((mu_mid - tf_density_min) / range, 1.0f))
+                    : 0.0f;
+                float tf_opacity;
+                sample_transfer_function(vv, tf_table, rgb, tf_opacity);
+                alpha = 1.0f - expf(-tf_opacity * tf_opacity_scale * delta_t);
+
+                if (vis_settings.phong_enabled) {
+                    // Representative cell: tet vertex with largest bary weight
+                    int k_max = 0;
+                    for (int k = 1; k < 4; k++)
+                        if (Lm[k] > Lm[k_max]) k_max = k;
+                    uint32_t rep = di[k_max];
+                    float mu_self = activated[rep];
+                    Vec3f grad = Vec3f::Zero();
+                    uint32_t ga0 = point_adjacency_offsets[rep];
+                    uint32_t ga1 = point_adjacency_offsets[rep + 1];
+                    for (uint32_t jj = ga0; jj < ga1; ++jj) {
+                        Vec4h adj_h = adjacent_diff[jj];
+                        Vec3f offset(__half2float(adj_h[0]),
+                                     __half2float(adj_h[1]),
+                                     __half2float(adj_h[2]));
+                        float r2 = offset.squaredNorm();
+                        if (r2 > 1e-12f) {
+                            float dmu = activated[point_adjacency[jj]] - mu_self;
+                            grad += dmu * offset / r2;
+                        }
+                    }
+                    float gn = grad.norm();
+                    float lighting = vis_settings.phong_ambient;
+                    if (gn > 1e-6f) {
+                        const Vec3f light_dir =
+                            Vec3f(1.0f, 1.0f, 1.0f) / sqrtf(3.0f);
+                        Vec3f N = -grad / gn;
+                        float NdotL = fmaxf(N.dot(light_dir), 0.0f);
+                        Vec3f V = -ray.direction;
+                        Vec3f H = (light_dir + V).normalized();
+                        float NdotH = fmaxf(N.dot(H), 0.0f);
+                        float spec = (NdotL > 0.0f)
+                            ? powf(NdotH, vis_settings.phong_shininess) : 0.0f;
+                        lighting += vis_settings.phong_diffuse * NdotL
+                                  + vis_settings.phong_specular * spec;
+                    }
+                    rgb = rgb * lighting;
+                }
+            } else {
+                float vv = fminf(mu_mid * den_scale, 1.0f);
+                rgb = colormap(vv, cmap, cmap_table);
+                alpha = 1.0f - expf(-mu_mid * delta_t);
+            }
+
+            if (vis_settings.ao_enabled && alpha > 1e-2f && ao_directions != nullptr) {
+                int k_max = 0;
+                for (int k = 1; k < 4; k++)
+                    if (Lm[k] > Lm[k_max]) k_max = k;
+                float t_mid = 0.5f * (t_0 + t_1);
+                Vec3f x_sample = ray.origin + t_mid * ray.direction;
+                float ao = compute_ao(di[k_max], x_sample,
+                                      points, activated,
+                                      point_adjacency, point_adjacency_offsets,
+                                      adjacent_diff, ao_directions,
+                                      vis_settings.ao_num_dirs,
+                                      vis_settings.ao_max_distance,
+                                      use_tf, tf_density_min, tf_density_max,
+                                      tf_opacity_scale, tf_table);
+                rgb = rgb * (1.0f - vis_settings.ao_strength
+                             + vis_settings.ao_strength * ao);
+            }
+
+            float next_transmittance = transmittance * (1.0f - alpha);
+            if (!depth_quantile_passed && next_transmittance < depth_quantile) {
+                depth_quantile_passed = true;
+                depth = (mu_mid > 1e-6f)
+                    ? t_0 + logf(transmittance / depth_quantile) / mu_mid
+                    : t_0;
+            }
+            color += transmittance * alpha * rgb;
+            transmittance = next_transmittance;
+            return transmittance > settings.weight_threshold && t_1 < t_exit;
+        });
+
+    Vec3f out;
+    switch (vis_settings.mode) {
+    case VolumeDensity:
+    case RGB: {
+        Vec3f bg = *vis_settings.bg_color;
+        if (vis_settings.checker_bg) {
+            int ci = i / 16, cj = j / 16;
+            bg = ((ci + cj) % 2 == 0) ? Vec3f(0.8f, 0.8f, 0.8f)
+                                       : Vec3f(0.6f, 0.6f, 0.6f);
+        }
+        out = color + transmittance * bg;
+        break;
+    }
+    case Depth: {
+        float val = fminf(fmaxf(depth / vis_settings.max_depth, 0.0f), 1.0f);
+        out = colormap(val, cmap, cmap_table);
+        break;
+    }
+    case Alpha:
+        out = Vec3f(1.0f - transmittance, 1.0f - transmittance,
+                    1.0f - transmittance);
+        break;
+    case Intersections: {
+        float val = (n > 1)
+            ? float(n - 1) / float(settings.max_intersections) : 0.0f;
+        val = fminf(fmaxf(val, 0.0f), 1.0f);
+        out = colormap(val, cmap, cmap_table);
+        break;
+    }
+    default:
+        out = Vec3f::Zero();
+        break;
+    }
+
+    surf2Dwrite(make_rgba8(out[0], out[1], out[2], 1.0f),
+                output_surface, i * 4, j);
+}
+
 class CUDADensityPipeline : public Pipeline {
   public:
+    CUDAArray<float> smooth_scratch;
+
     CUDADensityPipeline() = default;
 
     virtual ~CUDADensityPipeline() {}
@@ -1903,6 +2198,11 @@ class CUDADensityPipeline : public Pipeline {
                              uint32_t start_index,
                              uint64_t output_surface,
                              const float *ao_directions = nullptr,
+                             const uint32_t *tets = nullptr,
+                             const uint32_t *tet_adjacency = nullptr,
+                             const uint32_t *permutation = nullptr,
+                             uint32_t start_tet = 0,
+                             const float *cell_radius = nullptr,
                              const void *stream = nullptr) override {
 
         CUstream cu_stream = 0;
@@ -1910,6 +2210,7 @@ class CUDADensityPipeline : public Pipeline {
             cu_stream = *reinterpret_cast<const CUstream *>(stream);
         }
 
+        // Step 1: activate softplus
         constexpr uint32_t block_size_1d = 128;
         launch_kernel_1d<block_size_1d>(
             precompute_activated_density_vis,
@@ -1921,24 +2222,78 @@ class CUDADensityPipeline : public Pipeline {
             vis_settings.activation_beta,
             vis_settings.activation_scale);
 
+        // Step 2: bilateral Jacobi pre-smoothing (universal, all modes)
+        if (vis_settings.smooth_T > 0 && cell_radius != nullptr) {
+            smooth_scratch.resize(num_points);
+            float *in_buf  = activated;
+            float *out_buf = smooth_scratch.begin();
+            float sigma_v_sq = vis_settings.smooth_sigma_v * vis_settings.smooth_sigma_v;
+            for (int t = 0; t < vis_settings.smooth_T; t++) {
+                launch_kernel_1d<block_size_1d>(
+                    smooth_density_graph_step,
+                    num_points,
+                    stream,
+                    num_points,
+                    in_buf,
+                    out_buf,
+                    reinterpret_cast<const uint32_t *>(point_adjacency),
+                    reinterpret_cast<const uint32_t *>(point_adjacency_offsets),
+                    reinterpret_cast<const Vec4h *>(adjacent_points),
+                    cell_radius,
+                    vis_settings.smooth_alpha,
+                    sigma_v_sq,
+                    vis_settings.smooth_sigma_s_scale);
+                float *tmp = in_buf; in_buf = out_buf; out_buf = tmp;
+            }
+            // Ensure result is in activated[]
+            if (in_buf != activated) {
+                cuda_check(cuMemcpyDtoDAsync((CUdeviceptr)activated,
+                                             (CUdeviceptr)in_buf,
+                                             num_points * sizeof(float),
+                                             cu_stream));
+            }
+        }
+
         dim3 block(16, 16);
         dim3 grid((camera.width + block.x - 1) / block.x,
                   (camera.height + block.y - 1) / block.y);
 
-        ct_visualization<<<grid, block, 0, cu_stream>>>(
-            settings,
-            vis_settings,
-            camera,
-            cmap_table,
-            tf_table,
-            reinterpret_cast<const Vec3f *>(points),
-            activated,
-            reinterpret_cast<const uint32_t *>(point_adjacency),
-            reinterpret_cast<const uint32_t *>(point_adjacency_offsets),
-            reinterpret_cast<const Vec4h *>(adjacent_points),
-            ao_directions,
-            start_index,
-            static_cast<CUsurfObject>(output_surface));
+        // Step 3: dispatch renderer based on interpolation mode
+        if (vis_settings.interpolation_mode == InterpolationMode::BarycentricTet
+            && tets != nullptr && tet_adjacency != nullptr && permutation != nullptr) {
+            ct_bary_visualization<<<grid, block, 0, cu_stream>>>(
+                settings,
+                vis_settings,
+                camera,
+                cmap_table,
+                tf_table,
+                reinterpret_cast<const Vec3f *>(points),
+                activated,
+                reinterpret_cast<const uint32_t *>(point_adjacency),
+                reinterpret_cast<const uint32_t *>(point_adjacency_offsets),
+                reinterpret_cast<const Vec4h *>(adjacent_points),
+                ao_directions,
+                tets,
+                tet_adjacency,
+                permutation,
+                start_tet,
+                static_cast<CUsurfObject>(output_surface));
+        } else {
+            ct_visualization<<<grid, block, 0, cu_stream>>>(
+                settings,
+                vis_settings,
+                camera,
+                cmap_table,
+                tf_table,
+                reinterpret_cast<const Vec3f *>(points),
+                activated,
+                reinterpret_cast<const uint32_t *>(point_adjacency),
+                reinterpret_cast<const uint32_t *>(point_adjacency_offsets),
+                reinterpret_cast<const Vec4h *>(adjacent_points),
+                ao_directions,
+                start_index,
+                static_cast<CUsurfObject>(output_surface));
+        }
     }
 
     uint32_t attribute_dim() const override {

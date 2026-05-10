@@ -88,6 +88,143 @@ trace(const Ray &ray,
     return n;
 }
 
+// ---------------------------------------------------------------------------
+// Delaunay tet walker for barycentric interpolation
+// ---------------------------------------------------------------------------
+// Functor signature: (v[4] vertex positions, lam_mid[4] barycentrics at segment
+// midpoint, t_0, t_1) -> bool (true = continue marching).
+// The 4 vertex world positions are passed so the functor can look up densities.
+// tet_adj is a flat (num_tets * 4) array; entry [t*4 + k] is the packed
+// adjacency 4*neighbour_tet + face_slot_in_neighbour, or UINT32_MAX for boundary.
+// permutation maps triangulation-internal vertex indices to original point indices
+// (i.e. points[permutation[v]] gives the world position of tet vertex v).
+
+template <typename TetFunctor>
+__forceinline__ __device__ uint32_t
+trace_tet(const Ray &ray,
+          const Vec3f *__restrict__ points,
+          const uint32_t *__restrict__ tets,       // (T,4) flat uint32
+          const uint32_t *__restrict__ tet_adj,    // (T,4) flat uint32 packed
+          const uint32_t *__restrict__ permutation, // new→orig
+          uint32_t start_tet,
+          uint32_t max_steps,
+          float t_enter,
+          float t_exit,
+          TetFunctor functor) {
+
+    uint32_t cur_tet = start_tet;
+
+    // Helper: compute barycentrics of point x in tet, return in L[4].
+    // L[1..3] from solving [e1|e2|e3]*L123 = x-v0, L[0]=1-sum.
+    // det is the signed volume * 6; returns false if tet is degenerate.
+    auto compute_bary = [&](const Vec3f v[4], const Vec3f &x, float L[4]) -> bool {
+        Vec3f e1 = v[1] - v[0];
+        Vec3f e2 = v[2] - v[0];
+        Vec3f e3 = v[3] - v[0];
+        Vec3f n1 = e2.cross(e3);
+        Vec3f n2 = e3.cross(e1);
+        Vec3f n3 = e1.cross(e2);
+        float det = e1.dot(n1);
+        if (fabsf(det) < 1e-30f) return false;
+        float inv_det = 1.0f / det;
+        Vec3f rhs = x - v[0];
+        L[1] = n1.dot(rhs) * inv_det;
+        L[2] = n2.dot(rhs) * inv_det;
+        L[3] = n3.dot(rhs) * inv_det;
+        L[0] = 1.0f - L[1] - L[2] - L[3];
+        return true;
+    };
+
+    // Seek phase: walk from start_tet to the tet containing (ray.origin + t_enter*ray.dir).
+    constexpr int MAX_SEEK = 64;
+    {
+        Vec3f x_enter = ray.origin + t_enter * ray.direction;
+        for (int s = 0; s < MAX_SEEK; s++) {
+            Vec3f v[4];
+#pragma unroll
+            for (int k = 0; k < 4; k++)
+                v[k] = points[permutation[tets[cur_tet * 4 + k]]];
+            float L[4];
+            if (!compute_bary(v, x_enter, L)) break;
+            int worst = 0;
+            for (int k = 1; k < 4; k++) if (L[k] < L[worst]) worst = k;
+            if (L[worst] >= -1e-5f) break; // contained
+            uint32_t packed = tet_adj[cur_tet * 4 + worst];
+            if (packed == UINT32_MAX) break; // boundary
+            cur_tet = packed >> 2;
+        }
+    }
+
+    // Integration phase: march segment-by-segment through tets.
+    float t_0 = t_enter;
+    uint32_t n = 0;
+
+    while (n < max_steps && t_0 < t_exit) {
+        Vec3f v[4];
+#pragma unroll
+        for (int k = 0; k < 4; k++)
+            v[k] = points[permutation[tets[cur_tet * 4 + k]]];
+
+        // Compute dL/dt and L at t_0 (one 3x3 inverse via cross products).
+        Vec3f e1 = v[1] - v[0];
+        Vec3f e2 = v[2] - v[0];
+        Vec3f e3 = v[3] - v[0];
+        Vec3f n1 = e2.cross(e3);
+        Vec3f n2 = e3.cross(e1);
+        Vec3f n3 = e1.cross(e2);
+        float det = e1.dot(n1);
+        if (fabsf(det) < 1e-30f) break;
+        float inv_det = 1.0f / det;
+
+        float dL[4];
+        dL[1] = n1.dot(ray.direction) * inv_det;
+        dL[2] = n2.dot(ray.direction) * inv_det;
+        dL[3] = n3.dot(ray.direction) * inv_det;
+        dL[0] = -(dL[1] + dL[2] + dL[3]);
+
+        Vec3f rhs = (ray.origin + t_0 * ray.direction) - v[0];
+        float L[4];
+        L[1] = n1.dot(rhs) * inv_det;
+        L[2] = n2.dot(rhs) * inv_det;
+        L[3] = n3.dot(rhs) * inv_det;
+        L[0] = 1.0f - L[1] - L[2] - L[3];
+
+        // Find exit: smallest t > t_0 where some L[k] hits 0.
+        float t_1 = t_exit;
+        int exit_face = -1;
+        for (int k = 0; k < 4; k++) {
+            if (dL[k] < -1e-10f) {
+                float tk = t_0 - L[k] / dL[k];
+                if (tk > t_0 - 1e-8f && tk < t_1) {
+                    t_1 = tk;
+                    exit_face = k;
+                }
+            }
+        }
+
+        float dt = t_1 - t_0;
+        if (dt > 1e-10f) {
+            float t_mid = 0.5f * (t_0 + t_1);
+            float Lm[4];
+            for (int k = 0; k < 4; k++) Lm[k] = L[k] + dL[k] * (t_mid - t_0);
+            // Compute density indices (permutation[tets[cur_tet*4+k]]) for this tet
+            uint32_t di[4];
+            for (int k = 0; k < 4; k++) di[k] = permutation[tets[cur_tet * 4 + k]];
+            if (!functor(v, di, Lm, t_0, t_1)) break;
+        }
+
+        n++;
+        t_0 = t_1;
+
+        if (exit_face < 0) break; // capped at t_exit
+        uint32_t packed = tet_adj[cur_tet * 4 + exit_face];
+        if (packed == UINT32_MAX) break; // boundary
+        cur_tet = packed >> 2;
+    }
+
+    return n;
+}
+
 __forceinline__ __device__ Vec3f cell_intersection_grad(
     const Vec3f &primal_point, const Vec3f &opposite_point, const Ray &ray) {
     Vec3f face_origin = (primal_point + opposite_point) / 2.0f;
