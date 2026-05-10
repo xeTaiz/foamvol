@@ -1860,60 +1860,51 @@ __global__ void ct_bary_visualization(TraceSettings settings,
         start_tet, settings.max_intersections,
         t_enter, t_exit,
         [&](const Vec3f v[4], const uint32_t di[4],
-            const float Lm[4], float t_0, float t_1) -> bool {
+            const float L[4], const float dL[4], float t_0, float t_1) -> bool {
 
             float delta_t = t_1 - t_0;
-
-            // Gather vertex densities
             float mu4[4];
             for (int k = 0; k < 4; k++) mu4[k] = activated[di[k]];
 
-            // Clamp barycentric coords to [0,1] and renormalize to prevent
-            // extrapolation spikes from FP error near tet faces.
-            float Lc[4], lc_sum = 0.f;
-            for (int k = 0; k < 4; k++) { Lc[k] = fmaxf(Lm[k], 0.f); lc_sum += Lc[k]; }
-            if (lc_sum > 1e-10f) { for (int k = 0; k < 4; k++) Lc[k] /= lc_sum; }
-            else { for (int k = 0; k < 4; k++) Lc[k] = 0.25f; }
-
-            // Barycentric blend using clamped coords
-            float mu_mid = 0.f;
-            for (int k = 0; k < 4; k++) mu_mid += Lc[k] * mu4[k];
-
-            // Intra-tet bilateral reweight ("Tet A")
-            if (sigma_v_intra > 0.f) {
-                float mu_ref = mu_mid;
-                float w_sum = 0.f, w_mu = 0.f;
-                for (int k = 0; k < 4; k++) {
-                    float dmu = mu4[k] - mu_ref;
-                    float wk = Lc[k] * expf(-dmu * dmu / sigv_sq);
-                    w_sum += wk;
-                    w_mu  += wk * mu4[k];
-                }
-                if (w_sum > 1e-6f) mu_mid = w_mu / w_sum;
-            }
-
-            mu_mid = fmaxf(0.f, mu_mid);
-
-            Vec3f rgb;
-            float alpha;
             if (use_tf) {
+                // Per-vertex TF lookup → interpolate colour in colour-space.
+                // Ensures C⁰ rendered colour at tet faces: shared face vertices have the
+                // same global density → same TF result → Lc-blended colour is C⁰ at faces.
+                // (Interpolating mu then mapping through TF would give C⁰ density but
+                // visible colour seams with steep TFs; colour-space interpolation avoids this.)
                 float range = tf_density_max - tf_density_min;
-                float vv = (range > 1e-8f)
-                    ? fmaxf(0.0f, fminf((mu_mid - tf_density_min) / range, 1.0f))
-                    : 0.0f;
-                float tf_opacity;
-                sample_transfer_function(vv, tf_table, rgb, tf_opacity);
-                alpha = 1.0f - expf(-tf_opacity * tf_opacity_scale * delta_t);
+                Vec3f rgb_v[4];
+                float op_v[4];
+                for (int k = 0; k < 4; k++) {
+                    float vv = (range > 1e-8f)
+                        ? fmaxf(0.0f, fminf((mu4[k] - tf_density_min) / range, 1.0f))
+                        : 0.0f;
+                    sample_transfer_function(vv, tf_table, rgb_v[k], op_v[k]);
+                }
+
+                float t_mid = 0.5f * (t_0 + t_1);
+                float Lm[4];
+                for (int k = 0; k < 4; k++) Lm[k] = L[k] + dL[k] * (t_mid - t_0);
+                float Lc[4], lc_sum = 0.f;
+                for (int k = 0; k < 4; k++) { Lc[k] = fmaxf(Lm[k], 0.f); lc_sum += Lc[k]; }
+                if (lc_sum > 1e-10f) { for (int k = 0; k < 4; k++) Lc[k] /= lc_sum; }
+                else { for (int k = 0; k < 4; k++) Lc[k] = 0.25f; }
+
+                Vec3f rgb = Vec3f::Zero();
+                float opacity_mid = 0.f;
+                for (int k = 0; k < 4; k++) {
+                    rgb += Lc[k] * rgb_v[k];
+                    opacity_mid += Lc[k] * op_v[k];
+                }
+                float alpha = 1.0f - expf(-opacity_mid * tf_opacity_scale * delta_t);
 
                 if (vis_settings.phong_enabled && vertex_normal != nullptr) {
-                    // Interpolate per-vertex normals by clamped barycentrics (C0 across faces).
                     Vec3f N_raw = Vec3f::Zero();
                     for (int k = 0; k < 4; k++) N_raw += Lc[k] * vertex_normal[di[k]];
                     float Nn = N_raw.norm();
                     float lighting = vis_settings.phong_ambient;
                     if (Nn > 1e-6f) {
-                        const Vec3f light_dir =
-                            Vec3f(1.0f, 1.0f, 1.0f) / sqrtf(3.0f);
+                        const Vec3f light_dir = Vec3f(1.0f, 1.0f, 1.0f) / sqrtf(3.0f);
                         Vec3f N = -N_raw / Nn;
                         float NdotL = fmaxf(N.dot(light_dir), 0.0f);
                         Vec3f V = -ray.direction;
@@ -1926,39 +1917,86 @@ __global__ void ct_bary_visualization(TraceSettings settings,
                     }
                     rgb = rgb * lighting;
                 }
+
+                if (vis_settings.ao_enabled && alpha > 1e-2f && ao_directions != nullptr) {
+                    int k_max = 0;
+                    for (int k = 1; k < 4; k++) if (Lc[k] > Lc[k_max]) k_max = k;
+                    Vec3f x_sample = ray.origin + t_mid * ray.direction;
+                    float ao = compute_ao(di[k_max], x_sample,
+                                          points, activated,
+                                          point_adjacency, point_adjacency_offsets,
+                                          adjacent_diff, ao_directions,
+                                          vis_settings.ao_num_dirs,
+                                          vis_settings.ao_max_distance,
+                                          use_tf, tf_density_min, tf_density_max,
+                                          tf_opacity_scale, tf_table);
+                    rgb = rgb * (1.0f - vis_settings.ao_strength
+                                 + vis_settings.ao_strength * ao);
+                }
+
+                float next_T = transmittance * (1.0f - alpha);
+                if (!depth_quantile_passed && next_T < depth_quantile) {
+                    depth_quantile_passed = true;
+                    float eff_op = opacity_mid * tf_opacity_scale;
+                    depth = (eff_op > 1e-6f)
+                        ? t_0 + logf(transmittance / depth_quantile) / eff_op
+                        : t_0;
+                }
+                color += transmittance * alpha * rgb;
+                transmittance = next_T;
             } else {
-                float vv = fminf(mu_mid * den_scale, 1.0f);
-                rgb = colormap(vv, cmap, cmap_table);
-                alpha = 1.0f - expf(-mu_mid * delta_t);
-            }
-
-            if (vis_settings.ao_enabled && alpha > 1e-2f && ao_directions != nullptr) {
-                int k_max = 0;
-                for (int k = 1; k < 4; k++)
-                    if (Lc[k] > Lc[k_max]) k_max = k;
+                // Colormap mode: single midpoint sample (TF quantization not an issue here).
                 float t_mid = 0.5f * (t_0 + t_1);
-                Vec3f x_sample = ray.origin + t_mid * ray.direction;
-                float ao = compute_ao(di[k_max], x_sample,
-                                      points, activated,
-                                      point_adjacency, point_adjacency_offsets,
-                                      adjacent_diff, ao_directions,
-                                      vis_settings.ao_num_dirs,
-                                      vis_settings.ao_max_distance,
-                                      use_tf, tf_density_min, tf_density_max,
-                                      tf_opacity_scale, tf_table);
-                rgb = rgb * (1.0f - vis_settings.ao_strength
-                             + vis_settings.ao_strength * ao);
-            }
+                float Lm[4];
+                for (int k = 0; k < 4; k++) Lm[k] = L[k] + dL[k] * (t_mid - t_0);
+                float Lc[4], lc_sum = 0.f;
+                for (int k = 0; k < 4; k++) { Lc[k] = fmaxf(Lm[k], 0.f); lc_sum += Lc[k]; }
+                if (lc_sum > 1e-10f) { for (int k = 0; k < 4; k++) Lc[k] /= lc_sum; }
+                else { for (int k = 0; k < 4; k++) Lc[k] = 0.25f; }
 
-            float next_transmittance = transmittance * (1.0f - alpha);
-            if (!depth_quantile_passed && next_transmittance < depth_quantile) {
-                depth_quantile_passed = true;
-                depth = (mu_mid > 1e-6f)
-                    ? t_0 + logf(transmittance / depth_quantile) / mu_mid
-                    : t_0;
+                float mu_mid = 0.f;
+                for (int k = 0; k < 4; k++) mu_mid += Lc[k] * mu4[k];
+                if (sigma_v_intra > 0.f) {
+                    float mu_ref = mu_mid, w_sum = 0.f, w_mu = 0.f;
+                    for (int k = 0; k < 4; k++) {
+                        float dmu = mu4[k] - mu_ref;
+                        float wk = Lc[k] * expf(-dmu * dmu / sigv_sq);
+                        w_sum += wk; w_mu += wk * mu4[k];
+                    }
+                    if (w_sum > 1e-6f) mu_mid = w_mu / w_sum;
+                }
+                mu_mid = fmaxf(0.f, mu_mid);
+
+                float vv = fminf(mu_mid * den_scale, 1.0f);
+                Vec3f rgb = colormap(vv, cmap, cmap_table);
+                float alpha = 1.0f - expf(-mu_mid * delta_t);
+
+                if (vis_settings.ao_enabled && alpha > 1e-2f && ao_directions != nullptr) {
+                    int k_max = 0;
+                    for (int k = 1; k < 4; k++) if (Lc[k] > Lc[k_max]) k_max = k;
+                    Vec3f x_sample = ray.origin + t_mid * ray.direction;
+                    float ao = compute_ao(di[k_max], x_sample,
+                                          points, activated,
+                                          point_adjacency, point_adjacency_offsets,
+                                          adjacent_diff, ao_directions,
+                                          vis_settings.ao_num_dirs,
+                                          vis_settings.ao_max_distance,
+                                          use_tf, tf_density_min, tf_density_max,
+                                          tf_opacity_scale, tf_table);
+                    rgb = rgb * (1.0f - vis_settings.ao_strength
+                                 + vis_settings.ao_strength * ao);
+                }
+
+                float next_T = transmittance * (1.0f - alpha);
+                if (!depth_quantile_passed && next_T < depth_quantile) {
+                    depth_quantile_passed = true;
+                    depth = (mu_mid > 1e-6f)
+                        ? t_0 + logf(transmittance / depth_quantile) / mu_mid
+                        : t_0;
+                }
+                color += transmittance * alpha * rgb;
+                transmittance = next_T;
             }
-            color += transmittance * alpha * rgb;
-            transmittance = next_transmittance;
             return transmittance > settings.weight_threshold && t_1 < t_exit;
         });
 
