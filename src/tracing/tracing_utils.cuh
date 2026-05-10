@@ -137,8 +137,10 @@ trace_tet(const Ray &ray,
     };
 
     // Seek phase: walk from start_tet to the tet containing (ray.origin + t_enter*ray.dir).
-    // Returns 0 (no integration) when x_enter is outside the triangulation convex hull
-    // to prevent barycentric extrapolation across large boundary tets.
+    // Returns 0 ONLY when the walk reaches the convex hull boundary without finding a
+    // containing tet (x_enter is genuinely outside). Sliver tets (degenerate compute_bary)
+    // and MAX_SEEK exhaustion fall through to integration — Lc clamping in the functor
+    // makes starting from an approximate tet safe and prevents extrapolation spikes.
     constexpr int MAX_SEEK = 256;
     {
         Vec3f x_enter = ray.origin + t_enter * ray.direction;
@@ -149,15 +151,15 @@ trace_tet(const Ray &ray,
             for (int k = 0; k < 4; k++)
                 v[k] = points[permutation[tets[cur_tet * 4 + k]]];
             float L[4];
-            if (!compute_bary(v, x_enter, L)) break;
+            if (!compute_bary(v, x_enter, L)) break; // sliver during walk: bail
             int worst = 0;
             for (int k = 1; k < 4; k++) if (L[k] < L[worst]) worst = k;
             if (L[worst] >= -1e-5f) { in_hull = true; break; } // contained
             uint32_t packed = tet_adj[cur_tet * 4 + worst];
-            if (packed == UINT32_MAX) break; // hit hull boundary -> x_enter is outside
+            if (packed == UINT32_MAX) break; // hull boundary
             cur_tet = packed >> 2;
         }
-        if (!in_hull) return 0; // x_enter outside convex hull: skip to avoid streaks
+        if (!in_hull) return 0;
     }
 
     // Integration phase: march segment-by-segment through tets.
