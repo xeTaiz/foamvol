@@ -115,7 +115,7 @@ trace_tet(const Ray &ray,
     uint32_t cur_tet = start_tet;
 
     // Helper: compute barycentrics of point x in tet, return in L[4].
-    // L[1..3] from solving [e1|e2|e3]*L123 = x-v0, L[0]=1-sum.
+    // All four coords use independent normals to avoid cancellation in L[0].
     // det is the signed volume * 6; returns false if tet is degenerate.
     auto compute_bary = [&](const Vec3f v[4], const Vec3f &x, float L[4]) -> bool {
         Vec3f e1 = v[1] - v[0];
@@ -125,20 +125,24 @@ trace_tet(const Ray &ray,
         Vec3f n2 = e3.cross(e1);
         Vec3f n3 = e1.cross(e2);
         float det = e1.dot(n1);
-        if (fabsf(det) < 1e-30f) return false;
+        if (fabsf(det) < 1e-12f) return false;
         float inv_det = 1.0f / det;
         Vec3f rhs = x - v[0];
         L[1] = n1.dot(rhs) * inv_det;
         L[2] = n2.dot(rhs) * inv_det;
         L[3] = n3.dot(rhs) * inv_det;
-        L[0] = 1.0f - L[1] - L[2] - L[3];
+        // Use fourth normal instead of 1-sum to avoid cancellation error.
+        L[0] = -(n1 + n2 + n3).dot(x - v[1]) * inv_det;
         return true;
     };
 
     // Seek phase: walk from start_tet to the tet containing (ray.origin + t_enter*ray.dir).
-    constexpr int MAX_SEEK = 64;
+    // Returns 0 (no integration) when x_enter is outside the triangulation convex hull
+    // to prevent barycentric extrapolation across large boundary tets.
+    constexpr int MAX_SEEK = 256;
     {
         Vec3f x_enter = ray.origin + t_enter * ray.direction;
+        bool in_hull = false;
         for (int s = 0; s < MAX_SEEK; s++) {
             Vec3f v[4];
 #pragma unroll
@@ -148,11 +152,12 @@ trace_tet(const Ray &ray,
             if (!compute_bary(v, x_enter, L)) break;
             int worst = 0;
             for (int k = 1; k < 4; k++) if (L[k] < L[worst]) worst = k;
-            if (L[worst] >= -1e-5f) break; // contained
+            if (L[worst] >= -1e-5f) { in_hull = true; break; } // contained
             uint32_t packed = tet_adj[cur_tet * 4 + worst];
-            if (packed == UINT32_MAX) break; // boundary
+            if (packed == UINT32_MAX) break; // hit hull boundary -> x_enter is outside
             cur_tet = packed >> 2;
         }
+        if (!in_hull) return 0; // x_enter outside convex hull: skip to avoid streaks
     }
 
     // Integration phase: march segment-by-segment through tets.
@@ -173,7 +178,7 @@ trace_tet(const Ray &ray,
         Vec3f n2 = e3.cross(e1);
         Vec3f n3 = e1.cross(e2);
         float det = e1.dot(n1);
-        if (fabsf(det) < 1e-30f) break;
+        if (fabsf(det) < 1e-12f) break;
         float inv_det = 1.0f / det;
 
         float dL[4];
@@ -187,15 +192,16 @@ trace_tet(const Ray &ray,
         L[1] = n1.dot(rhs) * inv_det;
         L[2] = n2.dot(rhs) * inv_det;
         L[3] = n3.dot(rhs) * inv_det;
-        L[0] = 1.0f - L[1] - L[2] - L[3];
+        // Use fourth normal to avoid cancellation error in L[0].
+        L[0] = -(n1 + n2 + n3).dot(rhs - e1) * inv_det;
 
-        // Find exit: smallest t > t_0 where some L[k] hits 0.
+        // Find exit: smallest t strictly > t_0 where some L[k] hits 0.
         float t_1 = t_exit;
         int exit_face = -1;
         for (int k = 0; k < 4; k++) {
-            if (dL[k] < -1e-10f) {
+            if (dL[k] < 0.f) {
                 float tk = t_0 - L[k] / dL[k];
-                if (tk > t_0 - 1e-8f && tk < t_1) {
+                if (tk > t_0 && tk < t_1) {
                     t_1 = tk;
                     exit_face = k;
                 }
