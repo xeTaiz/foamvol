@@ -41,8 +41,20 @@ def main():
     camera_forward = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32)
     camera_up = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32)
 
+    print("Building Delaunay triangulation...")
+    triangulation = radfoam.Triangulation(xyz)
+    tets = triangulation.tets()
+    tet_adjacency = triangulation.tet_adjacency()
+    perm_gpu = triangulation.permutation()
+    perm_cpu = perm_gpu.cpu().to(torch.int32)
+    inv_perm_cpu = torch.argsort(perm_cpu).to(torch.int32)
+    vert_to_tet_cpu = triangulation.vert_to_tet().cpu().to(torch.int32)
+    print(f"Triangulation: {tets.shape[0]} tets, {xyz.shape[0]} vertices")
+
     def callback(viewer):
         viewer.update_scene(xyz, density, adjacency, adjacency_offsets, aabb_tree)
+        viewer.update_tet_topology(tets, tet_adjacency, perm_gpu,
+                                   inv_perm_cpu, vert_to_tet_cpu)
         if volume is not None:
             viewer.update_volume(volume)
 
