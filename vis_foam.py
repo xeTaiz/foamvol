@@ -18,6 +18,30 @@ from voxelize import sample_interpolated
 from radfoam_model.scene import IDWResult, idw_query
 
 
+def _build_tet_topology(points):
+    """Build Delaunay tet topology from a point cloud.
+
+    Returns a dict of int64 GPU tensors keyed by:
+      tets           (T, 4)  Triangulation vertex indices per tet
+      tet_adjacency  (T, 4)  packed: 4*nbr_tet + face_slot; 4294967295 = boundary
+      vert_to_tet    (P,)    one incident tet index per vertex
+      tri_perm       (P,)    perm[new_idx] = original point idx
+      tri_inv_perm   (P,)    inv_perm[original_idx] = Triangulation vertex idx
+    """
+    tri = radfoam.Triangulation(points)
+    N = points.shape[0]
+    tri_perm = tri.permutation().long()
+    tri_inv_perm = torch.empty(N, dtype=torch.long, device=points.device)
+    tri_inv_perm[tri_perm] = torch.arange(N, dtype=torch.long, device=points.device)
+    return {
+        "tets": tri.tets().long(),
+        "tet_adjacency": tri.tet_adjacency().long(),
+        "vert_to_tet": tri.vert_to_tet().long(),
+        "tri_perm": tri_perm,
+        "tri_inv_perm": tri_inv_perm,
+    }
+
+
 def field_from_model(model):
     """Build a field dict from a live CTScene (no checkpoint save/load)."""
     with torch.no_grad():
@@ -36,6 +60,7 @@ def field_from_model(model):
             "aabb_tree": model.aabb_tree,
             "cell_radius": cell_radius,
             "device": model.primal_points.device,
+            **_build_tet_topology(model.primal_points),
         }
 
 
@@ -71,6 +96,7 @@ def load_density_field(model_path, device="cuda"):
         "aabb_tree": aabb_tree,
         "cell_radius": cell_radius,
         "device": device,
+        **_build_tet_topology(points),
     }
 
 
@@ -303,6 +329,182 @@ def sample_nn_sibson(field, coordinates, k_samples=64, sample_radius_scale=1.5, 
         result[start:end] = res
 
     return result.reshape(original_shape).cpu().numpy()
+
+
+def sample_tet_barycentric(field, coordinates, sigma_v_intra=None, use_smoothed=False):
+    """C⁰ barycentric-linear density via Delaunay tet walk.
+
+    For each query point, walks the Delaunay tet adjacency graph from the
+    nearest cell site until the containing tet is found, then returns the
+    barycentric-linear blend of the 4 vertex densities (softplus-activated).
+    Continuous everywhere by construction — zero parameters.
+
+    Requires tet topology keys in field (built automatically by
+    load_density_field / field_from_model): tets, tet_adjacency, vert_to_tet,
+    tri_perm, tri_inv_perm.
+
+    Points outside the convex hull of the foam return 0.
+
+    Args:
+        field: dict from load_density_field() or field_from_model()
+        coordinates: numpy or torch array of shape (..., 3)
+        sigma_v_intra: if set, bilateral reweight the 4 barycentric coords by
+            exp(-(μ_k − μ_ref)² / σ²) where μ_ref is the unweighted blend.
+            C⁰ is preserved: the absent vertex (λ=0) cancels in numerator and
+            denominator, and μ_ref is itself C⁰.
+        use_smoothed: if True, use field["density_flat_smooth"] (pre-activated,
+            produced by smooth_density_graph) instead of density_flat.
+
+    Returns:
+        numpy array of shape (...) with interpolated density values
+    """
+    original_shape = coordinates.shape[:-1]
+    if isinstance(coordinates, np.ndarray):
+        coordinates = torch.from_numpy(coordinates).float()
+    q = coordinates.reshape(-1, 3).to(field["device"])
+    N = q.shape[0]
+
+    points = field["points"]
+    tets = field["tets"]            # (T, 4) int64 Triangulation vertex indices
+    tet_adj = field["tet_adjacency"]  # (T, 4) int64; UINT32_MAX=4294967295 → boundary
+    tri_perm = field["tri_perm"]      # (P,) int64; perm[new_idx] = original_idx
+    tri_inv_perm = field["tri_inv_perm"]  # (P,) int64; inv[orig] = new_idx
+    vert_to_tet = field["vert_to_tet"]    # (P,) int64
+
+    if use_smoothed and "density_flat_smooth" in field:
+        dens = field["density_flat_smooth"]  # already activated
+    else:
+        dens = F.softplus(field["density_flat"], beta=10)
+
+    BOUNDARY = (1 << 32) - 1  # uint32 max stored as int64
+
+    # Seed: nearest point in original space → Triangulation vertex → starting tet
+    nn_old = radfoam.nn(points, field["aabb_tree"], q).long()
+    nn_new = tri_inv_perm[nn_old]
+    cur_tet = vert_to_tet[nn_new].clone()
+
+    lam_result = torch.zeros(N, 4, device=q.device)
+    final_tet = cur_tet.clone()
+    done = torch.zeros(N, dtype=torch.bool, device=q.device)
+
+    for _ in range(32):
+        active_mask = ~done
+        if not active_mask.any():
+            break
+
+        idx = active_mask.nonzero(as_tuple=True)[0]  # (A,) active query indices
+        qa = q[idx]         # (A, 3)
+        ta = cur_tet[idx]   # (A,) tet indices
+
+        # Vertex positions via double index: Triangulation idx → original idx → xyz
+        vi_new = tets[ta]              # (A, 4) Triangulation vertex indices
+        vi_old = tri_perm[vi_new]      # (A, 4) original point indices
+        v = points[vi_old]             # (A, 4, 3)
+
+        # Barycentric: solve [v1-v0 | v2-v0 | v3-v0] @ [λ1;λ2;λ3] = q-v0
+        v0 = v[:, 0]
+        M = torch.stack([v[:, 1] - v0, v[:, 2] - v0, v[:, 3] - v0], dim=2)  # (A,3,3)
+        rhs = (qa - v0).unsqueeze(2)      # (A, 3, 1)
+        lam_123 = torch.linalg.solve(M, rhs).squeeze(2)  # (A, 3)
+        lam0 = 1.0 - lam_123.sum(-1, keepdim=True)
+        lam = torch.cat([lam0, lam_123], dim=-1)  # (A, 4)
+
+        # Mark degenerate tets (singular matrix → NaN) as boundary
+        bad = ~torch.isfinite(lam).all(-1)  # (A,)
+        done[idx[bad]] = True
+
+        # Contained: all λ ≥ -eps (small slack for floating point at faces)
+        contained = (~bad) & (lam.min(-1).values >= -1e-6)
+
+        done[idx[contained]] = True
+        lam_result[idx[contained]] = lam[contained]
+        final_tet[idx[contained]] = ta[contained]
+
+        # Step remaining active queries to the neighbor tet via the most-negative face
+        moving = ~contained & ~bad
+        if not moving.any():
+            continue
+
+        idx_m = idx[moving]
+        ta_m = ta[moving]
+        lam_m = lam[moving]
+
+        # Face slot with most-negative λ is the face to cross
+        k_neg = lam_m.argmin(-1)                 # (M,)
+        packed = tet_adj[ta_m, k_neg]             # (M,) packed adjacency entry
+
+        at_bnd = packed == BOUNDARY
+        done[idx_m[at_bnd]] = True               # outside convex hull → density 0
+
+        go = ~at_bnd
+        if go.any():
+            cur_tet[idx_m[go]] = packed[go] >> 2  # decode neighbor tet index
+
+    # Evaluate: linear blend of 4 vertex densities using converged λ
+    vi_new = tets[final_tet]          # (N, 4) Triangulation vertex indices
+    vi_old = tri_perm[vi_new]         # (N, 4) original point indices
+    mu_verts = dens[vi_old]           # (N, 4)
+
+    if sigma_v_intra is not None:
+        mu_ref = (lam_result * mu_verts).sum(-1, keepdim=True)  # (N, 1) plain blend
+        b = torch.exp(-(mu_verts - mu_ref).pow(2) / (sigma_v_intra * sigma_v_intra + 1e-12))
+        lam_w = lam_result * b
+        lam_w = lam_w / lam_w.sum(-1, keepdim=True).clamp(min=1e-10)
+        result = (lam_w * mu_verts).sum(-1)
+    else:
+        result = (lam_result * mu_verts).sum(-1)  # (N,)
+
+    return result.reshape(original_shape).cpu().numpy()
+
+
+def smooth_density_graph(field, alpha=1.0, sigma_v=0.3, sigma_s_scale=2.0, T=3):
+    """Bilateral Jacobi smoothing of per-cell densities on the Delaunay graph.
+
+    Runs T Jacobi iterations with spatial + value-bilateral weights:
+        μ̃_i ← (μ_i + α · Σ_j w_ij μ̃_j) / (1 + α · Σ_j w_ij)
+        w_ij = exp(−d_ij²/(σ_s_scale·r_i)²) · exp(−(μ_i−μ_j)²/σ_v²)
+
+    Uses the CSR Delaunay adjacency (field["adjacency"] / ["adjacency_offsets"]).
+    Spatial sigma is per-cell-adaptive: σ_s_i = σ_s_scale × cell_radius[i].
+
+    The result is cached on the field dict under "density_flat_smooth" together with
+    the cache key so that subsequent calls with the same params return immediately.
+
+    Returns the smoothed, already-activated density tensor (N,).
+    """
+    cache_key = (alpha, sigma_v, sigma_s_scale, T)
+    if field.get("_smooth_cache_key") == cache_key and "density_flat_smooth" in field:
+        return field["density_flat_smooth"]
+
+    device = field["device"]
+    adj = field["adjacency"].long()
+    adj_off = field["adjacency_offsets"].long()
+    points = field["points"]
+    cell_radius = field["cell_radius"]
+    N = points.shape[0]
+
+    degrees = adj_off[1:] - adj_off[:-1]                            # (N,)
+    src = torch.arange(N, device=device).repeat_interleave(degrees)  # (E,) row index
+    dst = adj                                                         # (E,) col index
+
+    d2 = (points[src] - points[dst]).pow(2).sum(-1)                 # (E,)
+    sigma_s_sq = (sigma_s_scale * cell_radius[src]).pow(2).clamp(min=1e-12)
+    w_spatial = torch.exp(-d2 / sigma_s_sq)                          # (E,) static part
+
+    mu = F.softplus(field["density_flat"], beta=10).clone()
+
+    for _ in range(T):
+        mu_diff_sq = (mu[src] - mu[dst]).pow(2)
+        w = w_spatial * torch.exp(-mu_diff_sq / (sigma_v * sigma_v + 1e-12))
+
+        w_sum = torch.zeros(N, device=device).scatter_add_(0, src, w)
+        w_mu = torch.zeros(N, device=device).scatter_add_(0, src, w * mu[dst])
+
+        mu = (mu + alpha * w_mu) / (1.0 + alpha * w_sum + 1e-12)
+
+    field["density_flat_smooth"] = mu
+    field["_smooth_cache_key"] = cache_key
+    return mu
 
 
 def sample_idw_diagnostic(field, coordinates, sigma=0.001, sigma_v=None):
