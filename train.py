@@ -1029,6 +1029,21 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     )
                     loss = loss + nvar_w * neighbor_var_loss
 
+                ba_w = getattr(optimizer_args, 'boundary_align_weight', 0.0)
+                boundary_align_loss = None
+                if ba_w > 0:
+                    ba_start = getattr(optimizer_args, 'boundary_align_start', -1)
+                    ba_until = getattr(optimizer_args, 'boundary_align_until', -1)
+                    if ba_start < 0:
+                        ba_start = pipeline_args.densify_from
+                    if ba_until < 0:
+                        ba_until = optimizer_args.freeze_points
+                    if ba_start <= i < ba_until:
+                        boundary_align_loss = model.boundary_alignment_regularization(
+                            sigma_v=var_sigma_v,
+                        )
+                        loss = loss + ba_w * boundary_align_loss
+
                 rv_w_cfg = getattr(optimizer_args, "ref_volume_weight", 0.0)
                 rv_start = getattr(optimizer_args, "ref_volume_start", 0)
                 rv_until = getattr(optimizer_args, "ref_volume_until", -1)
@@ -1146,6 +1161,9 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     if optimizer_args.neighbor_var_weight > 0 and i >= optimizer_args.neighbor_var_start:
                         writer.add_scalar("train/neighbor_var_loss", neighbor_var_loss.item(), i)
                         writer.add_scalar("train/neighbor_var_weight", nvar_w, i)
+                    if boundary_align_loss is not None:
+                        writer.add_scalar("train/boundary_align_loss", boundary_align_loss.item(), i)
+                        writer.add_scalar("train/boundary_align_weight", ba_w, i)
                     _rv_until = getattr(optimizer_args, "ref_volume_until", -1)
                     if (getattr(optimizer_args, "ref_volume_weight", 0.0) > 0
                             and hasattr(model, "_ref_volume")
