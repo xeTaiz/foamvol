@@ -49,6 +49,19 @@ class Viewer {
                                uint32_t depth,
                                const void *d_data) {}
 
+    /// @brief Upload Delaunay tet topology for barycentric interpolation.
+    /// tets: (num_tets * 4) uint32 flat — 4 vertex indices (triangulation-internal ordering).
+    /// tet_adjacency: (num_tets * 4) uint32 flat — packed 4*nbr_tet + face_slot, UINT32_MAX=boundary.
+    /// permutation: (num_points) uint32 — maps triangulation-internal → original point index.
+    /// inv_perm_cpu: raw host pointer to (num_points) uint32 for per-frame start_tet lookup.
+    /// vert_to_tet_cpu: raw host pointer to (num_points) uint32.
+    virtual void update_tet_topology(uint32_t num_tets,
+                                     const void *tets,
+                                     const void *tet_adjacency,
+                                     const void *permutation,
+                                     const uint32_t *inv_perm_cpu,
+                                     const uint32_t *vert_to_tet_cpu) {}
+
     virtual void step(int iteration) = 0;
 
     virtual bool is_closed() const = 0;

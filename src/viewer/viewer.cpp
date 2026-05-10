@@ -625,10 +625,20 @@ struct ViewerPrivate : public Viewer {
     CUDAArray<uint8_t> point_adjacency_offsets_buffer;
     CUDAArray<uint8_t> adjacent_diff_buffer;
     CUDAArray<float> activated_buffer;
+    CUDAArray<float> cell_radius_buffer;
     CUDAArray<float> ao_directions_buffer;
     uint32_t ao_directions_count = 0;
     std::vector<uint8_t> points_cpu;
     std::vector<uint8_t> aabb_tree_cpu;
+
+    // Tet topology for barycentric interpolation
+    uint32_t num_tets_stored = 0;
+    CUDAArray<uint8_t> tets_buffer;          // (num_tets * 4) uint32
+    CUDAArray<uint8_t> tet_adjacency_buffer; // (num_tets * 4) uint32
+    CUDAArray<uint8_t> perm_buffer;          // (num_points) uint32 new→orig
+    std::vector<uint32_t> inv_perm_cpu;      // orig→new, for start_tet lookup
+    std::vector<uint32_t> vert_to_tet_cpu;   // (num_points) uint32
+    bool tet_ready = false;
     std::vector<float> tf_hist_linear;   // raw counts per bin
     std::vector<float> tf_hist_log;      // log1p(count) per bin
     float tf_hist_max_lin  = 1.0f;
@@ -1144,10 +1154,29 @@ struct ViewerPrivate : public Viewer {
                 ImGui::Checkbox("Use Transfer Function",
                                 &vis_settings.use_transfer_function);
 
+                ImGui::SeparatorText("Pre-smoothing");
+                ImGui::SliderInt("T (iters)##smooth", &vis_settings.smooth_T, 0, 10);
+                if (vis_settings.smooth_T > 0) {
+                    ImGui::SliderFloat("alpha##smooth", &vis_settings.smooth_alpha,
+                                       0.0f, 5.0f, "%.2f");
+                    ImGui::SliderFloat("sigma_v##smooth", &vis_settings.smooth_sigma_v,
+                                       0.01f, 2.0f, "%.3f");
+                    ImGui::SliderFloat("sigma_s scale##smooth",
+                                       &vis_settings.smooth_sigma_s_scale,
+                                       0.5f, 8.0f, "%.2f");
+                }
+
                 ImGui::SeparatorText("Interpolation");
-                ImGui::Checkbox("IDW interpolation",
-                                &vis_settings.idw_interpolation);
-                if (vis_settings.idw_interpolation) {
+                {
+                    int imode = (int)vis_settings.interpolation_mode;
+                    const char *interp_items[] = {"Per-cell constant",
+                                                   "IDW",
+                                                   "Barycentric tet"};
+                    if (ImGui::Combo("Mode##interp", &imode, interp_items, 3))
+                        vis_settings.interpolation_mode =
+                            (InterpolationMode)imode;
+                }
+                if (vis_settings.interpolation_mode == InterpolationMode::IDW) {
                     // 2D sigma control: X = idw_sigma [1e-4, 10.0] log,
                     //                  Y = idw_sigma_v [1e-3, 10.0] log, increases downward.
                     const float canvas_w = 220.0f;
@@ -1217,6 +1246,10 @@ struct ViewerPrivate : public Viewer {
                     ImGui::Text("sigma: %.5f  sigma_v: %.4f",
                                 vis_settings.idw_sigma,
                                 vis_settings.idw_sigma_v);
+                }
+                if (vis_settings.interpolation_mode == InterpolationMode::BarycentricTet) {
+                    ImGui::SliderFloat("sigma_v intra", &vis_settings.sigma_v_intra,
+                                       0.0f, 1.0f, "%.3f");
                 }
 
                 if (vis_settings.use_transfer_function) {
@@ -1542,12 +1575,17 @@ struct ViewerPrivate : public Viewer {
 
             if (foam_ready || vol_ready) {
                 uint32_t start_index = 0;
+                uint32_t start_tet = 0;
                 if (foam_ready && w_foam > 0) {
                     start_index = nn_cpu(ScalarType::Float32,
                                          points_cpu.data(),
                                          aabb_tree_cpu.data(),
                                          *camera.position,
                                          num_points);
+                    if (tet_ready && !inv_perm_cpu.empty() && !vert_to_tet_cpu.empty()) {
+                        uint32_t new_idx = inv_perm_cpu[start_index];
+                        start_tet = vert_to_tet_cpu[new_idx];
+                    }
                 }
 
                 CUarray output_array = nullptr;
@@ -1608,7 +1646,7 @@ struct ViewerPrivate : public Viewer {
                         cmap_table,
                         tf_state.get_table(),
                         num_points,
-                        num_point_adjacency,
+                        num_tets_stored,
                         points_buffer.begin(),
                         attrs_buffer.begin(),
                         point_adjacency_buffer.begin(),
@@ -1618,6 +1656,15 @@ struct ViewerPrivate : public Viewer {
                         start_index,
                         output_surface,
                         ao_dirs_ptr,
+                        tet_ready ? reinterpret_cast<const uint32_t *>(
+                                        tets_buffer.begin()) : nullptr,
+                        tet_ready ? reinterpret_cast<const uint32_t *>(
+                                        tet_adjacency_buffer.begin()) : nullptr,
+                        tet_ready ? reinterpret_cast<const uint32_t *>(
+                                        perm_buffer.begin()) : nullptr,
+                        start_tet,
+                        cell_radius_buffer.size() > 0
+                            ? cell_radius_buffer.begin() : nullptr,
                         &cuda_stream);
                 }
 
@@ -1742,6 +1789,7 @@ struct ViewerPrivate : public Viewer {
         scene_updating = true;
         {
             auto lock = std::lock_guard(scene_mutex);
+            cuda_check(cuCtxPushCurrent(cuda_context));
 
             this->num_points = num_points;
             this->num_point_adjacency = num_point_adjacency;
@@ -1836,11 +1884,51 @@ struct ViewerPrivate : public Viewer {
                 reinterpret_cast<Vec4h *>(adjacent_diff_buffer.begin()),
                 nullptr);
 
+            // Compute per-cell radius for bilateral smoothing
+            cell_radius_buffer.resize(num_points);
+            compute_cell_radius(
+                num_points,
+                reinterpret_cast<const Vec4h *>(adjacent_diff_buffer.begin()),
+                reinterpret_cast<const uint32_t *>(
+                    point_adjacency_offsets_buffer.begin()),
+                cell_radius_buffer.begin());
+
             cuda_check(cuStreamSynchronize(0));
 
             scene_updating = false;
+            cuda_check(cuCtxPopCurrent(nullptr));
         }
         scene_cv.notify_one();
+    }
+
+    void update_tet_topology(uint32_t num_tets,
+                              const void *tets,
+                              const void *tet_adjacency,
+                              const void *permutation,
+                              const uint32_t *inv_perm_cpu_in,
+                              const uint32_t *vert_to_tet_cpu_in) override {
+        auto lock = std::lock_guard(scene_mutex);
+        cuda_check(cuCtxPushCurrent(cuda_context));
+
+        num_tets_stored = num_tets;
+        size_t tet_bytes   = (size_t)num_tets * 4 * sizeof(uint32_t);
+        size_t perm_bytes  = (size_t)num_points * sizeof(uint32_t);
+
+        tets_buffer.resize(tet_bytes);
+        tet_adjacency_buffer.resize(tet_bytes);
+        perm_buffer.resize(perm_bytes);
+
+        cuda_check(cuMemcpyDtoD((CUdeviceptr)tets_buffer.begin(),
+                                (CUdeviceptr)tets, tet_bytes));
+        cuda_check(cuMemcpyDtoD((CUdeviceptr)tet_adjacency_buffer.begin(),
+                                (CUdeviceptr)tet_adjacency, tet_bytes));
+        cuda_check(cuMemcpyDtoD((CUdeviceptr)perm_buffer.begin(),
+                                (CUdeviceptr)permutation, perm_bytes));
+
+        inv_perm_cpu.assign(inv_perm_cpu_in, inv_perm_cpu_in + num_points);
+        vert_to_tet_cpu.assign(vert_to_tet_cpu_in, vert_to_tet_cpu_in + num_points);
+        tet_ready = true;
+        cuda_check(cuCtxPopCurrent(nullptr));
     }
 
     void step(int iteration) override {

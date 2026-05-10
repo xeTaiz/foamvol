@@ -34,6 +34,12 @@ enum VisualizationMode {
     VolumeDensity = 4,
 };
 
+enum InterpolationMode {
+    PerCell = 0,
+    IDW = 1,
+    BarycentricTet = 2,
+};
+
 struct VisualizationSettings {
     VisualizationMode mode;
     ColorMap color_map;
@@ -48,9 +54,14 @@ struct VisualizationSettings {
     float tf_density_min;
     float tf_density_max;
     float tf_opacity_scale;
-    bool idw_interpolation;
+    InterpolationMode interpolation_mode;
     float idw_sigma;
     float idw_sigma_v;
+    float sigma_v_intra;
+    int smooth_T;
+    float smooth_alpha;
+    float smooth_sigma_v;
+    float smooth_sigma_s_scale;
     bool phong_enabled;
     float phong_ambient;
     float phong_diffuse;
@@ -79,9 +90,14 @@ inline VisualizationSettings default_visualization_settings() {
     settings.tf_density_min = 0.0f;
     settings.tf_density_max = 1.0f;
     settings.tf_opacity_scale = 100.0f;
-    settings.idw_interpolation = false;
+    settings.interpolation_mode = PerCell;
     settings.idw_sigma = 0.01f;
     settings.idw_sigma_v = 0.05f;
+    settings.sigma_v_intra = 0.0f;
+    settings.smooth_T = 0;
+    settings.smooth_alpha = 1.0f;
+    settings.smooth_sigma_v = 0.3f;
+    settings.smooth_sigma_s_scale = 2.0f;
     settings.phong_enabled = false;
     settings.phong_ambient = 0.3f;
     settings.phong_diffuse = 0.7f;
@@ -95,6 +111,14 @@ inline VisualizationSettings default_visualization_settings() {
     settings.slice_max = Vec3f( 1.0f,  1.0f,  1.0f);
     return settings;
 }
+
+/// @brief Compute per-cell radius (max edge length to any neighbor) from adjacent_diff.
+/// Must be called after prefetch_adjacent_diff.
+void compute_cell_radius(uint32_t num_points,
+                         const Vec4h *adjacent_diff,
+                         const uint32_t *adj_offsets,
+                         float *cell_radius,
+                         const void *stream = nullptr);
 
 /// @brief Prefetch offset for each edge in the adjacency matrix
 void prefetch_adjacent_diff(const Vec3f *points,
@@ -172,6 +196,11 @@ class Pipeline {
                                      uint32_t start_index,
                                      uint64_t output_surface,
                                      const float *ao_directions = nullptr,
+                                     const uint32_t *tets = nullptr,
+                                     const uint32_t *tet_adjacency = nullptr,
+                                     const uint32_t *permutation = nullptr,
+                                     uint32_t start_tet = 0,
+                                     const float *cell_radius = nullptr,
                                      const void *stream = nullptr) {}
 
     // Stub for viewer compatibility
