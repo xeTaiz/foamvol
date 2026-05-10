@@ -885,6 +885,58 @@ class CTScene(torch.nn.Module):
         else:
             raise ValueError(f"Unknown neighbor reg_type: {reg_type}")
 
+    def boundary_alignment_regularization(self, sigma_v: float = 0.2) -> torch.Tensor:
+        """Geometric regularizer: adjacent same-density cells should have aligned boundary structure.
+
+        For each cell i, builds a 3x3 PSD scatter matrix M_i from weighted outer products of
+        edge directions to neighbors, where weights are large for high-density-jump edges.
+        M_i summarizes which direction(s) the local iso-surface faces. For two same-density
+        neighbors i and j, penalizes the Frobenius distance between normalized M_hat_i and
+        M_hat_j. This encourages the boundary-direction fingerprint to vary smoothly across
+        the iso-surface, suppressing dihedral kinks between adjacent surface facets.
+
+        Gradients flow into primal_points only (all density/weight terms are detached).
+        """
+        points  = self.primal_points                                    # (N, 3)
+        mu      = self.get_primal_density().detach()                    # (N, 1), detached weights
+        cr      = self._cached_cell_radius                              # (N,)
+
+        offsets = self.point_adjacency_offsets.long()
+        adj     = self.point_adjacency.long()
+        counts  = offsets[1:] - offsets[:-1]
+        N       = points.shape[0]
+        src     = torch.repeat_interleave(
+                      torch.arange(N, device=points.device), counts)    # (E,)
+
+        dx      = points[adj] - points[src]                             # (E, 3)
+        n       = dx / dx.norm(dim=-1, keepdim=True).clamp_min(1e-12)  # (E, 3)
+
+        dmu_sq  = (mu[adj] - mu[src]).pow(2).squeeze(-1)                # (E,) detached
+        w_face  = (cr[src] * cr[adj]).detach()                          # (E,) detached
+        w       = dmu_sq * w_face                                       # (E,)
+
+        # Build per-edge outer products (E, 9) and scatter-sum to per-cell (N, 9).
+        # Use the non-in-place index_add so gradients flow through outer → n → points.
+        outer_flat = (w[:, None, None] * (n.unsqueeze(2) * n.unsqueeze(1))).reshape(-1, 9)  # (E, 9)
+        M_flat = torch.zeros((N, 9), device=points.device,
+                              dtype=points.dtype).index_add(0, src, outer_flat)
+        M = M_flat.reshape(N, 3, 3)                                     # (N, 3, 3)
+
+        tr      = M.diagonal(dim1=-2, dim2=-1).sum(-1)                  # (N,)
+        tau     = (tr.detach().median() * 0.01).clamp_min(1e-12)
+        valid   = (tr.detach() > tau)                                    # (N,) bool
+
+        M_hat   = M / tr.detach().unsqueeze(-1).unsqueeze(-1).clamp_min(1e-12)  # (N, 3, 3)
+
+        sim     = torch.exp(
+                      -(mu[src] - mu[adj]).pow(2) / (sigma_v ** 2)
+                  ).squeeze(-1)                                          # (E,)
+        mask    = (valid[src] & valid[adj]).float()                      # (E,)
+        diff_F  = (M_hat[src] - M_hat[adj]).pow(2).sum(dim=(-1, -2))    # (E,)
+
+        denom   = mask.sum().clamp_min(1.0)
+        return (mask * sim * diff_F).sum() / denom
+
     @torch.no_grad()
     def compute_neighborhood_variance(self, cell_radius=None, hops=1):
         """Per-cell neighborhood variance score for variance-based pruning.
