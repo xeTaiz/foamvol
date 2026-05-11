@@ -103,20 +103,20 @@ template <typename TetFunctor>
 __forceinline__ __device__ uint32_t
 trace_tet(const Ray &ray,
           const Vec3f *__restrict__ points,
-          const uint32_t *__restrict__ tets,       // (T,4) flat uint32
-          const uint32_t *__restrict__ tet_adj,    // (T,4) flat uint32 packed
+          const uint32_t *__restrict__ tets,        // (T,4) flat uint32
+          const uint32_t *__restrict__ tet_adj,     // (T,4) flat uint32 packed
           const uint32_t *__restrict__ permutation, // new→orig
           uint32_t start_tet,
           uint32_t max_steps,
           float t_enter,
           float t_exit,
-          TetFunctor functor) {
+          TetFunctor functor,
+          bool *failed_out = nullptr) {
 
     uint32_t cur_tet = start_tet;
 
-    // Helper: compute barycentrics of point x in tet, return in L[4].
-    // All four coords use independent normals to avoid cancellation in L[0].
-    // det is the signed volume * 6; returns false if tet is degenerate.
+    // Compute barycentrics of x in tet v[4]. Returns false for degenerate tets.
+    // Uses scale-aware threshold (1e-18) — fine for seek convergence.
     auto compute_bary = [&](const Vec3f v[4], const Vec3f &x, float L[4]) -> bool {
         Vec3f e1 = v[1] - v[0];
         Vec3f e2 = v[2] - v[0];
@@ -125,8 +125,6 @@ trace_tet(const Ray &ray,
         Vec3f n2 = e3.cross(e1);
         Vec3f n3 = e1.cross(e2);
         float det = e1.dot(n1);
-        // Scale-aware degenerate check: det^2 < eps * (sum_edge_sq)^3.
-        // Avoids false-positive sliver calls on legitimate small tets.
         float scale_sq = e1.squaredNorm() + e2.squaredNorm() + e3.squaredNorm();
         if (det * det < 1e-18f * scale_sq * scale_sq * scale_sq) return false;
         float inv_det = 1.0f / det;
@@ -134,52 +132,65 @@ trace_tet(const Ray &ray,
         L[1] = n1.dot(rhs) * inv_det;
         L[2] = n2.dot(rhs) * inv_det;
         L[3] = n3.dot(rhs) * inv_det;
-        // Use fourth normal instead of 1-sum to avoid cancellation error.
         L[0] = -(n1 + n2 + n3).dot(x - v[1]) * inv_det;
         return true;
     };
 
-    // Seek phase: walk from start_tet to the tet containing (ray.origin + t_enter*ray.dir).
-    // Returns 0 for any non-contained termination (hull boundary, MAX_SEEK exhaustion).
-    // Sliver tets during the walk hop to a neighbour and retry rather than bailing,
-    // but the Round-3 invariant holds: we never start integration in a wrong tet.
-    constexpr int MAX_SEEK = 256;
-    {
-        Vec3f x_enter = ray.origin + t_enter * ray.direction;
-        bool in_hull = false;
-        uint32_t prev_tet = UINT32_MAX;
-        for (int s = 0; s < MAX_SEEK; s++) {
-            Vec3f v[4];
+    // Worst-barycentric walker shared by initial seek and integration recovery.
+    // Walks up to max_iters steps from `start` toward x.
+    // Returns the containing tet, or UINT32_MAX on failure.
+    auto find_containing_tet = [&](const Vec3f &x,
+                                   uint32_t start,
+                                   int max_iters) -> uint32_t {
+        uint32_t cur = start;
+        uint32_t prev = UINT32_MAX;
+        for (int s = 0; s < max_iters; s++) {
+            Vec3f vv[4];
 #pragma unroll
             for (int k = 0; k < 4; k++)
-                v[k] = points[permutation[tets[cur_tet * 4 + k]]];
+                vv[k] = points[permutation[tets[cur * 4 + k]]];
             float L[4];
-            if (!compute_bary(v, x_enter, L)) {
-                // Sliver mid-walk: hop to face-0 neighbour and retry.
-                uint32_t packed = tet_adj[cur_tet * 4 + 0];
-                if (packed == UINT32_MAX) break; // sliver at hull: bail
-                cur_tet = packed >> 2;
+            if (!compute_bary(vv, x, L)) {
+                // Sliver mid-walk: try any non-prev, non-hull face.
+                uint32_t hop = UINT32_MAX;
+                for (int kk = 0; kk < 4; kk++) {
+                    uint32_t packed = tet_adj[cur * 4 + kk];
+                    if (packed == UINT32_MAX) continue;
+                    uint32_t cand = packed >> 2;
+                    if (cand == prev) continue;
+                    hop = cand;
+                    break;
+                }
+                if (hop == UINT32_MAX) return UINT32_MAX;
+                prev = cur; cur = hop;
                 continue;
             }
             int worst = 0;
             for (int k = 1; k < 4; k++) if (L[k] < L[worst]) worst = k;
-            if (L[worst] >= -1e-5f) { in_hull = true; break; } // contained
-            uint32_t packed = tet_adj[cur_tet * 4 + worst];
-            if (packed == UINT32_MAX) break; // hull boundary
-            uint32_t next_tet = packed >> 2;
-            if (next_tet == prev_tet) {
-                // 2-cycle: x_enter is on the face between cur_tet and prev_tet.
-                // Lc clamping in the functor handles the small negative L[worst].
-                if (L[worst] > -0.1f) in_hull = true;
-                break;
+            if (L[worst] >= -1e-5f) return cur;
+            uint32_t packed = tet_adj[cur * 4 + worst];
+            if (packed == UINT32_MAX) return UINT32_MAX;
+            uint32_t nxt = packed >> 2;
+            if (nxt == prev) {
+                if (L[worst] > -0.1f) return cur;
+                return UINT32_MAX;
             }
-            prev_tet = cur_tet;
-            cur_tet = next_tet;
+            prev = cur; cur = nxt;
         }
-        if (!in_hull) return 0;
+        return UINT32_MAX;
+    };
+
+    // Initial seek: locate the tet containing the ray entry point.
+    {
+        Vec3f x_enter = ray.origin + t_enter * ray.direction;
+        uint32_t found = find_containing_tet(x_enter, cur_tet, 256);
+        if (found == UINT32_MAX) return 0;
+        cur_tet = found;
     }
 
-    // Integration phase: march segment-by-segment through tets.
+    constexpr float SLIVER_EPS = 1e-4f;
+    constexpr float L_TOL = 1e-3f;
+
     float t_0 = t_enter;
     uint32_t n = 0;
 
@@ -189,7 +200,6 @@ trace_tet(const Ray &ray,
         for (int k = 0; k < 4; k++)
             v[k] = points[permutation[tets[cur_tet * 4 + k]]];
 
-        // Compute dL/dt and L at t_0 (one 3x3 inverse via cross products).
         Vec3f e1 = v[1] - v[0];
         Vec3f e2 = v[2] - v[0];
         Vec3f e3 = v[3] - v[0];
@@ -197,7 +207,21 @@ trace_tet(const Ray &ray,
         Vec3f n2 = e3.cross(e1);
         Vec3f n3 = e1.cross(e2);
         float det = e1.dot(n1);
-        if (fabsf(det) < 1e-12f) break;
+        float scale_sq = e1.squaredNorm() + e2.squaredNorm() + e3.squaredNorm();
+
+        Vec3f x_now = ray.origin + t_0 * ray.direction;
+
+        // (1) Sliver: inv_det would be unreliable; skip this tet.
+        if (det * det < SLIVER_EPS * scale_sq * scale_sq * scale_sq) {
+            t_0 = fminf(t_0 + 1e-4f * sqrtf(scale_sq), t_exit);
+            x_now = ray.origin + t_0 * ray.direction;
+            uint32_t found = find_containing_tet(x_now, cur_tet, 32);
+            if (found == UINT32_MAX) { if (failed_out) *failed_out = true; break; }
+            cur_tet = found;
+            n++;
+            continue;
+        }
+
         float inv_det = 1.0f / det;
 
         float dL[4];
@@ -206,13 +230,23 @@ trace_tet(const Ray &ray,
         dL[3] = n3.dot(ray.direction) * inv_det;
         dL[0] = -(dL[1] + dL[2] + dL[3]);
 
-        Vec3f rhs = (ray.origin + t_0 * ray.direction) - v[0];
+        Vec3f rhs = x_now - v[0];
         float L[4];
         L[1] = n1.dot(rhs) * inv_det;
         L[2] = n2.dot(rhs) * inv_det;
         L[3] = n3.dot(rhs) * inv_det;
-        // Use fourth normal to avoid cancellation error in L[0].
         L[0] = -(n1 + n2 + n3).dot(rhs - e1) * inv_det;
+
+        // (2) Stranded: upstream noise sent us into a tet we're not inside.
+        float lmin = L[0];
+        for (int k = 1; k < 4; k++) if (L[k] < lmin) lmin = L[k];
+        if (lmin < -L_TOL) {
+            uint32_t found = find_containing_tet(x_now, cur_tet, 32);
+            if (found == UINT32_MAX) { if (failed_out) *failed_out = true; break; }
+            cur_tet = found;
+            n++;
+            continue;
+        }
 
         // Find exit: smallest t strictly > t_0 where some L[k] hits 0.
         float t_1 = t_exit;
@@ -237,7 +271,7 @@ trace_tet(const Ray &ray,
         n++;
         t_0 = t_1;
 
-        if (exit_face < 0) break; // capped at t_exit
+        if (exit_face < 0) break;
         uint32_t packed = tet_adj[cur_tet * 4 + exit_face];
         if (packed == UINT32_MAX) break; // boundary
         cur_tet = packed >> 2;
