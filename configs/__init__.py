@@ -93,6 +93,13 @@ class PipelineParams(ParamGroup):
         self.log_percent = 5          # log metrics every N% of iterations
         self.diag_percent = 10        # log diagnostics/slices every N% of iterations
         self.diag = False             # enable mid-training diag logs (always logs once after training)
+        # Volume-supervised training (train_vol.py)
+        self.n_query_per_step = 1_000_000      # random query points per training step
+        self.n_query_error_map = 4_000_000     # random points for densification error-map pass
+        self.error_map_batch_size = 1_000_000  # chunk size inside collect_error_map_volume
+        self.volume_loss_type = "l1"           # l1, l2, or charbonnier
+        self.volume_sampling_extent = 1.0      # half-extent of [-extent, +extent]^3 sampling box
+        self.gt_volume_path = ""               # override GT path (empty = derived from dataset)
         super().__init__(parser, "Setting Pipeline parameters")
 
 

@@ -513,6 +513,108 @@ class CTScene(torch.nn.Module):
 
         return diff[occupied].pow(2).mean()
 
+    def _idw_query_at(self, query, hop=1):
+        """Differentiable IDW density at arbitrary [B, 3] query points.
+
+        Unlike _idw_voxelize, primal_points are NOT detached so that
+        gradients flow through point positions (spatial weights) as well as
+        density values — enabling the position-update signal in volume training.
+        """
+        mu = self.get_primal_density().squeeze()
+
+        sigma = getattr(self, '_idw_sigma', 0.7)
+        sigma_v = getattr(self, '_idw_sigma_v', None)
+        per_cell_sigma = getattr(self, '_per_cell_sigma', False)
+        per_neighbor_sigma = getattr(self, '_per_neighbor_sigma', False)
+        cell_radius = self._cached_cell_radius if per_cell_sigma else None
+
+        adj = self.point_adjacency
+        adj_off = self.point_adjacency_offsets
+
+        B = query.shape[0]
+        chunk_size = 500_000
+        chunks = []
+        for start in range(0, B, chunk_size):
+            result = idw_query(
+                query[start:start + chunk_size],
+                self.primal_points,
+                adj, adj_off, self.aabb_tree, mu,
+                sigma=sigma, sigma_v=sigma_v,
+                per_cell_sigma=per_cell_sigma,
+                per_neighbor_sigma=per_neighbor_sigma,
+                cell_radius=cell_radius,
+                hop=hop,
+            )
+            chunks.append(result.idw_result)
+        return torch.cat(chunks)
+
+    def collect_error_map_volume(self, vol_gt_5d, n_query=4_000_000,
+                                  batch_size=1_000_000, extent=1.0):
+        """Volume-based alternative to collect_error_map.
+
+        Samples n_query random 3D points, back-props |IDW_pred - GT|, and
+        returns per-cell position-gradient norms and a normalized sample count.
+
+        The contribution is normalized so that an average-sized cell has
+        contribution ~1.0, making it compatible with the < 1e-2 pruning
+        threshold used in prune_and_densify.
+        """
+        import math
+        self.optimizer.zero_grad(set_to_none=True)
+        n_points = self.primal_points.shape[0]
+        contribution = torch.zeros(n_points, device=self.device)
+
+        total = 0
+        while total < n_query:
+            bs = min(batch_size, n_query - total)
+            query = (torch.rand(bs, 3, device=self.device) * 2 - 1) * extent
+
+            mu_pred = self._idw_query_at(query)
+            grid = (query / extent).flip(-1)[None, None, None]
+            mu_gt = F.grid_sample(
+                vol_gt_5d, grid, mode='bilinear',
+                align_corners=True, padding_mode='zeros',
+            ).reshape(-1).detach()
+
+            (mu_pred - mu_gt).abs().sum().backward()
+
+            with torch.no_grad():
+                nn_idx = radfoam.nn(
+                    self.primal_points.detach(), self.aabb_tree, query
+                ).long()
+                contribution.scatter_add_(0, nn_idx, torch.ones(bs, device=self.device))
+
+            total += bs
+
+        grad = (self.primal_points.grad if self.primal_points.grad is not None
+                else torch.zeros_like(self.primal_points))
+        point_error = grad.norm(dim=-1, keepdim=True).clamp_min_(0).detach()
+        contribution_norm = (contribution / max(n_query, 1) * n_points).unsqueeze(-1)
+
+        self.optimizer.zero_grad(set_to_none=True)
+        return point_error, contribution_norm
+
+    def prune_only_volume(self, vol_gt_5d, n_query=2_000_000,
+                          batch_size=1_000_000, extent=1.0):
+        """Standalone prune pass using volume-based sample-count contribution."""
+        _, point_contribution = self.collect_error_map_volume(
+            vol_gt_5d, n_query=n_query, batch_size=batch_size, extent=extent)
+        with torch.no_grad():
+            points, _, point_adjacency, point_adjacency_offsets, *_ = self.get_trace_data()
+            _, cell_radius = radfoam.farthest_neighbor(
+                points, point_adjacency, point_adjacency_offsets,
+            )
+            prune_mask = torch.logical_or(
+                point_contribution.squeeze() < 1e-2,
+                cell_radius < 1e-3,
+            )
+            n_pruned = prune_mask.sum().item()
+            if n_pruned > 0:
+                print(f"Standalone prune: {n_pruned}/{points.shape[0]} cells")
+                self.prune_points(prune_mask)
+                self.update_triangulation(incremental=False)
+            return n_pruned
+
     def permute_points(self, permutation):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
