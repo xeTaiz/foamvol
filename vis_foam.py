@@ -24,15 +24,60 @@ def _build_tet_topology(points):
     Returns a dict of int64 GPU tensors keyed by:
       tets           (T, 4)  Triangulation vertex indices per tet
       tet_adjacency  (T, 4)  packed: 4*nbr_tet + face_slot; 4294967295 = boundary
-      vert_to_tet    (P,)    one incident tet index per vertex
-      tri_perm       (P,)    perm[new_idx] = original point idx
-      tri_inv_perm   (P,)    inv_perm[original_idx] = Triangulation vertex idx
+      vert_to_tet    (M,)    one incident tet index per vertex (M = dedup count ≤ N)
+      tri_perm       (M,)    perm[tri_vertex] = original point idx
+      tri_inv_perm   (N,)    inv_perm[original_idx] = Triangulation vertex idx
     """
-    tri = radfoam.Triangulation(points)
     N = points.shape[0]
-    tri_perm = tri.permutation().long()
-    tri_inv_perm = torch.empty(N, dtype=torch.long, device=points.device)
-    tri_inv_perm[tri_perm] = torch.arange(N, dtype=torch.long, device=points.device)
+    orig_to_dedup = None
+    keep_t = None
+
+    try:
+        tri = radfoam.Triangulation(points)
+    except radfoam.TriangulationFailedError as e:
+        if "duplicate" not in str(e):
+            raise
+        # Deduplicate: identical logic to scene.py load_model
+        pts_np = points.detach().cpu().numpy()
+        sort_idx = np.lexsort(pts_np.T[::-1])
+        diffs = np.linalg.norm(np.diff(pts_np[sort_idx], axis=0), axis=1)
+        eps = max(1e-6, float(np.abs(pts_np).max()) * 1e-5)
+        keep_in_sorted = np.concatenate([[True], diffs > eps])
+        keep_sorted_pos = np.where(keep_in_sorted)[0]  # positions in sort order that are kept
+
+        # For each sorted position, find the nearest preceding kept position
+        pred = np.searchsorted(keep_sorted_pos, np.arange(N), side="right") - 1
+        pred = np.clip(pred, 0, len(keep_sorted_pos) - 1)
+        # rep_orig[orig_idx] = original idx of its kept representative
+        rep_orig = np.empty(N, dtype=np.int64)
+        rep_orig[sort_idx] = sort_idx[keep_sorted_pos[pred]]
+
+        keep_orig = np.sort(sort_idx[keep_in_sorted])  # (M,) kept original indices
+        M = len(keep_orig)
+        orig_to_keep_pos = np.empty(N, dtype=np.int64)
+        orig_to_keep_pos[keep_orig] = np.arange(M)
+        orig_to_dedup = orig_to_keep_pos[rep_orig]  # (N,) → dedup index in [0, M)
+
+        keep_t = torch.from_numpy(keep_orig).to(points.device)
+        tri = radfoam.Triangulation(points[keep_t].contiguous())
+        print(f"_build_tet_topology: removed {N - M} near-duplicate points before triangulation")
+
+    tri_perm_raw = tri.permutation().long()
+    M_tri = tri_perm_raw.shape[0]
+
+    if orig_to_dedup is None:
+        tri_perm = tri_perm_raw  # (N,) original indices
+        tri_inv_perm = torch.empty(N, dtype=torch.long, device=points.device)
+        tri_inv_perm[tri_perm] = torch.arange(N, dtype=torch.long, device=points.device)
+    else:
+        tri_perm = keep_t[tri_perm_raw]  # (M,) maps tri vertex → original idx
+        # Inverse: dedup idx → tri vertex idx
+        tri_inv_dedup = torch.empty(M_tri, dtype=torch.long, device=points.device)
+        tri_inv_dedup[tri_perm_raw] = torch.arange(M_tri, dtype=torch.long, device=points.device)
+        # Full inverse: original idx → tri vertex idx (removed points map to their representative)
+        orig_to_dedup_t = torch.from_numpy(orig_to_dedup).to(points.device)
+        tri_inv_perm = tri_inv_dedup[orig_to_dedup_t]  # (N,)
+
     return {
         "tets": tri.tets().long(),
         "tet_adjacency": tri.tet_adjacency().long(),
@@ -196,6 +241,108 @@ def sample_idw(field, coordinates, sigma=0.01, sigma_v=None,
                          per_neighbor_sigma=per_neighbor_sigma,
                          hop=hop)
         result[start:end] = res.idw_result
+
+    return torch.nan_to_num(result).reshape(original_shape).cpu().numpy()
+
+
+def sample_linear_idw(field, coordinates, sigma_v=0.0, eps_frac=0.05):
+    """Linear inverse-distance-weighted interpolation over Voronoi neighbours.
+
+    Mirrors the CUDA ``ct_visualization_linear_idw`` kernel exactly.
+
+    For each query point, finds the containing cell and its Voronoi neighbours,
+    then computes:
+        w_j = 1 / (d_j² + eps²)
+    where eps² = (eps_frac * cell_radius)².  With sigma_v > 0 each weight is
+    additionally multiplied by exp(-(mu_j - mu_ref)² / sigma_v²).
+
+    Args:
+        field: dict from load_density_field() or field_from_model()
+        coordinates: numpy or torch array of shape (..., 3)
+        sigma_v: bilateral value sigma (0 = disabled; mirrors CUDA idw_sigma_v)
+        eps_frac: eps = eps_frac * cell_radius (default 0.05 = 5% of cell radius)
+
+    Returns:
+        numpy array of shape (...) with interpolated density values
+    """
+    original_shape = coordinates.shape[:-1]
+    if isinstance(coordinates, np.ndarray):
+        coordinates = torch.from_numpy(coordinates).float()
+    coords_flat = coordinates.reshape(-1, 3).to(field["device"])
+    device = field["device"]
+
+    activated = F.softplus(field["density_flat"], beta=10)
+    points = field["points"]                          # (N, 3)
+    adj    = field["adjacency"]                       # (E,)
+    adj_off = field["adjacency_offsets"]              # (N+1,)
+    cell_radius = field.get("cell_radius")            # (N,) or None
+    aabb_tree   = field["aabb_tree"]
+
+    use_bilateral = sigma_v > 0.0
+    sigma_v_sq = sigma_v ** 2 if use_bilateral else 1.0
+
+    batch_size = 500_000
+    result = torch.zeros(coords_flat.shape[0], device=device)
+
+    for start in range(0, coords_flat.shape[0], batch_size):
+        end = min(start + batch_size, coords_flat.shape[0])
+        q = coords_flat[start:end]                    # (B, 3)
+        B = q.shape[0]
+
+        # Find containing cell via nearest-neighbour lookup
+        nn_idx = radfoam.nn(q, aabb_tree, points)     # (B,)
+
+        # Self distance squared
+        p_self  = points[nn_idx]                      # (B, 3)
+        d_sq_self = ((q - p_self) ** 2).sum(-1)       # (B,)
+
+        # eps² scaled to containing cell radius
+        if cell_radius is not None:
+            r_self  = cell_radius[nn_idx]             # (B,)
+            eps_sq  = (eps_frac * r_self) ** 2        # (B,)
+        else:
+            eps_sq  = torch.full((B,), (eps_frac * 1e-3) ** 2, device=device)
+
+        mu_ref  = activated[nn_idx]                   # (B,)
+        w_sum   = 1.0 / (d_sq_self + eps_sq)          # (B,)
+        mu_w    = w_sum * mu_ref                      # (B,)
+
+        # Iterate over neighbour slots using CSR adjacency
+        # Build a dense (B, max_degree) neighbour matrix
+        deg     = (adj_off[nn_idx + 1] - adj_off[nn_idx])  # (B,)
+        max_deg = int(deg.max().item()) if B > 0 else 0
+
+        if max_deg > 0:
+            # Gather neighbour indices: (B, max_deg) — pad with self (safe)
+            nb_idx = torch.zeros(B, max_deg, dtype=torch.long, device=device)
+            for k in range(max_deg):
+                slot = adj_off[nn_idx] + k
+                valid = k < deg
+                slot_clamped = torch.where(valid, slot,
+                                           adj_off[nn_idx])   # fallback to row start
+                nb_idx[:, k] = torch.where(valid, adj[slot_clamped], nn_idx)
+
+            p_nb  = points[nb_idx]                    # (B, max_deg, 3)
+            mu_nb = activated[nb_idx]                 # (B, max_deg)
+
+            diff_nb   = q.unsqueeze(1) - p_nb        # (B, max_deg, 3)
+            d_sq_nb   = (diff_nb ** 2).sum(-1)       # (B, max_deg)
+            w_nb      = 1.0 / (d_sq_nb + eps_sq.unsqueeze(1))  # (B, max_deg)
+
+            if use_bilateral:
+                dmu = mu_nb - mu_ref.unsqueeze(1)    # (B, max_deg)
+                w_nb = w_nb * torch.exp(-dmu ** 2 / sigma_v_sq)
+
+            # Mask padding (where k >= deg)
+            valid_mask = torch.arange(max_deg, device=device).unsqueeze(0) < deg.unsqueeze(1)
+            w_nb = w_nb * valid_mask.float()
+            mu_nb_contrib = (w_nb * mu_nb).sum(1)
+            w_nb_sum      = w_nb.sum(1)
+
+            w_sum = w_sum + w_nb_sum
+            mu_w  = mu_w + mu_nb_contrib
+
+        result[start:end] = torch.clamp(mu_w / w_sum.clamp(min=1e-7), min=0.0)
 
     return torch.nan_to_num(result).reshape(original_shape).cpu().numpy()
 
