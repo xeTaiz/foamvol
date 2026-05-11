@@ -2087,6 +2087,7 @@ __global__ void ct_bary_visualization(TraceSettings settings,
     float depth = 0.0f;
     bool depth_quantile_passed = false;
 
+    bool sliver_failed = false;
     uint32_t n = trace_tet(
         ray, points, tets, tet_adj, perm,
         start_tet, settings.max_intersections,
@@ -2230,7 +2231,8 @@ __global__ void ct_bary_visualization(TraceSettings settings,
                 transmittance = next_T;
             }
             return transmittance > settings.weight_threshold && t_1 < t_exit;
-        });
+        },
+        &sliver_failed);
 
     Vec3f out;
     switch (vis_settings.mode) {
@@ -2265,6 +2267,8 @@ __global__ void ct_bary_visualization(TraceSettings settings,
         out = Vec3f::Zero();
         break;
     }
+
+    if (sliver_failed) out = Vec3f(1.0f, 0.0f, 1.0f); // debug: unrecoverable sliver
 
     surf2Dwrite(make_rgba8(out[0], out[1], out[2], 1.0f),
                 output_surface, i * 4, j);
