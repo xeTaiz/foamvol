@@ -1,6 +1,5 @@
-# Boundary-alignment sweep — g100 adaptive thresh, ba_weight=PLACEHOLDER_A.
+# Boundary-alignment sweep — g100 adaptive thresh, ba_weight=1e-3.
 # Base: configs/gradmag_thresh_split/best428_thresh_100_split.yaml (densify_grad_thresh=100, max 1024K).
-# Replace boundary_align_weight once local ablation winners are known.
 
 # Training
 iterations: 10000
@@ -128,6 +127,6 @@ gradient_max_slope: 5.0
 gradient_freeze_points: 500
 
 # Boundary alignment regularizer
-boundary_align_weight: 1.0e-4   # PLACEHOLDER — replace with ablation winner A
+boundary_align_weight: 1e-3
 boundary_align_start: -1        # -1 = densify_from
 boundary_align_until: -1        # -1 = freeze_points; uses var_sigma_v_init/final
