@@ -2245,9 +2245,16 @@ def load_model_for_mesh(model_path, activation_scale=1.0, device="cuda"):
             if "duplicate" not in str(e):
                 raise
             import numpy as np
-            _, keep_idx = np.unique(pts.cpu().numpy(), axis=0, return_index=True)
-            keep_idx = torch.from_numpy(np.sort(keep_idx)).to(pts.device)
-            print(f"Removed {pts.shape[0] - len(keep_idx)} duplicate points before triangulation")
+            pts_np = pts.cpu().numpy()
+            sort_idx = np.lexsort(pts_np.T[::-1])
+            sorted_pts = pts_np[sort_idx]
+            dists = np.linalg.norm(np.diff(sorted_pts, axis=0), axis=1)
+            extent = float(np.abs(pts_np).max())
+            eps = max(1e-6, extent * 1e-5)
+            keep_in_sorted = np.concatenate([[True], dists > eps])
+            keep_idx = np.sort(sort_idx[keep_in_sorted])
+            keep_idx = torch.from_numpy(keep_idx).to(pts.device)
+            print(f"Removed {pts.shape[0] - len(keep_idx)} near-duplicate points (eps={eps:.2e}) before triangulation")
             pts = pts[keep_idx].contiguous()
             model.primal_points = torch.nn.Parameter(pts)
             model.density = torch.nn.Parameter(model.density.detach()[keep_idx])
