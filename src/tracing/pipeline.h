@@ -38,6 +38,7 @@ enum InterpolationMode {
     PerCell = 0,
     IDW = 1,
     BarycentricTet = 2,
+    LinearIDW = 3,
 };
 
 struct VisualizationSettings {
@@ -51,6 +52,8 @@ struct VisualizationSettings {
     float activation_beta;
     float activation_scale;
     bool use_transfer_function;
+    bool use_preintegrated_tf;
+    PreIntegratedTFTable preint_tf;
     float tf_density_min;
     float tf_density_max;
     float tf_opacity_scale;
@@ -87,6 +90,8 @@ inline VisualizationSettings default_visualization_settings() {
     settings.activation_beta = 10.0f;
     settings.activation_scale = 1.0f;
     settings.use_transfer_function = false;
+    settings.use_preintegrated_tf = false;
+    settings.preint_tf = {nullptr, 0};
     settings.tf_density_min = 0.0f;
     settings.tf_density_max = 1.0f;
     settings.tf_opacity_scale = 100.0f;

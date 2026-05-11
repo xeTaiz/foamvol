@@ -272,6 +272,100 @@ inline RADFOAM_HD uint32_t make_rgba8(float r, float g, float b, float a) {
     return (ai << 24) | (bi << 16) | (gi << 8) | ri;
 }
 
+// Evaluate linear-IDW (w = 1/(d²+eps²)) over the CSR neighbor set of the
+// containing cell.  eps² is scaled to 5% of the cell radius to prevent the
+// self-weight from dominating when the query lies near the Voronoi site.
+__device__ inline float eval_linear_idw(
+    const Vec3f &x_query,
+    uint32_t point_idx,
+    const Vec3f *__restrict__ points,
+    const float *__restrict__ activated,
+    const uint32_t *__restrict__ point_adjacency,
+    const uint32_t *__restrict__ point_adjacency_offsets,
+    const Vec4h *__restrict__ adjacent_diff,
+    const float *__restrict__ cell_radius,
+    bool use_bilateral,
+    float sigma_v_sq)
+{
+    float r_self  = cell_radius ? cell_radius[point_idx] : 1e-3f;
+    float eps_frac = 0.05f * r_self;
+    float eps_sq   = eps_frac * eps_frac;
+
+    float mu_ref  = activated[point_idx];
+    Vec3f diff_self = x_query - points[point_idx];
+    float w_self  = 1.0f / (diff_self.squaredNorm() + eps_sq);
+    float w_sum   = w_self;
+    float mu_w    = w_self * mu_ref;
+
+    uint32_t a0 = point_adjacency_offsets[point_idx];
+    uint32_t a1 = point_adjacency_offsets[point_idx + 1];
+    for (uint32_t j = a0; j < a1; ++j) {
+        uint32_t nb = point_adjacency[j];
+        float mu_nb = activated[nb];
+        Vec4h adj_h = adjacent_diff[j];
+        Vec3f offset(__half2float(adj_h[0]),
+                     __half2float(adj_h[1]),
+                     __half2float(adj_h[2]));
+        Vec3f diff_nb = diff_self - offset;
+        float w_nb = 1.0f / (diff_nb.squaredNorm() + eps_sq);
+        if (use_bilateral) {
+            float dmu = mu_nb - mu_ref;
+            w_nb *= expf(-dmu * dmu / sigma_v_sq);
+        }
+        w_sum += w_nb;
+        mu_w  += w_nb * mu_nb;
+    }
+    return fmaxf(0.0f, mu_w / fmaxf(w_sum, 1e-7f));
+}
+
+// Bilinear lookup into a pre-integrated TF table.
+// mu_in, mu_out are clamped to [mu_min, mu_max] before indexing.
+// The LUT was computed for a reference segment length of 1.0; for an actual
+// segment of length delta_t, opacity is scaled as Beer-Lambert:
+//   alpha_scaled = 1 - (1 - alpha_lut)^delta_t
+// RGB is scaled proportionally to preserve emitted-radiance-per-unit-opacity.
+__device__ inline void sample_preintegrated_tf(
+    float mu_in, float mu_out, float delta_t,
+    float mu_min, float mu_max,
+    const PreIntegratedTFTable &lut,
+    Vec3f &rgb_out, float &alpha_out)
+{
+    float range = mu_max - mu_min;
+    float u = (range > 1e-8f) ? (mu_in  - mu_min) / range : 0.0f;
+    float v = (range > 1e-8f) ? (mu_out - mu_min) / range : 0.0f;
+    u = fmaxf(0.0f, fminf(1.0f, u));
+    v = fmaxf(0.0f, fminf(1.0f, v));
+
+    int n  = lut.size;
+    float ui = u * (n - 1);
+    float vi = v * (n - 1);
+    int u0 = (int)ui, u1 = min(u0 + 1, n - 1);
+    int v0 = (int)vi, v1 = min(v0 + 1, n - 1);
+    float tu = ui - u0, tv = vi - v0;
+
+    const float *d = lut.data;
+    // LUT row = mu_in index, col = mu_out index; 4 floats (RGBA) per entry.
+    const float *c00 = d + (u0 * n + v0) * 4;
+    const float *c01 = d + (u0 * n + v1) * 4;
+    const float *c10 = d + (u1 * n + v0) * 4;
+    const float *c11 = d + (u1 * n + v1) * 4;
+    float w00 = (1.0f - tu) * (1.0f - tv);
+    float w01 = (1.0f - tu) * tv;
+    float w10 = tu * (1.0f - tv);
+    float w11 = tu * tv;
+
+    float r = c00[0]*w00 + c01[0]*w01 + c10[0]*w10 + c11[0]*w11;
+    float g = c00[1]*w00 + c01[1]*w01 + c10[1]*w10 + c11[1]*w11;
+    float b = c00[2]*w00 + c01[2]*w01 + c10[2]*w10 + c11[2]*w11;
+    float a = fmaxf(0.0f, fminf(1.0f, c00[3]*w00 + c01[3]*w01 + c10[3]*w10 + c11[3]*w11));
+
+    // Δt scaling: LUT was built for d_ref = 1.0.
+    float alpha_scaled = 1.0f - powf(fmaxf(1.0f - a, 1e-7f), delta_t);
+    float scale = alpha_scaled / fmaxf(a, 1e-6f);
+    rgb_out   = Vec3f(r * scale, g * scale, b * scale);
+    alpha_out = alpha_scaled;
+}
+
 inline __device__ void sample_transfer_function(
     float v, const TransferFunctionTable &tf_table,
     Vec3f &rgb_out, float &alpha_out)

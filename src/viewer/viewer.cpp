@@ -485,6 +485,12 @@ struct TransferFunctionState {
     int selected_point = -1;
     int dragging_point = -1;
 
+    // Pre-integrated TF: 256×256 RGBA table (row = mu_in index, col = mu_out index).
+    // Computed CPU-side and uploaded on demand; 1 MB on GPU.
+    static constexpr int PREINT_SIZE = 256;
+    std::vector<float> preint_texture; // CPU: PREINT_SIZE * PREINT_SIZE * 4 floats
+    CUdeviceptr preint_gpu_texture = 0;
+
     TransferFunctionState() {
         // Default: black/transparent at 0, white/opaque at 1
         control_points.push_back({0.0f, 0.0f, {0.0f, 0.0f, 0.0f}});
@@ -551,6 +557,82 @@ struct TransferFunctionState {
 
     radfoam::TransferFunctionTable get_table() const {
         return {reinterpret_cast<const float *>(gpu_texture), TF_TEXTURE_SIZE};
+    }
+
+    void init_preint_gpu() {
+        size_t sz = (size_t)PREINT_SIZE * PREINT_SIZE * 4 * sizeof(float);
+        cuda_check(cuMemAlloc_v2(&preint_gpu_texture, sz));
+    }
+
+    void cleanup_preint_gpu() {
+        if (preint_gpu_texture) {
+            cuMemFree_v2(preint_gpu_texture);
+            preint_gpu_texture = 0;
+        }
+    }
+
+    // Build the 256×256 pre-integrated TF from the current baked 1-D TF.
+    // Assumes baked_texture is up to date (call bake_and_upload first).
+    // mu_min, mu_max, opacity_scale mirror the viewer's TF density range/scale.
+    void recompute_preint(float mu_min, float mu_max, float opacity_scale) {
+        int n = PREINT_SIZE;
+        preint_texture.assign((size_t)n * n * 4, 0.0f);
+        int tf_n = TF_TEXTURE_SIZE;
+        constexpr int N_STEPS = 32;
+
+        for (int ri = 0; ri < n; ++ri) {
+            float mu_a = mu_min + (float)ri / (n - 1) * (mu_max - mu_min);
+            for (int ci = 0; ci < n; ++ci) {
+                float mu_b = mu_min + (float)ci / (n - 1) * (mu_max - mu_min);
+                float ds = 1.0f / N_STEPS;  // integrate over unit segment (d_ref = 1)
+
+                float T = 1.0f;
+                float r_int = 0.0f, g_int = 0.0f, b_int = 0.0f;
+
+                for (int s = 0; s < N_STEPS; ++s) {
+                    float frac = (s + 0.5f) / N_STEPS;
+                    float mu_s = mu_a + frac * (mu_b - mu_a);
+
+                    // Sample the 1-D baked TF (RGBA in [0,1] density range)
+                    float mu_range = mu_max - mu_min;
+                    float v = (mu_range > 1e-8f)
+                        ? std::max(0.0f, std::min((mu_s - mu_min) / mu_range, 1.0f))
+                        : 0.0f;
+                    float ti = v * (tf_n - 1);
+                    int t0 = (int)ti, t1 = std::min(t0 + 1, tf_n - 1);
+                    float tt = ti - t0;
+                    float r_s = baked_texture[t0*4+0]*(1-tt) + baked_texture[t1*4+0]*tt;
+                    float g_s = baked_texture[t0*4+1]*(1-tt) + baked_texture[t1*4+1]*tt;
+                    float b_s = baked_texture[t0*4+2]*(1-tt) + baked_texture[t1*4+2]*tt;
+                    float o_s = baked_texture[t0*4+3]*(1-tt) + baked_texture[t1*4+3]*tt;
+                    float sigma_s = o_s * opacity_scale;
+
+                    // Trapezoid: contribution = T * sigma * ds * rgb
+                    float contrib = T * sigma_s * ds;
+                    r_int += contrib * r_s;
+                    g_int += contrib * g_s;
+                    b_int += contrib * b_s;
+                    T *= std::exp(-sigma_s * ds);
+                }
+
+                float alpha_int = 1.0f - T;
+                float *out = preint_texture.data() + (ri * n + ci) * 4;
+                out[0] = r_int;
+                out[1] = g_int;
+                out[2] = b_int;
+                out[3] = alpha_int;
+            }
+        }
+
+        if (preint_gpu_texture) {
+            size_t sz = (size_t)n * n * 4 * sizeof(float);
+            cuda_check(cuMemcpyHtoD_v2(preint_gpu_texture,
+                                        preint_texture.data(), sz));
+        }
+    }
+
+    radfoam::PreIntegratedTFTable get_preint_table() const {
+        return {reinterpret_cast<const float *>(preint_gpu_texture), PREINT_SIZE};
     }
 };
 
@@ -714,6 +796,7 @@ struct ViewerPrivate : public Viewer {
 
         cmap_table = upload_cmap_data();
         tf_state.init_gpu();
+        tf_state.init_preint_gpu();
 
         num_points = 0;
         num_point_adjacency = 0;
@@ -788,6 +871,7 @@ struct ViewerPrivate : public Viewer {
     }
 
     ~ViewerPrivate() {
+        tf_state.cleanup_preint_gpu();
         tf_state.cleanup_gpu();
         if (vol_tex != 0) {
             cudaDestroyTextureObject(vol_tex);
@@ -1153,6 +1237,22 @@ struct ViewerPrivate : public Viewer {
             if (vis_settings.mode == VisualizationMode::VolumeDensity) {
                 ImGui::Checkbox("Use Transfer Function",
                                 &vis_settings.use_transfer_function);
+                if (vis_settings.use_transfer_function) {
+                    ImGui::SameLine();
+                    bool preint_changed = ImGui::Checkbox("Pre-integrated##tf",
+                                                          &vis_settings.use_preintegrated_tf);
+                    ImGui::SetItemTooltip("Pre-integrate TF over each segment to eliminate\n"
+                                          "banding with steep opacity windows. Works best\n"
+                                          "with Linear IDW interpolation.");
+                    if (preint_changed && vis_settings.use_preintegrated_tf) {
+                        tf_state.recompute_preint(vis_settings.tf_density_min,
+                                                  vis_settings.tf_density_max,
+                                                  vis_settings.tf_opacity_scale);
+                        vis_settings.preint_tf = tf_state.get_preint_table();
+                    }
+                    if (!vis_settings.use_transfer_function)
+                        vis_settings.use_preintegrated_tf = false;
+                }
 
                 ImGui::SeparatorText("Pre-smoothing");
                 ImGui::SliderInt("T (iters)##smooth", &vis_settings.smooth_T, 0, 10);
@@ -1171,8 +1271,9 @@ struct ViewerPrivate : public Viewer {
                     int imode = (int)vis_settings.interpolation_mode;
                     const char *interp_items[] = {"Per-cell constant",
                                                    "IDW",
-                                                   "Barycentric tet"};
-                    if (ImGui::Combo("Mode##interp", &imode, interp_items, 3))
+                                                   "Barycentric tet",
+                                                   "Linear IDW"};
+                    if (ImGui::Combo("Mode##interp", &imode, interp_items, 4))
                         vis_settings.interpolation_mode =
                             (InterpolationMode)imode;
                 }
@@ -1251,6 +1352,14 @@ struct ViewerPrivate : public Viewer {
                     ImGui::SliderFloat("sigma_v intra", &vis_settings.sigma_v_intra,
                                        0.0f, 1.0f, "%.3f");
                 }
+                if (vis_settings.interpolation_mode == InterpolationMode::LinearIDW) {
+                    ImGui::SliderFloat("sigma_v##linidw", &vis_settings.idw_sigma_v,
+                                       0.0f, 2.0f, "%.4f");
+                    ImGui::SameLine();
+                    if (ImGui::Button("Off##linidw"))
+                        vis_settings.idw_sigma_v = 0.0f;
+                    ImGui::SetItemTooltip("Bilateral value sigma (0 = no bilateral filtering)");
+                }
 
                 if (vis_settings.use_transfer_function) {
                     ImGui::SeparatorText("Phong Shading");
@@ -1275,17 +1384,24 @@ struct ViewerPrivate : public Viewer {
                     // Transfer function editor
                     ImGui::SeparatorText("Transfer Function");
 
-                    ImGui::SliderFloat("TF Density Min",
+                    bool tf_range_changed = false;
+                    tf_range_changed |= ImGui::SliderFloat("TF Density Min",
                                        &vis_settings.tf_density_min,
                                        0.0f, 10.0f, "%.3f");
-                    ImGui::SliderFloat("TF Density Max",
+                    tf_range_changed |= ImGui::SliderFloat("TF Density Max",
                                        &vis_settings.tf_density_max,
                                        0.0f, 10.0f, "%.3f");
-                    ImGui::SliderFloat("TF Opacity Scale",
+                    tf_range_changed |= ImGui::SliderFloat("TF Opacity Scale",
                                        &vis_settings.tf_opacity_scale,
                                        1.0f, 1000.0f, "%.1f",
                                        ImGuiSliderFlags_Logarithmic |
                                            ImGuiSliderFlags_NoRoundToFormat);
+                    if (tf_range_changed && vis_settings.use_preintegrated_tf) {
+                        tf_state.recompute_preint(vis_settings.tf_density_min,
+                                                  vis_settings.tf_density_max,
+                                                  vis_settings.tf_opacity_scale);
+                        vis_settings.preint_tf = tf_state.get_preint_table();
+                    }
                     ImGui::Checkbox("Histogram", &tf_histogram_show);
                     ImGui::SameLine();
                     ImGui::Checkbox("Log Y", &tf_histogram_log_y);
@@ -1498,9 +1614,15 @@ struct ViewerPrivate : public Viewer {
                             tf_state.dirty = true;
                     }
 
-                    // Rebake if dirty
+                    // Rebake if dirty; also recompute pre-int LUT if enabled
                     if (tf_state.dirty) {
                         tf_state.bake_and_upload();
+                        if (vis_settings.use_preintegrated_tf) {
+                            tf_state.recompute_preint(vis_settings.tf_density_min,
+                                                      vis_settings.tf_density_max,
+                                                      vis_settings.tf_opacity_scale);
+                            vis_settings.preint_tf = tf_state.get_preint_table();
+                        }
                     }
                 } else {
                     // Original colormap controls

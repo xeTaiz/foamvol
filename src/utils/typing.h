@@ -150,6 +150,16 @@ struct TransferFunctionTable {
     int size;           // number of entries (e.g. 256)
 };
 
+// 2D pre-integrated transfer function table.
+// LUT[i, j] stores the pre-integrated (RGBA) result for a segment whose density
+// varies linearly from mu_min + i/(size-1)*(mu_max-mu_min) to the j-axis value,
+// integrated over a reference segment length of 1.0 scene units.
+// At render time, scale opacity with Beer-Lambert: α = 1-(1-α_lut)^(Δt).
+struct PreIntegratedTFTable {
+    const float *data;   // GPU pointer to float[size * size * 4] (row-major: mu_in, then mu_out)
+    int size;            // number of entries per axis (e.g. 256)
+};
+
 template <typename T>
 RADFOAM_HD void swap(T &a, T &b) {
     typename std::decay<T>::type tmp = a;
