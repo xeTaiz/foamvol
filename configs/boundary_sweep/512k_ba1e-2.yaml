@@ -1,6 +1,5 @@
-# Boundary-alignment sweep — 256K fixed, ba_weight=PLACEHOLDER_A.
-# Base: configs/fixed_final/256k.yaml (variance pruning, prune_hops=1).
-# Replace boundary_align_weight once local ablation winners are known.
+# Boundary-alignment sweep — 512K fixed, ba_weight=1e-2.
+# Base: configs/fixed_final/512k.yaml (variance pruning, prune_hops=1).
 
 # Training
 iterations: 10000
@@ -8,7 +7,7 @@ rays_per_batch: 1_000_000
 rays_per_batch_late: 4_000_000
 rays_per_batch_late_start: 9000
 init_points: 64000
-final_points: 256000
+final_points: 512000
 activation_scale: 1.0
 init_scale: 1.05
 init_type: random
@@ -127,6 +126,6 @@ gradient_max_slope: 5.0
 gradient_freeze_points: 500
 
 # Boundary alignment regularizer
-boundary_align_weight: 1.0e-4   # PLACEHOLDER — replace with ablation winner A
+boundary_align_weight: 1e-2
 boundary_align_start: -1        # -1 = densify_from
 boundary_align_until: -1        # -1 = freeze_points; uses var_sigma_v_init/final
