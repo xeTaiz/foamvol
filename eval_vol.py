@@ -273,6 +273,8 @@ def main():
     p.add_argument("--gt-name",   default="vol_gt.npy")
     p.add_argument("--cpu", action="store_true", help="Force CPU (default: CUDA if available)")
     p.add_argument("--save", action="store_true", help="Write metrics.txt next to each pred file")
+    p.add_argument("--skip-existing", action="store_true",
+                   help="Skip folders where vol_metrics.txt already exists")
     args = p.parse_args()
 
     if args.scan and args.files:
@@ -291,11 +293,14 @@ def main():
             sys.exit(1)
         print(f"Found {len(pairs)} pair(s) under {args.scan}")
         for pred_path, gt_path, folder in pairs:
+            out = os.path.join(folder, "vol_metrics.txt")
+            if args.skip_existing and os.path.exists(out):
+                print(f"\n[{folder}] skipped (vol_metrics.txt exists)")
+                continue
             print(f"\n[{folder}]")
             r = evaluate(pred_path, gt_path, device=device)
             print_results(folder, r)
             if args.save and r is not None:
-                out = os.path.join(folder, "vol_metrics.txt")
                 save_results(out, folder, r)
     else:
         if len(args.files) != 2:
