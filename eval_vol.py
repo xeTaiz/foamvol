@@ -291,6 +291,8 @@ def main():
             print(f"No folders found under {args.scan} containing both "
                   f"{args.pred_name} and {args.gt_name}")
             sys.exit(1)
+        import random
+        random.shuffle(pairs)
         print(f"Found {len(pairs)} pair(s) under {args.scan}")
         for pred_path, gt_path, folder in pairs:
             out = os.path.join(folder, "vol_metrics.txt")
