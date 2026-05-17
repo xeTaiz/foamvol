@@ -265,16 +265,20 @@ def find_pairs(root, pred_name, gt_name):
 
 def main():
     p = argparse.ArgumentParser(description="Evaluate vol_pred.npy vs vol_gt.npy")
-    grp = p.add_mutually_exclusive_group(required=True)
-    grp.add_argument("files", nargs="*", metavar="FILE",
-                     help="vol_pred.npy vol_gt.npy (positional pair)")
-    grp.add_argument("--scan", metavar="DIR",
-                     help="Recursively scan DIR for matching file pairs")
+    p.add_argument("files", nargs="*", metavar="FILE",
+                   help="vol_pred.npy vol_gt.npy (positional pair)")
+    p.add_argument("--scan", metavar="DIR",
+                   help="Recursively scan DIR for matching file pairs")
     p.add_argument("--pred-name", default="vol_pred.npy")
     p.add_argument("--gt-name",   default="vol_gt.npy")
     p.add_argument("--cpu", action="store_true", help="Force CPU (default: CUDA if available)")
     p.add_argument("--save", action="store_true", help="Write metrics.txt next to each pred file")
     args = p.parse_args()
+
+    if args.scan and args.files:
+        p.error("Use either positional files or --scan, not both")
+    if not args.scan and not args.files:
+        p.error("Provide either two positional files or --scan DIR")
 
     device = "cpu" if args.cpu or not torch.cuda.is_available() else "cuda"
     print(f"device: {device}")
