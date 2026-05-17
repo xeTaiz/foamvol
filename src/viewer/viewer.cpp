@@ -1037,7 +1037,7 @@ struct ViewerPrivate : public Viewer {
                 // Left drag: orbit rotation
                 if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT)) {
                     orbit_yaw   -= 0.005f * (float)delta_x;
-                    orbit_pitch += 0.005f * (float)delta_y;
+                    orbit_pitch -= 0.005f * (float)delta_y;
                     orbit_pitch = std::clamp(orbit_pitch, -1.5f, 1.5f);
                 }
 
