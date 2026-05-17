@@ -5,6 +5,21 @@
 
 namespace radfoam {
 
+__device__ __forceinline__ uint32_t wang_hash(uint32_t k) {
+    k = (k ^ 61u) ^ (k >> 16);
+    k *= 9u;
+    k = k ^ (k >> 4);
+    k *= 0x27d4eb2du;
+    k = k ^ (k >> 15);
+    return k;
+}
+
+// Advance a hash state and return a float in [0, 1).
+__device__ __forceinline__ float hash01(uint32_t &state) {
+    state = wang_hash(state);
+    return static_cast<float>(state) * (1.0f / 4294967296.0f);
+}
+
 template <int block_size, int chunk_size, typename CellFunctor>
 __forceinline__ __device__ uint32_t
 trace(const Ray &ray,
@@ -350,6 +365,89 @@ __device__ inline float eval_linear_idw(
         mu_w  += w_nb * mu_nb;
     }
     return fmaxf(0.0f, mu_w / fmaxf(w_sum, 1e-7f));
+}
+
+// Monte-Carlo Sibson natural-neighbor interpolation.
+//
+// For each of k_samples random points drawn uniformly in a ball of radius
+// (radius_scale * cell_radius[point_idx]) around x_query, we test whether
+// x_query (as a "virtual inserted cell") would own that sample — i.e. whether
+// x_query is closer to the sample than any existing Voronoi site in the 1-hop
+// candidate set.  The fraction of samples stolen from each neighbor determines
+// the Sibson weight.
+//
+// seed = wang_hash(pixel_idx) ^ wang_hash(point_idx).  Using point_idx rather
+// than a per-step counter avoids relying on functor-invocation order inside
+// trace<>.  Crucially, the *same* seed is passed for all three eval positions
+// (entry/mid/exit) in one pre-integrated-TF segment, so (mu_in, mu_out) are
+// correlated — the LUT lookup stays smooth without high K.
+__device__ inline float eval_sibson(
+    const Vec3f &x_query,
+    uint32_t point_idx,
+    const Vec3f *__restrict__ points,
+    const float *__restrict__ activated,
+    const uint32_t *__restrict__ point_adjacency,
+    const uint32_t *__restrict__ point_adjacency_offsets,
+    const Vec4h *__restrict__ adjacent_diff,
+    const float *__restrict__ cell_radius,
+    uint32_t seed,
+    uint32_t k_samples,
+    float radius_scale,
+    bool use_bilateral,
+    float sigma_v_sq)
+{
+    float R = radius_scale * cell_radius[point_idx];
+    float mu_ref = activated[point_idx];
+    Vec3f diff_self = x_query - points[point_idx];
+
+    float mu_w = 0.0f, w_sum = 0.0f;
+
+    for (uint32_t s = 0; s < k_samples; ++s) {
+        uint32_t h = wang_hash(seed ^ wang_hash(s));
+
+        // Uniform direction on sphere (via cos_theta, phi)
+        float cos_t = 2.0f * hash01(h) - 1.0f;
+        float sin_t = sqrtf(fmaxf(0.0f, 1.0f - cos_t * cos_t));
+        float phi   = 6.2831853f * hash01(h);
+        Vec3f dir(sin_t * cosf(phi), sin_t * sinf(phi), cos_t);
+
+        // Uniform in ball via cube-root radial CDF
+        float r      = R * cbrtf(fmaxf(hash01(h), 1e-7f));
+        Vec3f xs_off = dir * r;  // offset from x_query to sample
+
+        // Distance from sample to self
+        Vec3f from_self = xs_off + diff_self;  // x_s - p_i
+        float best_d2   = from_self.squaredNorm();
+        float best_mu   = mu_ref;
+
+        // Stream 1-hop neighbors: find argmin distance candidate
+        uint32_t a0 = point_adjacency_offsets[point_idx];
+        uint32_t a1 = point_adjacency_offsets[point_idx + 1];
+        for (uint32_t j = a0; j < a1; ++j) {
+            Vec4h adj_h = adjacent_diff[j];
+            Vec3f offset(__half2float(adj_h[0]),
+                         __half2float(adj_h[1]),
+                         __half2float(adj_h[2]));
+            Vec3f from_nb = from_self - offset;  // x_s - p_j
+            float d2_nb   = from_nb.squaredNorm();
+            if (d2_nb < best_d2) {
+                best_d2 = d2_nb;
+                best_mu = activated[point_adjacency[j]];
+            }
+        }
+
+        // "Stolen by Q": x_query is closer to x_s than any Voronoi site
+        float d_q2 = xs_off.squaredNorm();
+        if (d_q2 < best_d2) {
+            float w = use_bilateral
+                ? expf(-(best_mu - mu_ref) * (best_mu - mu_ref) / sigma_v_sq)
+                : 1.0f;
+            mu_w  += w * best_mu;
+            w_sum += w;
+        }
+    }
+
+    return (w_sum > 0.0f) ? fmaxf(0.0f, mu_w / w_sum) : mu_ref;
 }
 
 // Bilinear lookup into a pre-integrated TF table.

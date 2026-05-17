@@ -1070,15 +1070,6 @@ void prefetch_adjacent_diff(const Vec3f *points,
                           adjacent_diff);
 }
 
-__device__ __forceinline__ uint32_t wang_hash(uint32_t k) {
-    k = (k ^ 61u) ^ (k >> 16);
-    k *= 9u;
-    k = k ^ (k >> 4);
-    k *= 0x27d4eb2du;
-    k = k ^ (k >> 15);
-    return k;
-}
-
 __device__ __forceinline__ Vec3f rotate_yx(const Vec3f &v, float a, float b) {
     float ca = cosf(a), sa = sinf(a);
     float cb = cosf(b), sb = sinf(b);
@@ -1639,7 +1630,254 @@ __global__ void ct_visualization_linear_idw(
                 depth = tc_0;
             }
         }
-        color += transmittance * alpha * rgb;
+        // Pre-integrated TF returns premultiplied rgb (rgb already contains alpha).
+        // All other paths return plain rgb and need the alpha factor here.
+        if (use_preint && use_tf)
+            color += transmittance * rgb;
+        else
+            color += transmittance * alpha * rgb;
+        transmittance = next_transmittance;
+        return transmittance > settings.weight_threshold && t_1 < t_exit;
+    };
+
+    uint32_t n = trace<128, 4>(ray,
+                               points,
+                               point_adjacency,
+                               point_adjacency_offsets,
+                               adjacent_diff,
+                               start_index,
+                               settings.max_intersections,
+                               functor);
+
+    Vec3f out;
+    switch (vis_settings.mode) {
+    case VolumeDensity:
+    case RGB: {
+        Vec3f bg = *vis_settings.bg_color;
+        if (vis_settings.checker_bg) {
+            int ci = i / 16;
+            int cj = j / 16;
+            if ((ci + cj) % 2 == 0) {
+                bg = Vec3f(0.8f, 0.8f, 0.8f);
+            } else {
+                bg = Vec3f(0.6f, 0.6f, 0.6f);
+            }
+        }
+        out = color + transmittance * bg;
+        break;
+    }
+    case Depth: {
+        float val = depth / vis_settings.max_depth;
+        val = fminf(fmaxf(val, 0.0f), 1.0f);
+        out = colormap(val, cmap, cmap_table);
+        break;
+    }
+    case Alpha: {
+        float opacity = 1.0f - transmittance;
+        out = Vec3f(opacity, opacity, opacity);
+        break;
+    }
+    case Intersections: {
+        float val = (n > 1) ? float(n - 1) / float(settings.max_intersections) : 0.0f;
+        val = fminf(fmaxf(val, 0.0f), 1.0f);
+        out = colormap(val, cmap, cmap_table);
+        break;
+    }
+    default:
+        out = Vec3f::Zero();
+        break;
+    }
+
+    uint32_t rgba = make_rgba8(out[0], out[1], out[2], 1.0f);
+    surf2Dwrite(rgba, output_surface, i * 4, j);
+}
+
+// ---------------------------------------------------------------------------
+// Sibson natural-neighbor interpolation render kernel
+// ---------------------------------------------------------------------------
+
+__global__ void ct_visualization_sibson(
+        TraceSettings settings,
+        VisualizationSettings vis_settings,
+        Camera camera,
+        CMapTable cmap_table,
+        TransferFunctionTable tf_table,
+        const Vec3f *__restrict__ points,
+        const float *__restrict__ activated,
+        const uint32_t *__restrict__ point_adjacency,
+        const uint32_t *__restrict__ point_adjacency_offsets,
+        const Vec4h *__restrict__ adjacent_diff,
+        const float *__restrict__ cell_radius,
+        const float *__restrict__ ao_directions,
+        uint32_t start_index,
+        CUsurfObject output_surface) {
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= camera.width || j >= camera.height)
+        return;
+
+    Ray ray = cast_ray(camera, i, j);
+    ray.direction /= ray.direction.norm();
+
+    const Vec3f s_min = *vis_settings.slice_min;
+    const Vec3f s_max = *vis_settings.slice_max;
+    float aabb_t_enter = -1e38f, aabb_t_exit = 1e38f;
+#pragma unroll
+    for (int ax = 0; ax < 3; ++ax) {
+        float dir = ray.direction[ax];
+        float inv_d = 1.0f / (fabsf(dir) > 1e-20f ? dir : copysignf(1e-20f, dir));
+        float t1 = (s_min[ax] - ray.origin[ax]) * inv_d;
+        float t2 = (s_max[ax] - ray.origin[ax]) * inv_d;
+        aabb_t_enter = fmaxf(aabb_t_enter, fminf(t1, t2));
+        aabb_t_exit  = fminf(aabb_t_exit,  fmaxf(t1, t2));
+    }
+    const float t_enter = fmaxf(aabb_t_enter, 0.0f);
+    const float t_exit  = aabb_t_exit;
+
+    float den_scale      = vis_settings.density_scale;
+    ColorMap cmap        = vis_settings.color_map;
+    float depth_quantile = vis_settings.depth_quantile;
+
+    Vec3f color = Vec3f::Zero();
+    float transmittance = 1.0f;
+    float depth = 0.0f;
+    bool depth_quantile_passed = false;
+
+    bool  use_tf          = vis_settings.use_transfer_function;
+    float tf_density_min  = vis_settings.tf_density_min;
+    float tf_density_max  = vis_settings.tf_density_max;
+    float tf_opacity_scale = vis_settings.tf_opacity_scale;
+
+    bool  use_bilateral   = vis_settings.sibson_sigma_v > 0.0f;
+    float sigma_v_sq      = vis_settings.sibson_sigma_v * vis_settings.sibson_sigma_v;
+    bool  use_preint      = vis_settings.use_preintegrated_tf
+                            && vis_settings.preint_tf.data != nullptr;
+    uint32_t k_samples    = vis_settings.sibson_k_samples;
+    float radius_scale    = vis_settings.sibson_radius_scale;
+
+    // Per-pixel seed component mixed with point_idx per-segment inside the functor.
+    uint32_t pixel_seed = wang_hash((uint32_t)j * (uint32_t)camera.width + (uint32_t)i);
+
+    auto functor = [&](uint32_t point_idx,
+                       float t_0,
+                       float t_1,
+                       const Vec3f &current_point,
+                       const Vec3f & /*next_point*/) {
+        float tc_0 = fmaxf(t_0, t_enter);
+        float tc_1 = fminf(t_1, t_exit);
+        if (tc_0 >= tc_1)
+            return t_1 < t_exit;
+        float delta_t = tc_1 - tc_0;
+        float t_mid   = 0.5f * (tc_0 + tc_1);
+        Vec3f x_mid   = ray.origin + t_mid * ray.direction;
+
+        // Seed shared across all three eval positions in this segment so
+        // (mu_in, mu_out) are correlated → pre-integrated TF stays smooth.
+        uint32_t seg_seed = pixel_seed ^ wang_hash(point_idx);
+
+        float mu = eval_sibson(x_mid, point_idx, points, activated,
+                               point_adjacency, point_adjacency_offsets,
+                               adjacent_diff, cell_radius,
+                               seg_seed, k_samples, radius_scale,
+                               use_bilateral, sigma_v_sq);
+
+        Vec3f rgb;
+        float alpha;
+
+        if (use_tf) {
+            if (use_preint) {
+                Vec3f x_entry = ray.origin + tc_0 * ray.direction;
+                Vec3f x_exit  = ray.origin + tc_1 * ray.direction;
+                float mu_in  = eval_sibson(x_entry, point_idx, points, activated,
+                                           point_adjacency, point_adjacency_offsets,
+                                           adjacent_diff, cell_radius,
+                                           seg_seed, k_samples, radius_scale,
+                                           use_bilateral, sigma_v_sq);
+                float mu_out = eval_sibson(x_exit, point_idx, points, activated,
+                                           point_adjacency, point_adjacency_offsets,
+                                           adjacent_diff, cell_radius,
+                                           seg_seed, k_samples, radius_scale,
+                                           use_bilateral, sigma_v_sq);
+                sample_preintegrated_tf(mu_in, mu_out, delta_t,
+                                        tf_density_min, tf_density_max,
+                                        vis_settings.preint_tf, rgb, alpha);
+            } else {
+                float range = tf_density_max - tf_density_min;
+                float v = (range > 1e-8f)
+                    ? fmaxf(0.0f, fminf((mu - tf_density_min) / range, 1.0f))
+                    : 0.0f;
+                float tf_opacity;
+                sample_transfer_function(v, tf_table, rgb, tf_opacity);
+                alpha = 1.0f - expf(-tf_opacity * tf_opacity_scale * delta_t);
+            }
+
+            if (vis_settings.phong_enabled) {
+                Vec3f grad = Vec3f::Zero();
+                float mu_self = activated[point_idx];
+                uint32_t ga0 = point_adjacency_offsets[point_idx];
+                uint32_t ga1 = point_adjacency_offsets[point_idx + 1];
+                for (uint32_t k = ga0; k < ga1; ++k) {
+                    Vec4h adj_h = adjacent_diff[k];
+                    Vec3f offset(__half2float(adj_h[0]),
+                                 __half2float(adj_h[1]),
+                                 __half2float(adj_h[2]));
+                    float r2 = offset.squaredNorm();
+                    if (r2 > 1e-12f) {
+                        float dmu = activated[point_adjacency[k]] - mu_self;
+                        grad += dmu * offset / r2;
+                    }
+                }
+                float gn = grad.norm();
+                float lighting = vis_settings.phong_ambient;
+                if (gn > 1e-6f) {
+                    const Vec3f light_dir = Vec3f(1.0f, 1.0f, 1.0f) / sqrtf(3.0f);
+                    Vec3f N = -grad / gn;
+                    float NdotL = fmaxf(N.dot(light_dir), 0.0f);
+                    Vec3f V = -ray.direction;
+                    Vec3f H = (light_dir + V).normalized();
+                    float NdotH = fmaxf(N.dot(H), 0.0f);
+                    float spec = (NdotL > 0.0f)
+                                     ? powf(NdotH, vis_settings.phong_shininess)
+                                     : 0.0f;
+                    lighting += vis_settings.phong_diffuse * NdotL
+                              + vis_settings.phong_specular * spec;
+                }
+                rgb = rgb * lighting;
+            }
+        } else {
+            float v = fminf(mu * den_scale, 1.0f);
+            rgb = colormap(v, cmap, cmap_table);
+            alpha = 1.0f - expf(-mu * delta_t);
+        }
+
+        if (vis_settings.ao_enabled && alpha > 1e-2f && ao_directions != nullptr) {
+            Vec3f x_sample = ray.origin + t_mid * ray.direction;
+            float ao = compute_ao(point_idx, x_sample,
+                                  points, activated, point_adjacency,
+                                  point_adjacency_offsets, adjacent_diff,
+                                  ao_directions, vis_settings.ao_num_dirs,
+                                  vis_settings.ao_max_distance,
+                                  use_tf, tf_density_min, tf_density_max,
+                                  tf_opacity_scale, tf_table);
+            rgb = rgb * (1.0f - vis_settings.ao_strength + vis_settings.ao_strength * ao);
+        }
+
+        float next_transmittance = transmittance * (1.0f - alpha);
+        if (!depth_quantile_passed && next_transmittance < depth_quantile) {
+            depth_quantile_passed = true;
+            if (mu > 1e-6f) {
+                depth = tc_0 + logf(transmittance / depth_quantile) / mu;
+            } else {
+                depth = tc_0;
+            }
+        }
+        // Pre-integrated TF returns premultiplied rgb (rgb already contains alpha).
+        // All other paths return plain rgb and need the alpha factor here.
+        if (use_preint && use_tf)
+            color += transmittance * rgb;
+        else
+            color += transmittance * alpha * rgb;
         transmittance = next_transmittance;
         return transmittance > settings.weight_threshold && t_1 < t_exit;
     };
@@ -2580,7 +2818,24 @@ class CUDADensityPipeline : public Pipeline {
                   (camera.height + block.y - 1) / block.y);
 
         // Step 3: dispatch renderer based on interpolation mode
-        if (vis_settings.interpolation_mode == InterpolationMode::LinearIDW) {
+        if (vis_settings.interpolation_mode == InterpolationMode::Sibson
+            && cell_radius != nullptr) {
+            ct_visualization_sibson<<<grid, block, 0, cu_stream>>>(
+                settings,
+                vis_settings,
+                camera,
+                cmap_table,
+                tf_table,
+                reinterpret_cast<const Vec3f *>(points),
+                activated,
+                reinterpret_cast<const uint32_t *>(point_adjacency),
+                reinterpret_cast<const uint32_t *>(point_adjacency_offsets),
+                reinterpret_cast<const Vec4h *>(adjacent_points),
+                cell_radius,
+                ao_directions,
+                start_index,
+                static_cast<CUsurfObject>(output_surface));
+        } else if (vis_settings.interpolation_mode == InterpolationMode::LinearIDW) {
             ct_visualization_linear_idw<<<grid, block, 0, cu_stream>>>(
                 settings,
                 vis_settings,

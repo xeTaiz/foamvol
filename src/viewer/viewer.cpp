@@ -1272,8 +1272,9 @@ struct ViewerPrivate : public Viewer {
                     const char *interp_items[] = {"Per-cell constant",
                                                    "IDW",
                                                    "Barycentric tet",
-                                                   "Linear IDW"};
-                    if (ImGui::Combo("Mode##interp", &imode, interp_items, 4))
+                                                   "Linear IDW",
+                                                   "Sibson NN"};
+                    if (ImGui::Combo("Mode##interp", &imode, interp_items, 5))
                         vis_settings.interpolation_mode =
                             (InterpolationMode)imode;
                 }
@@ -1358,6 +1359,25 @@ struct ViewerPrivate : public Viewer {
                     ImGui::SameLine();
                     if (ImGui::Button("Off##linidw"))
                         vis_settings.idw_sigma_v = 0.0f;
+                    ImGui::SetItemTooltip("Bilateral value sigma (0 = no bilateral filtering)");
+                }
+                if (vis_settings.interpolation_mode == InterpolationMode::Sibson) {
+                    int k_int = (int)vis_settings.sibson_k_samples;
+                    if (ImGui::SliderInt("K samples##sibson", &k_int, 4, 64))
+                        vis_settings.sibson_k_samples = (uint32_t)k_int;
+                    ImGui::SetItemTooltip(
+                        "Monte-Carlo samples per query — higher = smoother but slower "
+                        "(pre-integrated TF evaluates 3x per segment)");
+                    ImGui::SliderFloat("radius scale##sibson",
+                                       &vis_settings.sibson_radius_scale,
+                                       0.5f, 3.0f, "%.2f");
+                    ImGui::SetItemTooltip(
+                        "Sampling ball radius as a multiple of the cell radius");
+                    ImGui::SliderFloat("sigma_v##sibson", &vis_settings.sibson_sigma_v,
+                                       0.0f, 2.0f, "%.4f");
+                    ImGui::SameLine();
+                    if (ImGui::Button("Off##sibson"))
+                        vis_settings.sibson_sigma_v = 0.0f;
                     ImGui::SetItemTooltip("Bilateral value sigma (0 = no bilateral filtering)");
                 }
 

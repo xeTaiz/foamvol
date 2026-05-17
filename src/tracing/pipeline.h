@@ -39,6 +39,7 @@ enum InterpolationMode {
     IDW = 1,
     BarycentricTet = 2,
     LinearIDW = 3,
+    Sibson = 4,
 };
 
 struct VisualizationSettings {
@@ -61,6 +62,9 @@ struct VisualizationSettings {
     float idw_sigma;
     float idw_sigma_v;
     float sigma_v_intra;
+    uint32_t sibson_k_samples;
+    float sibson_radius_scale;
+    float sibson_sigma_v;
     int smooth_T;
     float smooth_alpha;
     float smooth_sigma_v;
@@ -99,6 +103,9 @@ inline VisualizationSettings default_visualization_settings() {
     settings.idw_sigma = 0.01f;
     settings.idw_sigma_v = 0.05f;
     settings.sigma_v_intra = 0.0f;
+    settings.sibson_k_samples = 16;
+    settings.sibson_radius_scale = 1.5f;
+    settings.sibson_sigma_v = 0.0f;
     settings.smooth_T = 0;
     settings.smooth_alpha = 1.0f;
     settings.smooth_sigma_v = 0.3f;
