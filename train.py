@@ -798,6 +798,51 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                                    preserve_range=True).astype(np.float32)
                 error_vol = np.abs(raw_vol - gt_vol_ds)
 
+                # Spatial correlations: per-cell field vs 3D reconstruction error
+                if getattr(pipeline_args, 'corr_diag', True):
+                    from scipy.stats import pearsonr, spearmanr as _spearmanr
+                    err_flat = error_vol.ravel().astype(np.float32)
+                    err_base_mask = np.isfinite(err_flat) & (err_flat >= 0)
+                    writer.add_scalar("corr/error_vol_mean", float(err_flat.mean()), step)
+                    writer.add_scalar("corr/error_vol_p95",
+                                      float(np.percentile(err_flat, 95)), step)
+
+                    def _log_corr(name, field_tensor):
+                        try:
+                            fv = model.voxelize_per_cell_field(
+                                field_tensor, resolution=128, extent=1.0
+                            ).numpy().ravel()
+                            mask = err_base_mask & np.isfinite(fv)
+                            if mask.sum() < 200:
+                                return
+                            a, b = err_flat[mask], fv[mask]
+                            pcc = float(np.corrcoef(a, b)[0, 1])
+                            scc = float(_spearmanr(a, b).statistic)
+                            writer.add_scalar(f"corr/{name}_pearson",  pcc, step)
+                            writer.add_scalar(f"corr/{name}_spearman", scc, step)
+                        except Exception:
+                            pass
+
+                    with torch.no_grad():
+                        _log_corr("mu", model.get_primal_density().squeeze().detach())
+                        _log_corr("cell_radius", model._cached_cell_radius)
+                        if hasattr(model, '_starvation_count'):
+                            _log_corr("starvation",
+                                      model._starvation_count.float())
+                        if model.density.grad is not None:
+                            _log_corr("density_grad_norm",
+                                      model.density.grad.squeeze().abs())
+                        if hasattr(model, '_last_M_trace'):
+                            _log_corr("M_trace", model._last_M_trace)
+                        if hasattr(model, '_last_normal_lap_residual'):
+                            _log_corr("normal_lap_residual",
+                                      model._last_normal_lap_residual)
+                        if hasattr(model, '_last_cvt_residual'):
+                            _log_corr("cvt_residual", model._last_cvt_residual)
+                        _log_corr("neighbor_var",
+                                  model.compute_neighborhood_variance(
+                                      cell_radius=model._cached_cell_radius, hops=1))
+
                 import matplotlib
                 matplotlib.use("Agg")
                 import matplotlib.pyplot as plt
@@ -1029,20 +1074,44 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     )
                     loss = loss + nvar_w * neighbor_var_loss
 
-                ba_w = getattr(optimizer_args, 'boundary_align_weight', 0.0)
-                boundary_align_loss = None
-                if ba_w > 0:
-                    ba_start = getattr(optimizer_args, 'boundary_align_start', -1)
-                    ba_until = getattr(optimizer_args, 'boundary_align_until', -1)
-                    if ba_start < 0:
-                        ba_start = pipeline_args.densify_from
-                    if ba_until < 0:
-                        ba_until = optimizer_args.freeze_points
-                    if ba_start <= i < ba_until:
-                        boundary_align_loss = model.boundary_alignment_regularization(
+                top_eig_w    = getattr(optimizer_args, 'top_eig_align_weight', 0.0)
+                top_eig_loss = None
+                if top_eig_w > 0:
+                    _s = getattr(optimizer_args, 'top_eig_align_start', -1)
+                    _u = getattr(optimizer_args, 'top_eig_align_until', -1)
+                    if _s < 0: _s = pipeline_args.densify_from
+                    if _u < 0: _u = optimizer_args.freeze_points
+                    if _s <= i < _u:
+                        top_eig_loss = model.top_eigvec_alignment_regularization(
                             sigma_v=var_sigma_v,
                         )
-                        loss = loss + ba_w * boundary_align_loss
+                        loss = loss + top_eig_w * top_eig_loss
+
+                normal_lap_w    = getattr(optimizer_args, 'normal_lap_weight', 0.0)
+                normal_lap_loss = None
+                if normal_lap_w > 0:
+                    _s = getattr(optimizer_args, 'normal_lap_start', -1)
+                    _u = getattr(optimizer_args, 'normal_lap_until', -1)
+                    if _s < 0: _s = pipeline_args.densify_from
+                    if _u < 0: _u = optimizer_args.freeze_points
+                    if _s <= i < _u:
+                        normal_lap_loss = model.normal_laplacian_regularization(
+                            sigma_v=var_sigma_v,
+                        )
+                        loss = loss + normal_lap_w * normal_lap_loss
+
+                cvt_w    = getattr(optimizer_args, 'cvt_weight', 0.0)
+                cvt_loss = None
+                if cvt_w > 0:
+                    _s = getattr(optimizer_args, 'cvt_start', -1)
+                    _u = getattr(optimizer_args, 'cvt_until', -1)
+                    if _s < 0: _s = pipeline_args.densify_from
+                    if _u < 0: _u = optimizer_args.freeze_points
+                    if _s <= i < _u:
+                        cvt_loss = model.cvt_regularization(
+                            hops=getattr(optimizer_args, 'cvt_hops', 1),
+                        )
+                        loss = loss + cvt_w * cvt_loss
 
                 rv_w_cfg = getattr(optimizer_args, "ref_volume_weight", 0.0)
                 rv_start = getattr(optimizer_args, "ref_volume_start", 0)
@@ -1161,9 +1230,15 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     if optimizer_args.neighbor_var_weight > 0 and i >= optimizer_args.neighbor_var_start:
                         writer.add_scalar("train/neighbor_var_loss", neighbor_var_loss.item(), i)
                         writer.add_scalar("train/neighbor_var_weight", nvar_w, i)
-                    if boundary_align_loss is not None:
-                        writer.add_scalar("train/boundary_align_loss", boundary_align_loss.item(), i)
-                        writer.add_scalar("train/boundary_align_weight", ba_w, i)
+                    if top_eig_loss is not None:
+                        writer.add_scalar("train/top_eig_align_loss", top_eig_loss.item(), i)
+                        writer.add_scalar("train/top_eig_align_weight", top_eig_w, i)
+                    if normal_lap_loss is not None:
+                        writer.add_scalar("train/normal_lap_loss", normal_lap_loss.item(), i)
+                        writer.add_scalar("train/normal_lap_weight", normal_lap_w, i)
+                    if cvt_loss is not None:
+                        writer.add_scalar("train/cvt_loss", cvt_loss.item(), i)
+                        writer.add_scalar("train/cvt_weight", cvt_w, i)
                     _rv_until = getattr(optimizer_args, "ref_volume_until", -1)
                     if (getattr(optimizer_args, "ref_volume_weight", 0.0) > 0
                             and hasattr(model, "_ref_volume")

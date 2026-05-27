@@ -93,6 +93,7 @@ class PipelineParams(ParamGroup):
         self.log_percent = 5          # log metrics every N% of iterations
         self.diag_percent = 10        # log diagnostics/slices every N% of iterations
         self.diag = False             # enable mid-training diag logs (always logs once after training)
+        self.corr_diag = True         # log per-cell field vs 3D-error spatial correlations at diag cadence
         # Volume-supervised training (train_vol.py)
         self.n_query_per_step = 1_000_000      # random query points per training step
         self.n_query_error_map = 4_000_000     # random points for densification error-map pass
@@ -100,6 +101,10 @@ class PipelineParams(ParamGroup):
         self.volume_loss_type = "l1"           # l1, l2, or charbonnier
         self.volume_sampling_extent = 1.0      # half-extent of [-extent, +extent]^3 sampling box
         self.gt_volume_path = ""               # override GT path (empty = derived from dataset)
+        self.volume_interp_mode = "idw"        # volume-supervised interp: idw | tet | sibson
+        self.sibson_k_samples = 64             # Monte Carlo samples per query (sibson mode)
+        self.sibson_sample_radius_scale = 1.5  # ball radius as multiple of cell_radius (sibson)
+        self.sibson_temperature = 0.01         # sigmoid temperature for soft-stolen relaxation
         super().__init__(parser, "Setting Pipeline parameters")
 
 
@@ -153,9 +158,16 @@ class OptimizationParams(ParamGroup):
         self.neighbor_var_hops = 1         # k-hop neighborhood depth
         self.neighbor_var_start = 0
         self.neighbor_reg_type = "bilateral_var"
-        self.boundary_align_weight = 0.0   # boundary-direction smoothness weight (0 = off)
-        self.boundary_align_start  = -1    # -1 = densify_from
-        self.boundary_align_until  = -1    # -1 = freeze_points; uses var_sigma_v_init/final for σ_v
+        self.top_eig_align_weight = 0.0   # pairwise top-eigvec alignment weight (0 = off)
+        self.top_eig_align_start  = -1    # -1 = densify_from
+        self.top_eig_align_until  = -1    # -1 = freeze_points
+        self.normal_lap_weight    = 0.0   # normal-direction Laplacian weight (0 = off)
+        self.normal_lap_start     = -1    # -1 = densify_from
+        self.normal_lap_until     = -1    # -1 = freeze_points
+        self.cvt_weight           = 0.0   # CVT centroidal regularization weight (0 = off)
+        self.cvt_start            = -1    # -1 = densify_from
+        self.cvt_until            = -1    # -1 = freeze_points
+        self.cvt_hops             = 1     # k-hop neighbour mean for centroid estimate
         self.neighbor_huber_delta = 0.1    # Huber delta: residuals below this get L2, above get L1
         self.var_sigma_v_init = 0.2        # bilateral sigma at start (large = plain smoothing)
         self.var_sigma_v_final = 0.2       # bilateral sigma at end (small = edge-preserving)

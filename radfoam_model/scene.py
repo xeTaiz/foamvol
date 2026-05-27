@@ -477,6 +477,36 @@ class CTScene(torch.nn.Module):
         occupied = (vox_centers.abs() <= extent).all(dim=1).reshape(res, res, res)
         return vol_flat.reshape(res, res, res), occupied
 
+    @torch.no_grad()
+    def voxelize_per_cell_field(self, field: torch.Tensor, resolution: int = 128,
+                                extent: float = 1.0) -> torch.Tensor:
+        """Nearest-cell scatter of a per-cell scalar field onto a regular voxel grid.
+
+        Much cheaper than _idw_voxelize — assigns each voxel center to its nearest
+        cell via NN lookup and reads off the cell's field value directly.  Used for
+        diagnostic purposes (per-cell field vs 3D error spatial correlations).
+
+        Args:
+            field:      (N,) or (N,1) tensor of per-cell scalar values.
+            resolution: voxel grid side length R; output is (R, R, R).
+            extent:     voxel centers sampled from [-extent, extent]³.
+
+        Returns:
+            (R, R, R) float32 CPU tensor.
+        """
+        res = resolution
+        device = self.primal_points.device
+        voxel_size = 2.0 * extent / res
+        ax = torch.arange(res, device=device, dtype=torch.float32)
+        gx, gy, gz = torch.meshgrid(ax, ax, ax, indexing='ij')
+        vox_centers = (
+            torch.stack([gx, gy, gz], dim=-1).reshape(-1, 3) + 0.5
+        ) * voxel_size - extent
+        nn_idx = radfoam.nn(self.primal_points.detach(), self.aabb_tree,
+                            vox_centers).long()
+        field_f = field.to(device=device, dtype=torch.float32).detach().squeeze()
+        return field_f[nn_idx].reshape(res, res, res).cpu()
+
     def reference_volume_loss(self, resolution=64):
         """L2 loss between scatter-voxelized current model and the stored reference volume.
 
@@ -987,57 +1017,184 @@ class CTScene(torch.nn.Module):
         else:
             raise ValueError(f"Unknown neighbor reg_type: {reg_type}")
 
-    def boundary_alignment_regularization(self, sigma_v: float = 0.2) -> torch.Tensor:
-        """Geometric regularizer: adjacent same-density cells should have aligned boundary structure.
+    def _boundary_top_eigvec(self, sigma_v: float):
+        """Shared helper for top-eigvec-based boundary losses (A and C).
 
-        For each cell i, builds a 3x3 PSD scatter matrix M_i from weighted outer products of
-        edge directions to neighbors, where weights are large for high-density-jump edges.
-        M_i summarizes which direction(s) the local iso-surface faces. For two same-density
-        neighbors i and j, penalizes the Frobenius distance between normalized M_hat_i and
-        M_hat_j. This encourages the boundary-direction fingerprint to vary smoothly across
-        the iso-surface, suppressing dihedral kinks between adjacent surface facets.
+        Builds M_i = Σ_j w_ij n_ij n_ij^T (weighted scatter of high-jump edge directions),
+        normalises by trace for numerical stability, then extracts the top eigenvector v_i
+        via eigh.  Gradients flow into primal_points through n_ij and through eigh; all
+        density-derived weights are detached.
 
-        Gradients flow into primal_points only (all density/weight terms are detached).
+        Returns:
+            v      (N, 3)  top eigenvector of M_i per cell
+            valid  (N,)    bool, tr(M_i) > 0.01 * median(tr)
+            sim    (E,)    same-density gate exp(-Δμ²/σ_v²), detached
+            src    (E,)    long, source cell index per directed edge
+            adj    (E,)    long, destination cell index per directed edge
         """
-        points  = self.primal_points                                    # (N, 3)
-        mu      = self.get_primal_density().detach()                    # (N, 1), detached weights
-        cr      = self._cached_cell_radius                              # (N,)
+        points = self.primal_points                                         # (N, 3)
+        mu     = self.get_primal_density().detach()                         # (N, 1)
+        cr     = self._cached_cell_radius                                   # (N,)
 
         offsets = self.point_adjacency_offsets.long()
         adj     = self.point_adjacency.long()
         counts  = offsets[1:] - offsets[:-1]
         N       = points.shape[0]
         src     = torch.repeat_interleave(
-                      torch.arange(N, device=points.device), counts)    # (E,)
+                      torch.arange(N, device=points.device), counts)        # (E,)
 
-        dx      = points[adj] - points[src]                             # (E, 3)
-        n       = dx / dx.norm(dim=-1, keepdim=True).clamp_min(1e-12)  # (E, 3)
+        dx = points[adj] - points[src]                                      # (E, 3)
+        n  = dx / dx.norm(dim=-1, keepdim=True).clamp_min(1e-12)           # (E, 3)
 
-        dmu_sq  = (mu[adj] - mu[src]).pow(2).squeeze(-1)                # (E,) detached
-        w_face  = (cr[src] * cr[adj]).detach()                          # (E,) detached
-        w       = dmu_sq * w_face                                       # (E,)
+        dmu_sq = (mu[adj] - mu[src]).pow(2).squeeze(-1)                     # (E,) detached
+        w_face = (cr[src] * cr[adj]).detach()                               # (E,) detached
+        w      = dmu_sq * w_face                                            # (E,)
 
-        # Build per-edge outer products (E, 9) and scatter-sum to per-cell (N, 9).
-        # Use the non-in-place index_add so gradients flow through outer → n → points.
-        outer_flat = (w[:, None, None] * (n.unsqueeze(2) * n.unsqueeze(1))).reshape(-1, 9)  # (E, 9)
+        # Scatter outer products into per-cell M_i; gradients flow through n → points.
+        outer_flat = (w[:, None, None] * (n.unsqueeze(2) * n.unsqueeze(1))).reshape(-1, 9)
         M_flat = torch.zeros((N, 9), device=points.device,
                               dtype=points.dtype).index_add(0, src, outer_flat)
-        M = M_flat.reshape(N, 3, 3)                                     # (N, 3, 3)
+        M = M_flat.reshape(N, 3, 3)                                         # (N, 3, 3)
 
-        tr      = M.diagonal(dim1=-2, dim2=-1).sum(-1)                  # (N,)
-        tau     = (tr.detach().median() * 0.01).clamp_min(1e-12)
-        valid   = (tr.detach() > tau)                                    # (N,) bool
+        tr    = M.diagonal(dim1=-2, dim2=-1).sum(-1)                        # (N,)
+        tau   = (tr.detach().median() * 0.01).clamp_min(1e-12)
+        valid = tr.detach() > tau                                            # (N,)
 
-        M_hat   = M / tr.detach().unsqueeze(-1).unsqueeze(-1).clamp_min(1e-12)  # (N, 3, 3)
+        # Normalise M so Rayleigh quotients are in [0, 1].
+        M_hat = M / tr.detach().unsqueeze(-1).unsqueeze(-1).clamp_min(1e-12)
 
-        sim     = torch.exp(
-                      -(mu[src] - mu[adj]).pow(2) / (sigma_v ** 2)
-                  ).squeeze(-1)                                          # (E,)
-        mask    = (valid[src] & valid[adj]).float()                      # (E,)
-        diff_F  = (M_hat[src] - M_hat[adj]).pow(2).sum(dim=(-1, -2))    # (E,)
+        # Estimate top eigenvector via power iteration on the detached matrix.
+        # Gradients must NOT flow through the iteration itself (that would give
+        # an 8-step unrolled graph); instead the losses route gradients through
+        # M_hat via Rayleigh quotients, using v only as a detached probe direction.
+        with torch.no_grad():
+            v = torch.randn(N, 3, device=points.device, dtype=points.dtype)
+            v = v / v.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            for _ in range(8):
+                v = torch.einsum('nij,nj->ni', M_hat, v)
+                v = v / v.norm(dim=-1, keepdim=True).clamp_min(1e-12)
 
-        denom   = mask.sum().clamp_min(1.0)
-        return (mask * sim * diff_F).sum() / denom
+        sim = torch.exp(-(mu[src] - mu[adj]).pow(2).squeeze(-1) / (sigma_v ** 2))
+
+        # Cache detached per-cell intermediates for diagnostic correlation logging.
+        self._last_M_trace    = tr.detach()     # (N,) boundary edge strength
+        self._last_M_valid    = valid           # (N,) bool — cells near density boundary
+        self._last_top_eigvec = v               # (N, 3) — already detached (power-iter)
+
+        return v, M_hat, valid, sim, src, adj
+
+    def top_eigvec_alignment_regularization(self, sigma_v: float = 0.2) -> torch.Tensor:
+        """Loss A: pairwise top-eigvec alignment between same-density Voronoi neighbors.
+
+        For each edge (i,j) measures how well j's probe direction explains i's M_hat via
+        the Rayleigh quotient R = v_j^T M_hat_i v_j (∈ [0,1] for normalised M_hat).
+        Loss = 1 − (R_ij + R_ji)/2.  Zero when probe directions are top eigenvectors of
+        each other's M_hat (i.e. surface normals agree); one when they are perpendicular.
+
+        Gradients flow through M_hat (→ n_ij → primal_points); v is a detached probe
+        so no eigenvalue-gap blow-up.  Still a first-order pairwise loss — fires on
+        both kinks and smooth curvature.
+        """
+        v, M_hat, valid, sim, src, adj = self._boundary_top_eigvec(sigma_v)
+
+        # Rayleigh quotient: how well does each cell's probe explain the partner's M_hat?
+        Mv_adj = torch.einsum('eij,ej->ei', M_hat[src], v[adj])            # (E, 3)
+        R_adj_in_src = (Mv_adj * v[adj]).sum(dim=-1)                       # (E,)
+
+        Mv_src = torch.einsum('eij,ej->ei', M_hat[adj], v[src])            # (E, 3)
+        R_src_in_adj = (Mv_src * v[src]).sum(dim=-1)                       # (E,)
+
+        loss  = 1.0 - (R_adj_in_src + R_src_in_adj) * 0.5                 # (E,)
+        mask  = (valid[src] & valid[adj]).float()
+        denom = mask.sum().clamp_min(1.0)
+        return (mask * sim * loss).sum() / denom
+
+    def normal_laplacian_regularization(self, sigma_v: float = 0.2) -> torch.Tensor:
+        """Loss C: graph-Laplacian smoothness on the surface-normal direction field.
+
+        Computes a sign-aligned neighbourhood-mean probe v̄_i from detached power-
+        iteration eigenvectors, then measures 1 − v̄_i^T M_hat_i v̄_i (Rayleigh
+        quotient of the mean direction against the cell's own boundary tensor).
+
+        On a smoothly curved iso-surface v̄_i ≈ v_i ≈ top eigvec of M_hat_i, so the
+        Rayleigh quotient ≈ 1 and loss ≈ 0.  On a kink v̄_i averages across the
+        direction discontinuity, reducing the quotient and firing the loss.
+        Unlike pairwise losses (BA, A) this does NOT penalise smooth curvature.
+
+        Gradients flow through M_hat (→ n_ij → primal_points); v and v̄ are detached.
+        """
+        v, M_hat, valid, sim, src, adj = self._boundary_top_eigvec(sigma_v)
+        N = v.shape[0]
+
+        # Sign-align each neighbour probe to the same hemisphere as the source.
+        dot_sg = (v[src] * v[adj]).sum(dim=-1)                             # (E,)
+        sigma  = dot_sg.sign().masked_fill(dot_sg == 0, 1.0)               # (E,) ∈ {-1,+1}
+
+        # Weighted mean of sign-aligned probes: v̄_i (fully detached).
+        w = sim * valid[adj].float()                                        # (E,)
+        v_num = torch.zeros((N, 3), device=v.device, dtype=v.dtype).index_add(
+                    0, src, (w * sigma).unsqueeze(-1) * v[adj])
+        v_den = torch.zeros(N, device=v.device, dtype=v.dtype).index_add(0, src, w)
+
+        has_nbrs = v_den > 1e-8
+        v_bar    = v_num / v_den.unsqueeze(-1).clamp_min(1e-8)             # (N, 3), detached
+        # Normalize before Rayleigh quotient so ||v̄|| == 1; otherwise a flat
+        # boundary with slightly-varying local normals gives ||v̄|| < 1 → loss > 0
+        # even without any kink, collapsing the tolerance advantage over loss A.
+        v_bar    = v_bar / v_bar.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+
+        # Rayleigh quotient: 1 − v̄_i^T M_hat_i v̄_i.
+        Mv_bar   = torch.einsum('nij,nj->ni', M_hat, v_bar)                # (N, 3)
+        R        = (Mv_bar * v_bar).sum(dim=-1)                            # (N,)
+        residual = 1.0 - R                                                  # (N,)
+
+        self._last_normal_lap_residual = residual.detach()                  # (N,) cached for diag
+
+        active = (valid & has_nbrs).float()
+        denom  = active.sum().clamp_min(1.0)
+        return (active * residual).sum() / denom
+
+    def cvt_regularization(self, hops: int = 1) -> torch.Tensor:
+        """CVT centroidal regularization (Laplacian/Lloyd proxy).
+
+        Pulls each point toward the mean of its k-hop Delaunay neighbours with
+        the target fully detached, equivalent to one SGD step of Lloyd's algorithm.
+        Loss is normalized by r_i² (cached cell radius squared) so the weight is
+        scale-invariant across point counts and scene scales.
+
+        Caches self._last_cvt_residual = ||p_i − centroid_i|| / r_i (N,) for
+        per-cell correlation diagnostics.
+        """
+        pts = self.primal_points                               # (N, 3), gradient flows here
+        N = pts.shape[0]
+        device = pts.device
+
+        offsets = self.point_adjacency_offsets.long()
+        adj = self.point_adjacency.long()
+        counts = (offsets[1:] - offsets[:-1]).float().clamp(min=1)
+        src = torch.repeat_interleave(
+            torch.arange(N, device=device),
+            offsets[1:] - offsets[:-1],
+        )
+
+        # K-hop centroid estimate via iterated mean (detached neighbour positions).
+        centroid = pts.detach().clone()
+        for _ in range(hops):
+            nbr_sum = torch.zeros(N, 3, device=device, dtype=centroid.dtype)
+            nbr_sum.index_add_(0, src, centroid[adj])
+            centroid = nbr_sum / counts.unsqueeze(-1)          # (N, 3), fully detached
+
+        r2 = self._cached_cell_radius.to(device=device, dtype=pts.dtype).detach() ** 2
+        r2 = r2.clamp_min(1e-12)
+
+        diff = pts - centroid                                  # (N, 3); gradient into pts
+        sq_dist = (diff * diff).sum(dim=-1)                   # (N,)
+
+        # Cache per-cell residual (displacement / radius) for diag correlations.
+        self._last_cvt_residual = (sq_dist / r2).sqrt().detach()   # (N,)
+
+        loss = (sq_dist / r2).mean()
+        return loss
 
     @torch.no_grad()
     def compute_neighborhood_variance(self, cell_radius=None, hops=1):
