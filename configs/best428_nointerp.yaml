@@ -12,7 +12,7 @@
 # Training
 iterations: 10000
 rays_per_batch: 1_000_000
-rays_per_batch_late: 8_000_000
+rays_per_batch_late: 4_000_000
 rays_per_batch_late_start: 9000
 init_points: 64000
 final_points: 512000
