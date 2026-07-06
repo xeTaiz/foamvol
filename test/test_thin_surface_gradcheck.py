@@ -62,20 +62,32 @@ TOL_FD = 5e-2            # Relative tolerance for FD check (loose for float32 CU
 VALIDATE_FINITE = True   # Check that analytic grads are finite and nonzero
 
 
-def _make_1cell_scene(device="cuda", cell_pos=None):
-    """Create a CTScene with exactly 1 cell for controlled gradient tests.
+# Delaunay triangulation requires >= MIN_POINTS (see old/test_cube.py). A 1-point
+# scene is backend-invalid (empty adjacency, no cell radius). We build a minimal
+# valid scene: one "test" cell at the origin whose params we perturb, padded with
+# MIN_POINTS-1 filler cells on a shell at `filler_scale` (outside the central
+# cell's Voronoi region). Fillers have density driven to ~0 (softplus(-10)≈0) so
+# they contribute negligibly; their thin-surface params stay at inert init
+# (delta=0, heights=0, identity quat) so perturbing them yields ~0 grad (the FD
+# check confirms this via its near-zero branch).
+MIN_POINTS = 32
+_FILLER_SCALE = 1.05
 
-    To get a single cell we need the Delaunay triangulation to produce a valid
-    point_adjacency. We use n=1 point; the resulting Voronoi cell covers the
-    entire scene. This bypasses multi-cell adjacency complexity.
+
+def _make_1cell_scene(device="cuda", cell_pos=None):
+    """Create a minimal valid CTScene (>= MIN_POINTS) with one active test cell.
+
+    Cell 0 is the test cell (at `cell_pos` or the origin); cells 1..N-1 are
+    inert fillers on a shell. Thin-surface params are registered for ALL cells
+    so shapes match a real scene, but only cell 0 is made active by the tests.
     """
     args = type("Args", (), {
-        "init_points": 1,
-        "final_points": 1,
+        "init_points": MIN_POINTS,
+        "final_points": MIN_POINTS,
         "activation_scale": 1.0,
-        "init_scale": 0.5,
+        "init_scale": _FILLER_SCALE,
         "init_type": "random",
-        "init_density": 1.0,     # nonzero starting density
+        "init_density": 1.0,     # nonzero starting density for the test cell
         "device": device,
         "init_points_file": "",
         "init_volume_path": "",
@@ -86,20 +98,31 @@ def _make_1cell_scene(device="cuda", cell_pos=None):
 
     model = CTScene(args, device=torch.device(device))
 
-    # Override the random point to a fixed position
+    # Build the point set: 1 real cell + (MIN_POINTS-1) fillers on a shell.
     with torch.no_grad():
         if cell_pos is not None:
-            model.primal_points.data.copy_(torch.tensor(cell_pos, device=device).float())
+            real = torch.tensor(cell_pos, device=device, dtype=torch.float32)
         else:
-            model.primal_points.data.copy_(torch.tensor([[0.0, 0.0, 0.0]], device=device).float())
-        # Ensure the point is within [-1, 1]^3
-        model.primal_points.data.clamp_(-0.9, 0.9)
+            real = torch.tensor([[0.0, 0.0, 0.0]], device=device, dtype=torch.float32)
+        n_pad = MIN_POINTS - real.shape[0]
+        filler = torch.randn(n_pad, 3, device=device) * 0.1
+        filler = filler / filler.norm(dim=-1, keepdim=True).clamp_min(1e-6) * _FILLER_SCALE
+        filler += torch.randn_like(filler) * 1e-4  # avoid degeneracies
+        pts = torch.cat([real, filler], dim=0).clamp(-0.999, 0.999)
+        assert pts.shape[0] == MIN_POINTS
+        model.primal_points.data.copy_(pts)
 
-    # Must rebuild triangulation after changing point positions
+    # Must rebuild triangulation after changing point positions.
     model.update_triangulation(rebuild=True, incremental=False)
 
-    # Manually register thin-surface params (simulating initialize_thin_surface)
-    N = model.primal_points.shape[0]  # should be 1
+    # Drive filler (cell 0 is the test cell, fillers are 1..N-1) density to ~0 so
+    # they do not contribute to the projection; the test cell keeps init density.
+    with torch.no_grad():
+        if model.density.shape[0] > 1:
+            model.density.data[1:] = -10.0
+
+    # Manually register thin-surface params (simulating initialize_thin_surface).
+    N = model.primal_points.shape[0]  # == MIN_POINTS
     model._thin_surface_active = True
     model._thin_K = 4
     model._thin_surface_gate_tau = 0.01
@@ -116,7 +139,7 @@ def _make_1cell_scene(device="cuda", cell_pos=None):
     model.texel_sites_2d = nn.Parameter(base_sites.unsqueeze(0).expand(N, -1, -1).clone())
     model.texel_heights = nn.Parameter(torch.zeros(N, K, device=device))
 
-    # Recompute cell radius for thin-surface kernel
+    # Recompute cell radius for thin-surface kernel.
     with torch.no_grad():
         _, cr = radfoam.farthest_neighbor(
             model.primal_points, model.point_adjacency, model.point_adjacency_offsets,
@@ -261,11 +284,12 @@ def test_grad_density_crossing():
                        lambda: _render_with_grad(model, rays, thin_surface_active=True),
                        desc="crossing")
     if not fd_ok:
-        # If density_delta grad has shape mismatch, the whole backward might be broken
+        # If the base-density check failed, sanity-check that density_delta
+        # backward still produced a finite (N,1) grad (P0-C contract).
         has_dd_grad = (model.density_delta.grad is not None and
-                       model.density_delta.grad.isfinite().any())
-        check(has_dd_grad, "density_delta backward produces finite gradient "
-              "(expected FAIL if shape mismatch: param (N,1), grad (N,))")
+                       model.density_delta.grad.isfinite().any() and
+                       model.density_delta.grad.shape == model.density_delta.shape)
+        check(has_dd_grad, "density_delta backward produces finite (N,1) grad")
 
 
 def test_grad_density_delta_zero():
@@ -445,12 +469,15 @@ def test_finite_gradients_all_params():
     loss = _render_with_grad(model, rays, thin_surface_active=True)
     loss.backward()
 
+    # Shapes are dynamic (N = MIN_POINTS for the padded scene). Grad shape must
+    # equal param shape (P0-C fix); density_delta grad is (N,1), not (N,).
+    N = model.primal_points.shape[0]
     param_info = {
-        "density": (True, (1, 1)),
-        "density_delta": (True, (1, 1)),   # KNOWN ISSUE: may be (1,) from C++
-        "quaternions": (True, (1, 4)),
-        "texel_sites_2d": (True, (1, 4, 2)),
-        "texel_heights": (True, (1, 4)),
+        "density":         (True, (N, 1)),
+        "density_delta":   (True, (N, 1)),
+        "quaternions":     (True, (N, 4)),
+        "texel_sites_2d":  (True, (N, 4, 2)),
+        "texel_heights":   (True, (N, 4)),
     }
 
     for name, (expect_grad, expect_shape) in param_info.items():
@@ -466,11 +493,11 @@ def test_finite_gradients_all_params():
         if param.grad is not None:
             check(param.grad.isfinite().all(), f"{name} grad is finite")
             check(param.grad.shape == param.shape,
-                  f"{name} grad shape {tuple(param.grad.shape)} matches param {tuple(param.shape)}")
+                  f"{name} grad shape {tuple(param.grad.shape)} matches param "
+                  f"{tuple(param.shape)}")
         else:
             check(not expect_grad,
-                  f"{name} grad is not None (expected grad exists) — "
-                  f"KNOWN ISSUE if density_delta: param (N,1) but C++ allocates grad as (N,)")
+                  f"{name} grad is not None (expected grad exists)")
 
 
 def main():
@@ -491,8 +518,7 @@ def main():
     print("\n" + "=" * 60)
     if _any_failed:
         print("SUMMARY: SOME TESTS FAILED (see above)")
-        print("KNOWN EXPECTED FAILURES:")
-        print("  - density_delta shape: param (N,1) but C++ allocates grad (N,)")
+        print("Grad shape contract (P0-C): density_delta grad must be (N,1).")
         sys.exit(1)
     else:
         print("SUMMARY: ALL TESTS PASSED")

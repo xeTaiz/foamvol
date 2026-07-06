@@ -278,6 +278,16 @@ py::object trace_forward(Pipeline &self,
     settings.thin_temp = thin_temp;
     settings.thin_height_eps = thin_height_eps;
 
+    // Hard cap: the CUDA backward kernel uses a fixed-size stack buffer
+    // `float w_arr[8]` (pipeline.cu, ct_thinsurface_backward). An invalid K
+    // would overflow it or loop past the texel tensor stride. Reject before
+    // any kernel launch. Mirrors the Python guard assert_supported_thin_K.
+    if (thin_surface_mode && (thin_K <= 0 || thin_K > 8)) {
+        throw std::runtime_error(
+            "thin_surface_mode requires 1 <= thin_K <= 8 (got " +
+            std::to_string(thin_K) + "); CUDA backward w_arr[8] hard cap.");
+    }
+
     std::vector<int64_t> output_shape;
     for (int i = 0; i < rays.dim() - 1; i++) {
         output_shape.push_back(rays.size(i));
@@ -521,6 +531,13 @@ py::object trace_backward(Pipeline &self,
     settings.thin_K = thin_K;
     settings.thin_temp = thin_temp;
     settings.thin_height_eps = thin_height_eps;
+
+    // Hard cap (same as trace_forward): protect the CUDA backward w_arr[8].
+    if (thin_surface_mode && (thin_K <= 0 || thin_K > 8)) {
+        throw std::runtime_error(
+            "thin_surface_mode requires 1 <= thin_K <= 8 (got " +
+            std::to_string(thin_K) + "); CUDA backward w_arr[8] hard cap.");
+    }
 
     bool has_density_delta = density_delta_in.has_value();
     torch::Tensor density_delta_t;

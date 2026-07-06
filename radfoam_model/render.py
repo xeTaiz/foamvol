@@ -202,6 +202,25 @@ class TraceRays(torch.autograd.Function):
         texel_heights_grad = results.get("texel_heights_grad", None)
         ctx.errbox.point_error = results.get("point_error", None)
 
+        # Autograd-contract guard: every returned thin-surface grad MUST match
+        # the corresponding forward-input parameter shape, else AccumulateGrad
+        # cannot accumulate it (a silent or hard failure). This catches any
+        # future regression of the C++ grad-tensor allocation shapes.
+        if has_thin_surface:
+            _expected = {
+                "density_delta_grad": (ctx.density_delta, density_delta_grad),
+                "quaternions_grad": (ctx.quaternions, quaternions_grad),
+                "texel_sites_2d_grad": (ctx.texel_sites_2d, texel_sites_2d_grad),
+                "texel_heights_grad": (ctx.texel_heights, texel_heights_grad),
+            }
+            for _name, (_param, _grad) in _expected.items():
+                assert _grad is not None, (
+                    f"{_name} is None but thin-surface mode is active "
+                    f"(has_thin_surface=True)")
+                assert tuple(_grad.shape) == tuple(_param.shape), (
+                    f"{_name} shape {tuple(_grad.shape)} != param "
+                    f"{tuple(_param.shape)}; autograd cannot accumulate")
+
         points_grad[~points_grad.isfinite()] = 0
         attr_grad[~attr_grad.isfinite()] = 0
         if density_grad_grad is not None:

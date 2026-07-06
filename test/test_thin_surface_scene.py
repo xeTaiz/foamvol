@@ -174,7 +174,7 @@ def test_density_delta_grad_shape():
         return
     device = "cuda"
 
-    model = _make_minimal_scene(device)
+    model = _make_minimal_scene(device=device)
     model = _activate_thin_surface(model, K=4, delta_val=0.0)
     rays = _make_test_rays(model)
     start_point = model.get_starting_point(rays, model.primal_points, model.aabb_tree)
@@ -207,7 +207,7 @@ def test_quaternions_grad_shape():
         return
     device = "cuda"
 
-    model = _make_minimal_scene(device)
+    model = _make_minimal_scene(device=device)
     model = _activate_thin_surface(model, K=4, delta_val=0.3)
     rays = _make_test_rays(model)
     start_point = model.get_starting_point(rays, model.primal_points, model.aabb_tree)
@@ -237,7 +237,7 @@ def test_texel_sites_grad_shape():
         return
     device = "cuda"
 
-    model = _make_minimal_scene(device)
+    model = _make_minimal_scene(device=device)
     model = _activate_thin_surface(model, K=4, delta_val=0.3)
     rays = _make_test_rays(model)
     start_point = model.get_starting_point(rays, model.primal_points, model.aabb_tree)
@@ -268,7 +268,7 @@ def test_texel_heights_grad_shape():
         return
     device = "cuda"
 
-    model = _make_minimal_scene(device)
+    model = _make_minimal_scene(device=device)
     model = _activate_thin_surface(model, K=4, delta_val=0.3, height_val=0.02)
     rays = _make_test_rays(model)
     start_point = model.get_starting_point(rays, model.primal_points, model.aabb_tree)
@@ -305,7 +305,7 @@ def test_zero_init_inertness():
         return
     device = "cuda"
 
-    model = _make_minimal_scene(device)
+    model = _make_minimal_scene(device=device)
     model = _activate_thin_surface(model, K=4, delta_val=0.0, height_val=0.0)
     rays = _make_test_rays(model)
     start_point = model.get_starting_point(rays, model.primal_points, model.aabb_tree)
@@ -406,11 +406,9 @@ def test_forward_backward_consistency():
             continue
 
         if param.grad is None:
-            if name == "density_delta":
-                check(False,
-                      f"{name}.grad is None. KNOWN ISSUE: param (N,1) vs C++ grad (N,)")
-            else:
-                check(False, f"{name}.grad is not None after backward")
+            check(False,
+                  f"{name}.grad is None after backward (P0-C: grad shape must "
+                  f"match param shape)")
             continue
 
         grad_ok = param.grad.isfinite().all() and param.grad.abs().sum() > 0
@@ -443,10 +441,7 @@ def main():
     print("\n" + "=" * 60)
     if _any_failed:
         print("SUMMARY: SOME TESTS FAILED (see above)")
-        print("KNOWN EXPECTED FAILURES:")
-        print("  - density_delta shape: param (N,1) but C++ allocates grad (N,)")
-        print("    This affects: density_delta grad shape, inertness test,")
-        print("    forward/backward consistency for density_delta only.")
+        print("Grad shape contract (P0-C): density_delta grad must be (N,1).")
         sys.exit(1)
     else:
         print("SUMMARY: ALL TESTS PASSED")
