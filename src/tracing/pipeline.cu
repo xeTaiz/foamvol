@@ -633,6 +633,538 @@ __global__ void ct_gaussian_backward(TraceSettings settings,
                          functor);
 }
 
+// ============================================================================
+// Device helpers for thin-surface kernels
+// ============================================================================
+
+__device__ __forceinline__ void quat_to_frame(
+    const float *q, Vec3f &n, Vec3f &tang, Vec3f &bita)
+{
+    float w = q[0], x = q[1], y = q[2], z = q[3];
+    float inv_norm = rsqrtf(w*w + x*x + y*y + z*z + 1e-12f);
+    w *= inv_norm; x *= inv_norm; y *= inv_norm; z *= inv_norm;
+
+    n[0]    = 1.0f - 2.0f*(y*y + z*z);
+    n[1]    = 2.0f*(x*y + w*z);
+    n[2]    = 2.0f*(x*z - w*y);
+
+    tang[0] = 2.0f*(x*y - w*z);
+    tang[1] = 1.0f - 2.0f*(x*x + z*z);
+    tang[2] = 2.0f*(y*z + w*x);
+
+    bita[0] = 2.0f*(x*z + w*y);
+    bita[1] = 2.0f*(y*z - w*x);
+    bita[2] = 1.0f - 2.0f*(x*x + y*y);
+}
+
+// Adjoint of quat_to_frame. Accumulates into dL_dq[4].
+__device__ __forceinline__ void quat_to_frame_bwd(
+    const float *q,
+    const Vec3f &dL_dn, const Vec3f &dL_dtang, const Vec3f &dL_dbita,
+    float *dL_dq)
+{
+    float w = q[0], x = q[1], y = q[2], z = q[3];
+    float norm_sq = w*w + x*x + y*y + z*z + 1e-12f;
+    float inv_norm = rsqrtf(norm_sq);
+    float w_ = w*inv_norm, x_ = x*inv_norm, y_ = y*inv_norm, z_ = z*inv_norm;
+
+    // Gradients w.r.t. normalized (w_, x_, y_, z_)
+    float dw = 0.0f, dx = 0.0f, dy = 0.0f, dz = 0.0f;
+
+    // n[0]=1-2(y²+z²), n[1]=2(xy+wz), n[2]=2(xz-wy)
+    dy += dL_dn[0] * (-4.0f*y_);
+    dz += dL_dn[0] * (-4.0f*z_);
+    dw += dL_dn[1] * 2.0f*z_;
+    dx += dL_dn[1] * 2.0f*y_;
+    dy += dL_dn[1] * 2.0f*x_;
+    dz += dL_dn[1] * 2.0f*w_;
+    dw += dL_dn[2] * (-2.0f*y_);
+    dx += dL_dn[2] * 2.0f*z_;
+    dy += dL_dn[2] * (-2.0f*w_);
+    dz += dL_dn[2] * 2.0f*x_;
+
+    // t[0]=2(xy-wz), t[1]=1-2(x²+z²), t[2]=2(yz+wx)
+    dw += dL_dtang[0] * (-2.0f*z_);
+    dx += dL_dtang[0] * 2.0f*y_;
+    dy += dL_dtang[0] * 2.0f*x_;
+    dz += dL_dtang[0] * (-2.0f*w_);
+    dx += dL_dtang[1] * (-4.0f*x_);
+    dz += dL_dtang[1] * (-4.0f*z_);
+    dw += dL_dtang[2] * 2.0f*x_;
+    dx += dL_dtang[2] * 2.0f*w_;
+    dy += dL_dtang[2] * 2.0f*z_;
+    dz += dL_dtang[2] * 2.0f*y_;
+
+    // b[0]=2(xz+wy), b[1]=2(yz-wx), b[2]=1-2(x²+y²)
+    dw += dL_dbita[0] * 2.0f*y_;
+    dx += dL_dbita[0] * 2.0f*z_;
+    dy += dL_dbita[0] * 2.0f*w_;
+    dz += dL_dbita[0] * 2.0f*x_;
+    dw += dL_dbita[1] * (-2.0f*x_);
+    dx += dL_dbita[1] * (-2.0f*w_);
+    dy += dL_dbita[1] * 2.0f*z_;
+    dz += dL_dbita[1] * 2.0f*y_;
+    dx += dL_dbita[2] * (-4.0f*x_);
+    dy += dL_dbita[2] * (-4.0f*y_);
+
+    // Chain through normalization: q_ = q * inv_norm
+    float dot = w_*dw + x_*dx + y_*dy + z_*dz;
+    dL_dq[0] += (dw - dot*w_) * inv_norm;
+    dL_dq[1] += (dx - dot*x_) * inv_norm;
+    dL_dq[2] += (dy - dot*y_) * inv_norm;
+    dL_dq[3] += (dz - dot*z_) * inv_norm;
+}
+
+// ============================================================================
+// ct_thinsurface_forward
+// ============================================================================
+
+template <int block_size>
+__global__ void ct_thinsurface_forward(
+    TraceSettings settings,
+    const Vec3f *__restrict__ points,
+    const float *__restrict__ density,        // raw density_base (N,)
+    const float *__restrict__ density_delta,  // raw delta (N,)
+    const float *__restrict__ quaternions,    // (N, 4) [w,x,y,z]
+    const float *__restrict__ texel_sites_2d, // (N, K, 2)
+    const float *__restrict__ texel_heights,  // (N, K)
+    const float *__restrict__ cell_radius,    // (N,)
+    const uint32_t *__restrict__ point_adjacency,
+    const uint32_t *__restrict__ point_adjacency_offsets,
+    const Vec4h *__restrict__ adjacent_diff,
+    const Ray *__restrict__ rays,
+    uint32_t num_rays,
+    const uint32_t *__restrict__ start_point_index,
+    float *__restrict__ ray_projection,
+    uint32_t *__restrict__ num_intersections,
+    float *__restrict__ point_contribution,
+    uint32_t *__restrict__ point_hit_count)
+{
+    uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (thread_idx >= num_rays)
+        return;
+
+    Ray ray = rays[thread_idx];
+    ray.direction /= ray.direction.norm();
+
+    float projection = 0.0f;
+    constexpr float sp_beta = 10.0f;
+    const int K = settings.thin_K;
+    const float thin_temp = settings.thin_temp;
+    const float thin_height_eps = settings.thin_height_eps;
+
+    auto functor = [&](uint32_t point_idx,
+                       float t_0,
+                       float t_1,
+                       const Vec3f &current_point,
+                       const Vec3f &next_point) {
+        float delta_t = fmaxf(t_1 - t_0, 0.0f);
+
+        // Densities
+        float raw_base  = density[point_idx];
+        float mu_bar    = (sp_beta * raw_base > 20.0f) ? raw_base
+                          : logf(1.0f + expf(sp_beta * raw_base)) / sp_beta;
+        float delta_val = density_delta[point_idx];
+        float mu_p      = fmaxf(mu_bar + delta_val, 0.0f);
+        float mu_n      = fmaxf(mu_bar - delta_val, 0.0f);
+
+        // Tangent frame from quaternion
+        const float *q = quaternions + point_idx * 4;
+        Vec3f n, tang, bita;
+        quat_to_frame(q, n, tang, bita);
+
+        float dp = n.dot(ray.direction);
+
+        // Grazing-ray fallback: surface crosses at near-infinite t
+        if (fabsf(dp) < 1e-3f) {
+            projection += mu_bar * delta_t;
+            if (point_contribution) atomicAdd(point_contribution + point_idx, delta_t);
+            if (point_hit_count)    atomicAdd(point_hit_count + point_idx, 1u);
+            return true;
+        }
+
+        float r = cell_radius[point_idx];
+
+        // Fixed-point step 1: query point on flat plane
+        float t_flat = (current_point - ray.origin).dot(n) / dp;
+        float t_q0 = (dp < 0.0f) ? fmaxf(t_0, t_flat) : t_0;
+        Vec3f x0 = ray.origin + t_q0 * ray.direction;
+
+        // Fixed-point step 2: soft-Voronoi height eval at x0
+        float h_sum = 0.0f, w_sum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            const float *s2d = texel_sites_2d + (point_idx * K + k) * 2;
+            Vec3f site3 = current_point + r * (s2d[0] * tang + s2d[1] * bita);
+            float d2 = (x0 - site3).squaredNorm() / (r * r + 1e-20f);
+            float w = expf(-thin_temp * d2);
+            h_sum += w * (r * texel_heights[point_idx * K + k]);
+            w_sum += w;
+        }
+        float w_sum_safe = fmaxf(w_sum, 1e-20f);
+        float h_eval = h_sum / w_sum_safe;
+
+        // Fixed-point step 3: surface intersection with height offset
+        float t_surf = ((current_point - ray.origin).dot(n) + h_eval) / dp;
+
+        // Two-sided partition
+        float mu_near = (dp > 0.0f) ? mu_n : mu_p;
+        float mu_far  = (dp > 0.0f) ? mu_p : mu_n;
+
+        float t_s = fminf(fmaxf(t_surf, t_0), t_1);
+        bool crossing = (t_surf > t_0 + thin_height_eps) &&
+                        (t_surf < t_1 - thin_height_eps);
+
+        float contrib;
+        if (crossing) {
+            contrib = mu_near * (t_s - t_0) + mu_far * (t_1 - t_s);
+        } else {
+            bool plus_side = (dp > 0.0f) ? (t_surf <= t_0) : (t_surf >= t_1);
+            contrib = (plus_side ? mu_p : mu_n) * delta_t;
+        }
+        projection += contrib;
+
+        if (point_contribution) atomicAdd(point_contribution + point_idx, delta_t);
+        if (point_hit_count)    atomicAdd(point_hit_count + point_idx, 1u);
+
+        return true;
+    };
+
+    uint32_t start_point = start_point_index[thread_idx];
+
+    uint32_t n = trace<block_size, 4>(ray,
+                                      points,
+                                      point_adjacency,
+                                      point_adjacency_offsets,
+                                      adjacent_diff,
+                                      start_point,
+                                      settings.max_intersections,
+                                      functor);
+
+    ray_projection[thread_idx] = projection;
+    if (num_intersections)
+        num_intersections[thread_idx] = n;
+}
+
+// ============================================================================
+// ct_thinsurface_backward
+// ============================================================================
+
+template <int block_size>
+__global__ void ct_thinsurface_backward(
+    TraceSettings settings,
+    const Vec3f *__restrict__ points,
+    const float *__restrict__ density,        // raw density_base (N,)
+    const float *__restrict__ density_delta,  // raw delta (N,)
+    const float *__restrict__ quaternions,    // (N, 4) [w,x,y,z]
+    const float *__restrict__ texel_sites_2d, // (N, K, 2)
+    const float *__restrict__ texel_heights,  // (N, K)
+    const float *__restrict__ cell_radius,    // (N,)
+    const uint32_t *__restrict__ point_adjacency,
+    const uint32_t *__restrict__ point_adjacency_offsets,
+    const Vec4h *__restrict__ adjacent_diff,
+    const Ray *__restrict__ rays,
+    uint32_t num_rays,
+    const uint32_t *__restrict__ start_point_index,
+    const float *__restrict__ ray_projection_grad,
+    const float *__restrict__ ray_error,
+    Vec3f *__restrict__ points_grad,
+    float *__restrict__ density_base_grad,
+    float *__restrict__ density_delta_grad,
+    float *__restrict__ quaternions_grad,
+    float *__restrict__ texel_sites_2d_grad,
+    float *__restrict__ texel_heights_grad,
+    float *__restrict__ point_error)
+{
+    uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (thread_idx >= num_rays)
+        return;
+
+    Ray ray = rays[thread_idx];
+    ray.direction /= ray.direction.norm();
+
+    float dL_dprojection = ray_projection_grad[thread_idx];
+    float error = 0.0f;
+    if (ray_error) error = ray_error[thread_idx];
+
+    constexpr float sp_beta = 10.0f;
+    const int K = settings.thin_K;
+    const float thin_temp = settings.thin_temp;
+    const float thin_height_eps = settings.thin_height_eps;
+
+    uint32_t prev_point_idx = UINT32_MAX;
+    Vec3f prev_point = Vec3f::Zero();
+    Vec3f prev_point_grad = Vec3f::Zero();
+    Vec3f current_point_grad = Vec3f::Zero();
+    Vec3f next_point_grad = Vec3f::Zero();
+
+    auto functor = [&](uint32_t point_idx,
+                       float t_0,
+                       float t_1,
+                       const Vec3f &current_point,
+                       const Vec3f &next_point) {
+        float delta_t = fmaxf(t_1 - t_0, 0.0f);
+
+        if (point_error) {
+            atomicAdd(point_error + point_idx, delta_t * error);
+        }
+
+        // ---- Recompute forward quantities ----
+        float raw_base  = density[point_idx];
+        float mu_bar    = (sp_beta * raw_base > 20.0f) ? raw_base
+                          : logf(1.0f + expf(sp_beta * raw_base)) / sp_beta;
+        float d_softplus = 1.0f / (1.0f + expf(-sp_beta * raw_base));
+
+        float delta_val = density_delta[point_idx];
+        float mu_p      = fmaxf(mu_bar + delta_val, 0.0f);
+        float mu_n      = fmaxf(mu_bar - delta_val, 0.0f);
+        float ind_p     = (mu_p > 0.0f) ? 1.0f : 0.0f;
+        float ind_n     = (mu_n > 0.0f) ? 1.0f : 0.0f;
+
+        const float *q = quaternions + point_idx * 4;
+        Vec3f n, tang, bita;
+        quat_to_frame(q, n, tang, bita);
+
+        float dp = n.dot(ray.direction);
+
+        // ---- Grazing-ray fallback ----
+        if (fabsf(dp) < 1e-3f) {
+            // contrib = mu_bar * delta_t
+            float dL_dmu_bar = dL_dprojection * delta_t;
+            atomicAdd(density_base_grad + point_idx, dL_dmu_bar * d_softplus);
+            // dL/d(density_delta) = 0
+
+            float dL_ddelta_t = dL_dprojection * mu_bar;
+            float dL_dt0 = -dL_ddelta_t, dL_dt1 = dL_ddelta_t;
+            // Propagate through bisector intersections (same as ct_backward)
+            Vec3f dt0_dprev;
+            if (prev_point_idx != UINT32_MAX)
+                dt0_dprev = cell_intersection_grad(prev_point, current_point, ray);
+            else
+                dt0_dprev = Vec3f::Zero();
+            Vec3f dt1_dcur  = cell_intersection_grad(current_point, next_point, ray);
+            Vec3f dt0_dcur  = cell_intersection_grad(current_point, prev_point, ray);
+            Vec3f dt1_dnext = cell_intersection_grad(next_point, current_point, ray);
+
+            prev_point_grad += dL_dt0 * dt0_dprev;
+            current_point_grad += dL_dt0 * dt0_dcur + dL_dt1 * dt1_dcur;
+            next_point_grad += dL_dt1 * dt1_dnext;
+
+            if (prev_point_idx != UINT32_MAX)
+                atomic_add_vec(points_grad + prev_point_idx, prev_point_grad);
+            prev_point = current_point;
+            prev_point_idx = point_idx;
+            prev_point_grad = current_point_grad;
+            current_point_grad = next_point_grad;
+            next_point_grad = Vec3f::Zero();
+            return true;
+        }
+
+        float r = cell_radius[point_idx];
+
+        // ---- Recompute fixed-point quantities ----
+        float t_flat = (current_point - ray.origin).dot(n) / dp;
+        bool q0_from_tflat = (dp < 0.0f) && (t_flat >= t_0);
+        float t_q0 = q0_from_tflat ? t_flat : t_0;
+        Vec3f x0 = ray.origin + t_q0 * ray.direction;
+
+        // soft-Voronoi weights
+        float h_sum = 0.0f, w_sum = 0.0f;
+        float w_arr[8]; // max K=8
+        for (int k = 0; k < K; ++k) {
+            const float *s2d = texel_sites_2d + (point_idx * K + k) * 2;
+            Vec3f site3 = current_point + r * (s2d[0] * tang + s2d[1] * bita);
+            float d2 = (x0 - site3).squaredNorm() / (r * r + 1e-20f);
+            float w = expf(-thin_temp * d2);
+            w_arr[k] = w;
+            h_sum += w * (r * texel_heights[point_idx * K + k]);
+            w_sum += w;
+        }
+        float w_sum_safe = fmaxf(w_sum, 1e-20f);
+        float h_eval = h_sum / w_sum_safe;
+
+        float t_surf = ((current_point - ray.origin).dot(n) + h_eval) / dp;
+
+        float mu_near = (dp > 0.0f) ? mu_n : mu_p;
+        float mu_far  = (dp > 0.0f) ? mu_p : mu_n;
+        float t_s = fminf(fmaxf(t_surf, t_0), t_1);
+        bool crossing = (t_surf > t_0 + thin_height_eps) &&
+                        (t_surf < t_1 - thin_height_eps);
+
+        // ---- Backward pass ----
+
+        // Chord-length gradients
+        float dL_dmu_near = 0.0f, dL_dmu_far = 0.0f;
+        float dL_dt_s = 0.0f;
+        float dL_ddelta_t;
+
+        if (crossing) {
+            dL_dmu_near = dL_dprojection * (t_s - t_0);
+            dL_dmu_far  = dL_dprojection * (t_1 - t_s);
+            dL_dt_s     = dL_dprojection * (mu_near - mu_far);
+            dL_ddelta_t = 0.0f; // delta_t not used directly in crossing formula
+        } else {
+            bool plus_side = (dp > 0.0f) ? (t_surf <= t_0) : (t_surf >= t_1);
+            float mu_eff = plus_side ? mu_p : mu_n;
+            if (plus_side) dL_dmu_far  = dL_dprojection * delta_t; // mu_p is mu_far when dp>0
+            else           dL_dmu_near = dL_dprojection * delta_t;
+            dL_ddelta_t = dL_dprojection * mu_eff;
+        }
+
+        // Unscramble mu_near/mu_far -> mu_p/mu_n
+        float dL_dmu_p, dL_dmu_n;
+        if (dp > 0.0f) {
+            dL_dmu_n = dL_dmu_near;
+            dL_dmu_p = dL_dmu_far;
+        } else {
+            dL_dmu_p = dL_dmu_near;
+            dL_dmu_n = dL_dmu_far;
+        }
+
+        // mu_p = max(mu_bar + delta_val, 0), mu_n = max(mu_bar - delta_val, 0)
+        float dL_dmu_bar = ind_p * dL_dmu_p + ind_n * dL_dmu_n;
+        float dL_ddelta  = ind_p * dL_dmu_p - ind_n * dL_dmu_n;
+        atomicAdd(density_base_grad  + point_idx, dL_dmu_bar * d_softplus);
+        atomicAdd(density_delta_grad + point_idx, dL_ddelta);
+
+        // ---- dL/d(t_surf) -> dL/d(h_eval) + dL/d(current_point) + dL/dn ----
+        // t_surf = (cp · n - origin · n + h_eval) / dp
+        // dt_surf/dh_eval = 1/dp
+        // dt_surf/d(cp) = n/dp
+        // dt_surf/dn = (cp - origin)/dp - t_surf * d/dp  =  (cp - origin - t_surf*d) / dp
+
+        Vec3f dL_dn = Vec3f::Zero();
+        Vec3f dL_dtang = Vec3f::Zero();
+        Vec3f dL_dbita = Vec3f::Zero();
+        Vec3f dL_dcurrent_point = Vec3f::Zero();
+
+        if (fabsf(dL_dt_s) > 0.0f) {
+            float dL_dt_surf = dL_dt_s; // t_s = clamp(t_surf, t_0, t_1)
+            // Only when crossing is true, t_s = t_surf, so the clamp is transparent
+
+            float dL_dh_eval = dL_dt_surf / dp;
+            dL_dcurrent_point += dL_dt_surf * n / dp;
+            dL_dn += dL_dt_surf * (current_point - ray.origin - t_surf * ray.direction) / dp;
+
+            // ---- dL/d(h_eval) -> soft-Voronoi backward ----
+            // h_eval = h_sum / w_sum_safe
+            float dL_dh_sum   = dL_dh_eval / w_sum_safe;
+            float dL_dw_total = -dL_dh_eval * h_eval / w_sum_safe;  // chain via w_sum
+
+            Vec3f dL_dx0 = Vec3f::Zero();
+
+            for (int k = 0; k < K; ++k) {
+                float w = w_arr[k];
+                float h_k = texel_heights[point_idx * K + k];
+                const float *s2d = texel_sites_2d + (point_idx * K + k) * 2;
+                Vec3f site3 = current_point + r * (s2d[0] * tang + s2d[1] * bita);
+
+                // dL/d(w_k) = dL/d(h_sum) * r * h_k + dL/dw_total
+                float dL_dw = dL_dh_sum * (r * h_k) + dL_dw_total;
+
+                // dL/d(texel_heights[k]) via h_sum contribution
+                float dL_dhk = dL_dh_sum * w * r;
+                atomicAdd(texel_heights_grad + point_idx * K + k, dL_dhk);
+
+                // dL/d(d2_k) via w_k = exp(-temp * d2_k)
+                float dL_dd2 = dL_dw * (-thin_temp) * w;
+
+                Vec3f diff = x0 - site3;
+                float inv_r2 = 1.0f / (r * r + 1e-20f);
+
+                // dL/d(x0) += dL/d(d2_k) * 2 * diff / r²
+                dL_dx0 += dL_dd2 * 2.0f * diff * inv_r2;
+
+                // dL/d(site3) = -dL/d(x0 - site3) part
+                Vec3f dL_dsite3 = dL_dd2 * (-2.0f) * diff * inv_r2;
+
+                // site3 = cp + r * (s2d[0]*tang + s2d[1]*bita)
+                dL_dcurrent_point += dL_dsite3;
+                dL_dtang += dL_dsite3 * (r * s2d[0]);
+                dL_dbita += dL_dsite3 * (r * s2d[1]);
+
+                // dL/d(texel_sites_2d[k, 0]) and [k, 1]
+                float dL_ds0 = dL_dsite3.dot(r * tang);
+                float dL_ds1 = dL_dsite3.dot(r * bita);
+                atomicAdd(texel_sites_2d_grad + (point_idx * K + k) * 2 + 0, dL_ds0);
+                atomicAdd(texel_sites_2d_grad + (point_idx * K + k) * 2 + 1, dL_ds1);
+            }
+
+            // ---- dL/d(x0) -> dL/d(t_q0) -> dL/d(current_point, n) ----
+            float dL_dt_q0 = dL_dx0.dot(ray.direction);
+
+            if (q0_from_tflat) {
+                // t_q0 = t_flat = (cp - origin).n / dp
+                // dt_flat/d(cp) = n/dp
+                // dt_flat/dn = (cp - origin)/dp - t_flat * d/dp
+                dL_dcurrent_point += dL_dt_q0 * n / dp;
+                dL_dn += dL_dt_q0 * (current_point - ray.origin - t_flat * ray.direction) / dp;
+                // Note: dL_dt0 contribution from t_q0 = max(t_0, t_flat) when t_flat < t_0
+                // is zero since we're in the t_flat >= t_0 branch
+            } else {
+                // t_q0 = t_0; gradient flows to t_0 via bisector below
+                // We accumulate into dL_ddelta_t path: dL/d(t_0) += -dL_dt_q0
+                // (since t_0 contributes to delta_t and now also to t_q0)
+                // But we handle t_0 grad below via the bisector chain,
+                // so we need to record this extra contribution.
+                // Use dL_ddelta_t to carry the cell-boundary t_0 signal:
+                dL_ddelta_t += -dL_dt_q0; // feeds into dL_dt0 = -dL_ddelta_t below
+            }
+        }
+
+        // ---- Quaternion backward ----
+        if (dL_dn.squaredNorm() > 0.0f || dL_dtang.squaredNorm() > 0.0f ||
+            dL_dbita.squaredNorm() > 0.0f) {
+            float local_qg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            quat_to_frame_bwd(q, dL_dn, dL_dtang, dL_dbita, local_qg);
+            float *qg = quaternions_grad + point_idx * 4;
+            atomicAdd(qg + 0, local_qg[0]);
+            atomicAdd(qg + 1, local_qg[1]);
+            atomicAdd(qg + 2, local_qg[2]);
+            atomicAdd(qg + 3, local_qg[3]);
+        }
+
+        // ---- Cell-boundary position gradients ----
+        float dL_dt0 = -dL_ddelta_t;
+        float dL_dt1 =  dL_ddelta_t;
+
+        Vec3f dt0_dprev;
+        if (prev_point_idx != UINT32_MAX)
+            dt0_dprev = cell_intersection_grad(prev_point, current_point, ray);
+        else
+            dt0_dprev = Vec3f::Zero();
+        Vec3f dt1_dcur  = cell_intersection_grad(current_point, next_point, ray);
+        Vec3f dt0_dcur  = cell_intersection_grad(current_point, prev_point, ray);
+        Vec3f dt1_dnext = cell_intersection_grad(next_point, current_point, ray);
+
+        prev_point_grad += dL_dt0 * dt0_dprev;
+        dL_dcurrent_point += dL_dt0 * dt0_dcur + dL_dt1 * dt1_dcur;
+        next_point_grad    += dL_dt1 * dt1_dnext;
+
+        current_point_grad += dL_dcurrent_point;
+
+        if (prev_point_idx != UINT32_MAX)
+            atomic_add_vec(points_grad + prev_point_idx, prev_point_grad);
+        prev_point = current_point;
+        prev_point_idx = point_idx;
+        prev_point_grad = current_point_grad;
+        current_point_grad = next_point_grad;
+        next_point_grad = Vec3f::Zero();
+
+        return true;
+    };
+
+    uint32_t start_point = start_point_index[thread_idx];
+
+    trace<block_size, 2>(ray,
+                         points,
+                         point_adjacency,
+                         point_adjacency_offsets,
+                         adjacent_diff,
+                         start_point,
+                         settings.max_intersections,
+                         functor);
+}
+
 __global__ void precompute_activated_density(
     const float *__restrict__ density,
     float *__restrict__ activated,
@@ -2539,7 +3071,11 @@ class CUDADensityPipeline : public Pipeline {
                        const float *cell_radius = nullptr,
                        const float *density_peak = nullptr,
                        const float *delta_raw = nullptr,
-                       const float *cov_raw = nullptr) override {
+                       const float *cov_raw = nullptr,
+                       const float *density_delta = nullptr,
+                       const float *quaternions = nullptr,
+                       const float *texel_sites_2d = nullptr,
+                       const float *texel_heights = nullptr) override {
 
         CUDAArray<Vec4h> adjacent_diff(point_adjacency_size + 32);
         prefetch_adjacent_diff(reinterpret_cast<const Vec3f *>(points),
@@ -2552,7 +3088,31 @@ class CUDADensityPipeline : public Pipeline {
                                nullptr);
 
         constexpr uint32_t block_size = 128;
-        if (settings.gaussian_mode && density_peak && delta_raw && cov_raw && cell_radius) {
+        if (settings.thin_surface_mode && density_delta && quaternions &&
+            texel_sites_2d && texel_heights && cell_radius) {
+            launch_kernel_1d<block_size>(
+                ct_thinsurface_forward<block_size>,
+                num_rays,
+                nullptr,
+                settings,
+                points,
+                density,
+                density_delta,
+                quaternions,
+                texel_sites_2d,
+                texel_heights,
+                cell_radius,
+                point_adjacency,
+                point_adjacency_offsets,
+                adjacent_diff.begin(),
+                rays,
+                num_rays,
+                start_point_index,
+                ray_projection,
+                num_intersections,
+                point_contribution,
+                point_hit_count);
+        } else if (settings.gaussian_mode && density_peak && delta_raw && cov_raw && cell_radius) {
             launch_kernel_1d<block_size>(
                 ct_gaussian_forward<block_size>,
                 num_rays,
@@ -2647,7 +3207,15 @@ class CUDADensityPipeline : public Pipeline {
                         const float *cov_raw = nullptr,
                         float *density_peak_grad = nullptr,
                         float *delta_raw_grad = nullptr,
-                        float *cov_raw_grad = nullptr) override {
+                        float *cov_raw_grad = nullptr,
+                        const float *density_delta = nullptr,
+                        const float *quaternions = nullptr,
+                        const float *texel_sites_2d = nullptr,
+                        const float *texel_heights = nullptr,
+                        float *density_delta_grad = nullptr,
+                        float *quaternions_grad = nullptr,
+                        float *texel_sites_2d_grad = nullptr,
+                        float *texel_heights_grad = nullptr) override {
 
         CUDAArray<Vec4h> adjacent_diff(point_adjacency_size + 32);
         prefetch_adjacent_diff(reinterpret_cast<const Vec3f *>(points),
@@ -2660,7 +3228,36 @@ class CUDADensityPipeline : public Pipeline {
                                nullptr);
 
         constexpr uint32_t block_size = 128;
-        if (settings.gaussian_mode && density_peak && delta_raw && cov_raw && cell_radius) {
+        if (settings.thin_surface_mode && density_delta && quaternions &&
+            texel_sites_2d && texel_heights && cell_radius) {
+            launch_kernel_1d<block_size>(
+                ct_thinsurface_backward<block_size>,
+                num_rays,
+                nullptr,
+                settings,
+                points,
+                density,
+                density_delta,
+                quaternions,
+                texel_sites_2d,
+                texel_heights,
+                cell_radius,
+                point_adjacency,
+                point_adjacency_offsets,
+                adjacent_diff.begin(),
+                rays,
+                num_rays,
+                start_point_index,
+                ray_projection_grad,
+                ray_error,
+                points_grad,
+                density_scalar_grad,
+                density_delta_grad,
+                quaternions_grad,
+                texel_sites_2d_grad,
+                texel_heights_grad,
+                point_error);
+        } else if (settings.gaussian_mode && density_peak && delta_raw && cov_raw && cell_radius) {
             launch_kernel_1d<block_size>(
                 ct_gaussian_backward<block_size>,
                 num_rays,

@@ -17,6 +17,10 @@ struct TraceSettings {
     bool per_cell_sigma = false;
     bool per_neighbor_sigma = false;
     bool gaussian_mode = false;
+    bool thin_surface_mode = false;
+    int  thin_K = 4;
+    float thin_temp = 10.0f;
+    float thin_height_eps = 1e-4f;
 };
 
 inline TraceSettings default_trace_settings() {
@@ -164,7 +168,12 @@ class Pipeline {
                                const float *cell_radius = nullptr,
                                const float *density_peak = nullptr,
                                const float *delta_raw = nullptr,
-                               const float *cov_raw = nullptr) = 0;
+                               const float *cov_raw = nullptr,
+                               // thin-surface parameters (nullptr = disabled)
+                               const float *density_delta = nullptr,
+                               const float *quaternions = nullptr,
+                               const float *texel_sites_2d = nullptr,
+                               const float *texel_heights = nullptr) = 0;
 
     virtual void trace_backward(const TraceSettings &settings,
                                 uint32_t num_points,
@@ -189,7 +198,16 @@ class Pipeline {
                                 const float *cov_raw = nullptr,
                                 float *density_peak_grad = nullptr,
                                 float *delta_raw_grad = nullptr,
-                                float *cov_raw_grad = nullptr) = 0;
+                                float *cov_raw_grad = nullptr,
+                                // thin-surface parameters (nullptr = disabled)
+                                const float *density_delta = nullptr,
+                                const float *quaternions = nullptr,
+                                const float *texel_sites_2d = nullptr,
+                                const float *texel_heights = nullptr,
+                                float *density_delta_grad = nullptr,
+                                float *quaternions_grad = nullptr,
+                                float *texel_sites_2d_grad = nullptr,
+                                float *texel_heights_grad = nullptr) = 0;
 
     // Stub for viewer compatibility — CT pipeline does not implement this
     virtual void trace_visualization(const TraceSettings &settings,
