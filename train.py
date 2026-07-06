@@ -1113,6 +1113,19 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         )
                         loss = loss + cvt_w * cvt_loss
 
+                # Thin-surface regularization (active only after thin_surface_start)
+                ts_delta_loss = None
+                ts_height_loss = None
+                if getattr(model, '_thin_surface_active', False):
+                    ts_delta_w  = getattr(optimizer_args, 'thin_surface_delta_weight', 1e-3)
+                    ts_height_w = getattr(optimizer_args, 'thin_surface_height_weight', 1e-3)
+                    if ts_delta_w > 0 and hasattr(model, 'density_delta'):
+                        ts_delta_loss = model.density_delta.pow(2).mean()
+                        loss = loss + ts_delta_w * ts_delta_loss
+                    if ts_height_w > 0 and hasattr(model, 'texel_heights'):
+                        ts_height_loss = model.texel_heights.abs().mean()
+                        loss = loss + ts_height_w * ts_height_loss
+
                 rv_w_cfg = getattr(optimizer_args, "ref_volume_weight", 0.0)
                 rv_start = getattr(optimizer_args, "ref_volume_start", 0)
                 rv_until = getattr(optimizer_args, "ref_volume_until", -1)
@@ -1239,6 +1252,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     if cvt_loss is not None:
                         writer.add_scalar("train/cvt_loss", cvt_loss.item(), i)
                         writer.add_scalar("train/cvt_weight", cvt_w, i)
+                    if ts_delta_loss is not None:
+                        writer.add_scalar("train/ts_delta_loss", ts_delta_loss.item(), i)
+                    if ts_height_loss is not None:
+                        writer.add_scalar("train/ts_height_loss", ts_height_loss.item(), i)
                     _rv_until = getattr(optimizer_args, "ref_volume_until", -1)
                     if (getattr(optimizer_args, "ref_volume_weight", 0.0) > 0
                             and hasattr(model, "_ref_volume")
@@ -1408,6 +1425,14 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 ):
                     model.density.requires_grad_(True)
                     print(f"Unfroze base density for joint fine-tuning at iter {i}")
+
+                # Thin-surface activation
+                thin_start = getattr(optimizer_args, 'thin_surface_start', -1)
+                if thin_start >= 0 and i == thin_start:
+                    K = getattr(optimizer_args, 'thin_surface_K', 4)
+                    tau = getattr(optimizer_args, 'thin_surface_gate_tau', 0.01)
+                    model._thin_surface_gate_tau = tau
+                    model.initialize_thin_surface(optimizer_args, K=K)
 
                 frozen_unfreeze = getattr(optimizer_args, "frozen_unfreeze_step", -1)
                 if frozen_unfreeze >= 0 and i == frozen_unfreeze:

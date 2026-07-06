@@ -1106,6 +1106,17 @@ class CTScene(torch.nn.Module):
 
         loss  = 1.0 - (R_adj_in_src + R_src_in_adj) * 0.5                 # (E,)
         mask  = (valid[src] & valid[adj]).float()
+
+        # Skip cells where the thin-surface sub-cell geometry is already active
+        # (height norm > τ) — they don't need bisector alignment on top.
+        if getattr(self, "_thin_surface_active", False) and hasattr(self, "texel_heights"):
+            with torch.no_grad():
+                h_norm = self.texel_heights.detach().abs().sum(dim=-1)  # (N,)
+                thin_tau = getattr(self, "_thin_surface_gate_tau", 0.01)
+                active_ts = (h_norm > thin_tau).float()
+            ts_mask = 1.0 - (active_ts[src].clamp(max=1.0) + active_ts[adj].clamp(max=1.0)).clamp(max=1.0)
+            mask = mask * ts_mask
+
         denom = mask.sum().clamp_min(1.0)
         return (mask * sim * loss).sum() / denom
 
@@ -1151,6 +1162,15 @@ class CTScene(torch.nn.Module):
         self._last_normal_lap_residual = residual.detach()                  # (N,) cached for diag
 
         active = (valid & has_nbrs).float()
+
+        # Skip cells where the thin-surface sub-cell geometry is already active.
+        if getattr(self, "_thin_surface_active", False) and hasattr(self, "texel_heights"):
+            with torch.no_grad():
+                h_norm = self.texel_heights.detach().abs().sum(dim=-1)  # (N,)
+                thin_tau = getattr(self, "_thin_surface_gate_tau", 0.01)
+                active_ts = (h_norm > thin_tau).float()
+            active = active * (1.0 - active_ts.clamp(max=1.0))
+
         denom  = active.sum().clamp_min(1.0)
         return (active * residual).sum() / denom
 
@@ -1465,10 +1485,15 @@ class CTScene(torch.nn.Module):
         density_peak = getattr(self, "density_peak", None)
         delta_raw = getattr(self, "delta_raw", None)
         cov_raw = getattr(self, "cov_raw", None)
+        density_delta = getattr(self, "density_delta", None)
+        quaternions = getattr(self, "quaternions", None)
+        texel_sites_2d = getattr(self, "texel_sites_2d", None)
+        texel_heights = getattr(self, "texel_heights", None)
 
         return (points, density, point_adjacency, point_adjacency_offsets,
                 density_grad, gradient_max_slope,
-                density_peak, delta_raw, cov_raw)
+                density_peak, delta_raw, cov_raw,
+                density_delta, quaternions, texel_sites_2d, texel_heights)
 
     @torch.no_grad()
     def _get_cell_radius(self):
@@ -1547,7 +1572,8 @@ class CTScene(torch.nn.Module):
     ):
         (points, density, point_adjacency, point_adjacency_offsets,
          density_grad, gradient_max_slope,
-         density_peak, delta_raw, cov_raw) = self.get_trace_data()
+         density_peak, delta_raw, cov_raw,
+         density_delta, quaternions, texel_sites_2d, texel_heights) = self.get_trace_data()
 
         interpolation_mode = getattr(self, "_interpolation_mode", False)
         idw_sigma = getattr(self, "_idw_sigma", 0.01)
@@ -1555,12 +1581,15 @@ class CTScene(torch.nn.Module):
         per_cell_sigma = getattr(self, "_per_cell_sigma", False)
         per_neighbor_sigma = getattr(self, "_per_neighbor_sigma", False)
         gaussian_mode = getattr(self, "_gaussian_active", False)
+        thin_surface_mode = getattr(self, "_thin_surface_active", False)
 
-        # Compute cell_radius on demand when adaptive sigma or gaussian mode is active
+        # Compute cell_radius on demand when adaptive sigma, gaussian, or thin-surface mode is active
         cell_radius = None
         if interpolation_mode and (per_cell_sigma or per_neighbor_sigma):
             cell_radius = self._get_cell_radius()
         if gaussian_mode and density_peak is not None:
+            cell_radius = self._get_cell_radius()
+        if thin_surface_mode and density_delta is not None:
             cell_radius = self._get_cell_radius()
 
         # When interpolation is active, suppress the linear gradient feature
@@ -1596,6 +1625,11 @@ class CTScene(torch.nn.Module):
             density_peak,
             delta_raw,
             cov_raw,
+            thin_surface_mode,
+            density_delta,
+            quaternions,
+            texel_sites_2d,
+            texel_heights,
         )
 
     def declare_optimizer(self, args, warmup, max_iterations):
@@ -1707,6 +1741,96 @@ class CTScene(torch.nn.Module):
               f"(peak_lr={args.peak_lr_init}, offset_lr={args.offset_lr_init}, "
               f"cov_lr={args.cov_lr_init})")
 
+    def initialize_thin_surface(self, args, K: int = 4):
+        """Activate the two-sided thin-surface sub-cell partition.
+
+        Called once at iteration M0 (Stage 1 init). Registers density_delta,
+        quaternions, texel_sites_2d, texel_heights as learnable parameters and
+        adds them to the optimizer with separate (lower) learning rates.
+        """
+        N = self.primal_points.shape[0]
+        device = self.device
+
+        # Initialise density_base ← existing density (they share the same raw storage);
+        # delta starts at 0 so μ₊ = μ₋ = softplus(density_base) initially.
+        self.density_delta = nn.Parameter(
+            torch.zeros(N, 1, device=device, dtype=torch.float32)
+        )
+
+        # Quaternions: identity [w=1, x=0, y=0, z=0] → surface normal points along +X
+        # until the boundary-alignment eigenvectors are available for warm-start.
+        q0 = torch.zeros(N, 4, device=device, dtype=torch.float32)
+        q0[:, 0] = 1.0
+        # Warm-start orientation from cached top eigenvector if available.
+        if hasattr(self, "_last_top_eigvec"):
+            v = self._last_top_eigvec  # (N, 3) unit vectors, detached
+            # Build quaternion that rotates [1,0,0] (default normal) onto v.
+            # Using the half-angle formula: q = [cos(θ/2), sin(θ/2)*(e×v)].
+            ref = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=torch.float32)
+            ref = ref.unsqueeze(0).expand(N, -1)
+            cross = torch.cross(ref, v, dim=-1)         # (N, 3)
+            dot   = (ref * v).sum(dim=-1, keepdim=True) # (N, 1)
+            cn    = cross.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            # sin(θ) = |cross|, cos(θ) = dot
+            w = torch.sqrt(((dot + 1.0) * 0.5).clamp_min(0.0))  # cos(θ/2)
+            xyz = cross / (2.0 * w.clamp_min(1e-12))             # sin(θ/2) * axis
+            q0 = torch.cat([w, xyz], dim=-1)
+            q0 = q0 / q0.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            # Flip to upper hemisphere (w ≥ 0) for sign consistency.
+            q0 = q0 * torch.sign(q0[:, :1]).clamp_min(1.0)
+        self.quaternions = nn.Parameter(q0)
+
+        # Texel sites: small jittered grid in the unit disc, K sites per cell.
+        angles = torch.linspace(0, 2 * 3.14159265, K + 1, device=device)[:-1]
+        base_sites = torch.stack([
+            torch.cos(angles) * 0.4,
+            torch.sin(angles) * 0.4,
+        ], dim=-1)  # (K, 2)
+        jitter = (torch.rand(N, K, 2, device=device) - 0.5) * 0.05
+        self.texel_sites_2d = nn.Parameter(
+            base_sites.unsqueeze(0).expand(N, -1, -1) + jitter
+        )
+
+        # Heights: zero → flat surface, no contribution until δ grows.
+        self.texel_heights = nn.Parameter(
+            torch.zeros(N, K, device=device, dtype=torch.float32)
+        )
+
+        thin_surface_lr = args.density_lr_init * 0.1
+
+        self.optimizer.add_param_group({
+            "params": self.density_delta,
+            "lr": thin_surface_lr,
+            "name": "density_delta",
+        })
+        self.optimizer.add_param_group({
+            "params": self.quaternions,
+            "lr": thin_surface_lr,
+            "name": "quaternions",
+        })
+        self.optimizer.add_param_group({
+            "params": self.texel_sites_2d,
+            "lr": thin_surface_lr,
+            "name": "texel_sites_2d",
+        })
+        self.optimizer.add_param_group({
+            "params": self.texel_heights,
+            "lr": thin_surface_lr,
+            "name": "texel_heights",
+        })
+
+        self.thin_surface_scheduler_args = get_cosine_lr_func(
+            lr_init=thin_surface_lr,
+            lr_final=thin_surface_lr * 0.1,
+            max_steps=self._max_iterations - args.thin_surface_start,
+        )
+        self._thin_surface_start = args.thin_surface_start
+        self._thin_surface_active = True
+        self._thin_K = K
+
+        print(f"Initialized thin-surface params: {N} cells, K={K} texels "
+              f"(lr={thin_surface_lr:.2e})")
+
     def update_learning_rate(self, iteration):
         # Freeze positions while density gradients stabilize
         freeze_for_grad = (
@@ -1746,6 +1870,13 @@ class CTScene(torch.nn.Module):
                         iteration - self._gaussian_start
                     )
                     param_group["lr"] = lr
+            elif param_group["name"] in ("density_delta", "quaternions",
+                                         "texel_sites_2d", "texel_heights"):
+                if hasattr(self, "thin_surface_scheduler_args"):
+                    lr = self.thin_surface_scheduler_args(
+                        iteration - self._thin_surface_start
+                    )
+                    param_group["lr"] = lr
 
     def prune_optimizer(self, mask):
         optimizable_tensors = {}
@@ -1782,6 +1913,14 @@ class CTScene(torch.nn.Module):
             self.delta_raw = optimizable_tensors["delta_raw"]
         if "cov_raw" in optimizable_tensors:
             self.cov_raw = optimizable_tensors["cov_raw"]
+        if "density_delta" in optimizable_tensors:
+            self.density_delta = optimizable_tensors["density_delta"]
+        if "quaternions" in optimizable_tensors:
+            self.quaternions = optimizable_tensors["quaternions"]
+        if "texel_sites_2d" in optimizable_tensors:
+            self.texel_sites_2d = optimizable_tensors["texel_sites_2d"]
+        if "texel_heights" in optimizable_tensors:
+            self.texel_heights = optimizable_tensors["texel_heights"]
         if hasattr(self, '_starvation_count'):
             self._starvation_count = self._starvation_count[valid_points_mask]
         if hasattr(self, '_frozen_mask'):
@@ -1845,6 +1984,14 @@ class CTScene(torch.nn.Module):
             self.delta_raw = optimizable_tensors["delta_raw"]
         if "cov_raw" in optimizable_tensors:
             self.cov_raw = optimizable_tensors["cov_raw"]
+        if "density_delta" in optimizable_tensors:
+            self.density_delta = optimizable_tensors["density_delta"]
+        if "quaternions" in optimizable_tensors:
+            self.quaternions = optimizable_tensors["quaternions"]
+        if "texel_sites_2d" in optimizable_tensors:
+            self.texel_sites_2d = optimizable_tensors["texel_sites_2d"]
+        if "texel_heights" in optimizable_tensors:
+            self.texel_heights = optimizable_tensors["texel_heights"]
         if hasattr(self, '_starvation_count'):
             self._starvation_count = torch.cat([
                 self._starvation_count,
@@ -2215,6 +2362,21 @@ class CTScene(torch.nn.Module):
                 new_params["density_peak"] = sampled_peak
                 new_params["delta_raw"] = sampled_dr
                 new_params["cov_raw"] = sampled_cov
+            if getattr(self, "_thin_surface_active", False):
+                n_s = sampled_points.shape[0]
+                K = getattr(self, "_thin_K", 4)
+                dev = sampled_points.device
+                new_params["density_delta"] = torch.zeros(n_s, 1, device=dev)
+                q0 = torch.zeros(n_s, 4, device=dev)
+                q0[:, 0] = 1.0
+                new_params["quaternions"] = q0
+                angles = torch.linspace(0, 2 * 3.14159265, K + 1, device=dev)[:-1]
+                base_sites = torch.stack([
+                    torch.cos(angles) * 0.4,
+                    torch.sin(angles) * 0.4,
+                ], dim=-1)
+                new_params["texel_sites_2d"] = base_sites.unsqueeze(0).expand(n_s, -1, -1).clone()
+                new_params["texel_heights"] = torch.zeros(n_s, K, device=dev)
 
             prune_mask = torch.cat(
                 (

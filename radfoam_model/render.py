@@ -31,6 +31,11 @@ class TraceRays(torch.autograd.Function):
         _density_peak=None,
         _delta_raw=None,
         _cov_raw=None,
+        _thin_surface_mode=False,
+        _density_delta=None,
+        _quaternions=None,
+        _texel_sites_2d=None,
+        _texel_heights=None,
     ):
         ctx.rays = rays
         ctx.start_point = start_point
@@ -49,12 +54,19 @@ class TraceRays(torch.autograd.Function):
         ctx.cell_radius = _cell_radius
         ctx.gaussian_mode = _gaussian_mode
         ctx.has_gaussian = _density_peak is not None
+        ctx.thin_surface_mode = _thin_surface_mode
+        ctx.has_thin_surface = _density_delta is not None
         if ctx.has_density_grad:
             ctx.density_grad = _density_grad
         if ctx.has_gaussian:
             ctx.density_peak = _density_peak
             ctx.delta_raw = _delta_raw
             ctx.cov_raw = _cov_raw
+        if ctx.has_thin_surface:
+            ctx.density_delta = _density_delta
+            ctx.quaternions = _quaternions
+            ctx.texel_sites_2d = _texel_sites_2d
+            ctx.texel_heights = _texel_heights
 
         results = pipeline.trace_forward(
             _points,
@@ -76,6 +88,11 @@ class TraceRays(torch.autograd.Function):
             density_peak=_density_peak,
             delta_raw=_delta_raw,
             cov_raw=_cov_raw,
+            thin_surface_mode=_thin_surface_mode,
+            density_delta=_density_delta,
+            quaternions=_quaternions,
+            texel_sites_2d=_texel_sites_2d,
+            texel_heights=_texel_heights,
         )
 
         errbox = ErrorBox()
@@ -124,6 +141,12 @@ class TraceRays(torch.autograd.Function):
         _density_peak = ctx.density_peak if has_gaussian else None
         _delta_raw = ctx.delta_raw if has_gaussian else None
         _cov_raw = ctx.cov_raw if has_gaussian else None
+        thin_surface_mode = ctx.thin_surface_mode
+        has_thin_surface = ctx.has_thin_surface
+        _density_delta = ctx.density_delta if has_thin_surface else None
+        _quaternions = ctx.quaternions if has_thin_surface else None
+        _texel_sites_2d = ctx.texel_sites_2d if has_thin_surface else None
+        _texel_heights = ctx.texel_heights if has_thin_surface else None
 
         results = pipeline.trace_backward(
             _points,
@@ -146,6 +169,11 @@ class TraceRays(torch.autograd.Function):
             density_peak=_density_peak,
             delta_raw=_delta_raw,
             cov_raw=_cov_raw,
+            thin_surface_mode=thin_surface_mode,
+            density_delta=_density_delta,
+            quaternions=_quaternions,
+            texel_sites_2d=_texel_sites_2d,
+            texel_heights=_texel_heights,
         )
         points_grad = results["points_grad"]
         attr_grad = results["attr_grad"]
@@ -153,6 +181,10 @@ class TraceRays(torch.autograd.Function):
         density_peak_grad = results.get("density_peak_grad", None)
         delta_raw_grad = results.get("delta_raw_grad", None)
         cov_raw_grad = results.get("cov_raw_grad", None)
+        density_delta_grad = results.get("density_delta_grad", None)
+        quaternions_grad = results.get("quaternions_grad", None)
+        texel_sites_2d_grad = results.get("texel_sites_2d_grad", None)
+        texel_heights_grad = results.get("texel_heights_grad", None)
         ctx.errbox.point_error = results.get("point_error", None)
 
         points_grad[~points_grad.isfinite()] = 0
@@ -165,6 +197,14 @@ class TraceRays(torch.autograd.Function):
             delta_raw_grad[~delta_raw_grad.isfinite()] = 0
         if cov_raw_grad is not None:
             cov_raw_grad[~cov_raw_grad.isfinite()] = 0
+        if density_delta_grad is not None:
+            density_delta_grad[~density_delta_grad.isfinite()] = 0
+        if quaternions_grad is not None:
+            quaternions_grad[~quaternions_grad.isfinite()] = 0
+        if texel_sites_2d_grad is not None:
+            texel_sites_2d_grad[~texel_sites_2d_grad.isfinite()] = 0
+        if texel_heights_grad is not None:
+            texel_heights_grad[~texel_heights_grad.isfinite()] = 0
 
         del (
             ctx.rays,
@@ -184,31 +224,40 @@ class TraceRays(torch.autograd.Function):
             ctx.cell_radius,
             ctx.gaussian_mode,
             ctx.has_gaussian,
+            ctx.thin_surface_mode,
+            ctx.has_thin_surface,
         )
         if has_density_grad:
             del ctx.density_grad
         if has_gaussian:
             del ctx.density_peak, ctx.delta_raw, ctx.cov_raw
+        if has_thin_surface:
+            del ctx.density_delta, ctx.quaternions, ctx.texel_sites_2d, ctx.texel_heights
 
         return (
-            None,  # pipeline
-            points_grad,  # _points
-            attr_grad,  # _density
-            None,  # _point_adjacency
-            None,  # _point_adjacency_offsets
-            None,  # rays
-            None,  # start_point
-            None,  # return_contribution
+            None,               # pipeline
+            points_grad,        # _points
+            attr_grad,          # _density
+            None,               # _point_adjacency
+            None,               # _point_adjacency_offsets
+            None,               # rays
+            None,               # start_point
+            None,               # return_contribution
             density_grad_grad,  # _density_grad
-            None,  # _gradient_max_slope
-            None,  # _interpolation_mode
-            None,  # _idw_sigma
-            None,  # _idw_sigma_v
-            None,  # _per_cell_sigma
-            None,  # _per_neighbor_sigma
-            None,  # _cell_radius
-            None,  # _gaussian_mode
+            None,               # _gradient_max_slope
+            None,               # _interpolation_mode
+            None,               # _idw_sigma
+            None,               # _idw_sigma_v
+            None,               # _per_cell_sigma
+            None,               # _per_neighbor_sigma
+            None,               # _cell_radius
+            None,               # _gaussian_mode
             density_peak_grad,  # _density_peak
-            delta_raw_grad,  # _delta_raw
-            cov_raw_grad,  # _cov_raw
+            delta_raw_grad,     # _delta_raw
+            cov_raw_grad,       # _cov_raw
+            None,               # _thin_surface_mode
+            density_delta_grad, # _density_delta
+            quaternions_grad,   # _quaternions
+            texel_sites_2d_grad, # _texel_sites_2d
+            texel_heights_grad, # _texel_heights
         )

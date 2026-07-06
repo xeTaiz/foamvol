@@ -192,6 +192,12 @@ class OptimizationParams(ParamGroup):
         self.offset_lr_final = 1e-4
         self.cov_lr_init = 1e-2
         self.cov_lr_final = 1e-3
+        # Thin-surface sub-cell partition
+        self.thin_surface_start = -1       # iteration to activate (-1 = disabled)
+        self.thin_surface_K = 4            # texel sites per cell
+        self.thin_surface_delta_weight = 1e-3   # L2 penalty on density_delta
+        self.thin_surface_height_weight = 1e-3  # L1 penalty on texel_heights
+        self.thin_surface_gate_tau = 0.01  # height L1 norm threshold for regularizer gating
         super().__init__(parser, "Setting Optimization parameters")
 
 

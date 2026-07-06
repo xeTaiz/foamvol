@@ -168,7 +168,12 @@ py::object trace_forward(Pipeline &self,
                          bool gaussian_mode,
                          std::optional<torch::Tensor> density_peak_in,
                          std::optional<torch::Tensor> delta_raw_in,
-                         std::optional<torch::Tensor> cov_raw_in) {
+                         std::optional<torch::Tensor> cov_raw_in,
+                         bool thin_surface_mode,
+                         std::optional<torch::Tensor> density_delta_in,
+                         std::optional<torch::Tensor> quaternions_in,
+                         std::optional<torch::Tensor> texel_sites_2d_in,
+                         std::optional<torch::Tensor> texel_heights_in) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -238,6 +243,22 @@ py::object trace_forward(Pipeline &self,
         cov_raw_t = cov_raw_in.value().contiguous();
     }
 
+    bool has_density_delta = density_delta_in.has_value();
+    torch::Tensor density_delta_t;
+    if (has_density_delta) density_delta_t = density_delta_in.value().contiguous();
+
+    bool has_quaternions = quaternions_in.has_value();
+    torch::Tensor quaternions_t;
+    if (has_quaternions) quaternions_t = quaternions_in.value().contiguous();
+
+    bool has_texel_sites = texel_sites_2d_in.has_value();
+    torch::Tensor texel_sites_t;
+    if (has_texel_sites) texel_sites_t = texel_sites_2d_in.value().contiguous();
+
+    bool has_texel_heights = texel_heights_in.has_value();
+    torch::Tensor texel_heights_t;
+    if (has_texel_heights) texel_heights_t = texel_heights_in.value().contiguous();
+
     TraceSettings settings = default_trace_settings();
     if (!max_intersections.is_none()) {
         settings.max_intersections = max_intersections.cast<uint32_t>();
@@ -249,6 +270,7 @@ py::object trace_forward(Pipeline &self,
     settings.per_cell_sigma = per_cell_sigma;
     settings.per_neighbor_sigma = per_neighbor_sigma;
     settings.gaussian_mode = gaussian_mode;
+    settings.thin_surface_mode = thin_surface_mode;
 
     std::vector<int64_t> output_shape;
     for (int i = 0; i < rays.dim() - 1; i++) {
@@ -315,6 +337,18 @@ py::object trace_forward(Pipeline &self,
             : nullptr,
         has_cov_raw
             ? reinterpret_cast<const float *>(cov_raw_t.data_ptr())
+            : nullptr,
+        has_density_delta
+            ? reinterpret_cast<const float *>(density_delta_t.data_ptr())
+            : nullptr,
+        has_quaternions
+            ? reinterpret_cast<const float *>(quaternions_t.data_ptr())
+            : nullptr,
+        has_texel_sites
+            ? reinterpret_cast<const float *>(texel_sites_t.data_ptr())
+            : nullptr,
+        has_texel_heights
+            ? reinterpret_cast<const float *>(texel_heights_t.data_ptr())
             : nullptr);
 
     py::dict output_dict;
@@ -350,7 +384,12 @@ py::object trace_backward(Pipeline &self,
                           bool gaussian_mode,
                           std::optional<torch::Tensor> density_peak_in,
                           std::optional<torch::Tensor> delta_raw_in,
-                          std::optional<torch::Tensor> cov_raw_in) {
+                          std::optional<torch::Tensor> cov_raw_in,
+                          bool thin_surface_mode,
+                          std::optional<torch::Tensor> density_delta_in,
+                          std::optional<torch::Tensor> quaternions_in,
+                          std::optional<torch::Tensor> texel_sites_2d_in,
+                          std::optional<torch::Tensor> texel_heights_in) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -469,6 +508,23 @@ py::object trace_backward(Pipeline &self,
     settings.per_cell_sigma = per_cell_sigma;
     settings.per_neighbor_sigma = per_neighbor_sigma;
     settings.gaussian_mode = gaussian_mode;
+    settings.thin_surface_mode = thin_surface_mode;
+
+    bool has_density_delta = density_delta_in.has_value();
+    torch::Tensor density_delta_t;
+    if (has_density_delta) density_delta_t = density_delta_in.value().contiguous();
+
+    bool has_quaternions = quaternions_in.has_value();
+    torch::Tensor quaternions_t;
+    if (has_quaternions) quaternions_t = quaternions_in.value().contiguous();
+
+    bool has_texel_sites = texel_sites_2d_in.has_value();
+    torch::Tensor texel_sites_t;
+    if (has_texel_sites) texel_sites_t = texel_sites_2d_in.value().contiguous();
+
+    bool has_texel_heights = texel_heights_in.has_value();
+    torch::Tensor texel_heights_t;
+    if (has_texel_heights) texel_heights_t = texel_heights_in.value().contiguous();
 
     int64_t num_attr = attributes.size(0);
 
@@ -501,6 +557,25 @@ py::object trace_backward(Pipeline &self,
             torch::dtype(torch::kFloat32).device(rays.device()));
         cov_raw_grad_t = torch::zeros(
             {(int64_t)num_points, 6},
+            torch::dtype(torch::kFloat32).device(rays.device()));
+    }
+
+    // Thin-surface gradient tensors
+    const int thin_K = settings.thin_K;
+    torch::Tensor density_delta_grad_t, quaternions_grad_t,
+                  texel_sites_grad_t, texel_heights_grad_t;
+    if (thin_surface_mode && has_density_delta) {
+        density_delta_grad_t = torch::zeros(
+            {(int64_t)num_points},
+            torch::dtype(torch::kFloat32).device(rays.device()));
+        quaternions_grad_t = torch::zeros(
+            {(int64_t)num_points, 4},
+            torch::dtype(torch::kFloat32).device(rays.device()));
+        texel_sites_grad_t = torch::zeros(
+            {(int64_t)num_points, thin_K, 2},
+            torch::dtype(torch::kFloat32).device(rays.device()));
+        texel_heights_grad_t = torch::zeros(
+            {(int64_t)num_points, thin_K},
             torch::dtype(torch::kFloat32).device(rays.device()));
     }
 
@@ -550,6 +625,30 @@ py::object trace_backward(Pipeline &self,
             : nullptr,
         (gaussian_mode && has_cov_raw)
             ? reinterpret_cast<float *>(cov_raw_grad_t.data_ptr())
+            : nullptr,
+        (thin_surface_mode && has_density_delta)
+            ? reinterpret_cast<const float *>(density_delta_t.data_ptr())
+            : nullptr,
+        (thin_surface_mode && has_quaternions)
+            ? reinterpret_cast<const float *>(quaternions_t.data_ptr())
+            : nullptr,
+        (thin_surface_mode && has_texel_sites)
+            ? reinterpret_cast<const float *>(texel_sites_t.data_ptr())
+            : nullptr,
+        (thin_surface_mode && has_texel_heights)
+            ? reinterpret_cast<const float *>(texel_heights_t.data_ptr())
+            : nullptr,
+        (thin_surface_mode && has_density_delta)
+            ? reinterpret_cast<float *>(density_delta_grad_t.data_ptr())
+            : nullptr,
+        (thin_surface_mode && has_quaternions)
+            ? reinterpret_cast<float *>(quaternions_grad_t.data_ptr())
+            : nullptr,
+        (thin_surface_mode && has_texel_sites)
+            ? reinterpret_cast<float *>(texel_sites_grad_t.data_ptr())
+            : nullptr,
+        (thin_surface_mode && has_texel_heights)
+            ? reinterpret_cast<float *>(texel_heights_grad_t.data_ptr())
             : nullptr);
 
     py::dict output_dict;
@@ -563,6 +662,12 @@ py::object trace_backward(Pipeline &self,
         output_dict["density_peak_grad"] = density_peak_grad_t;
         output_dict["delta_raw_grad"] = delta_raw_grad_t;
         output_dict["cov_raw_grad"] = cov_raw_grad_t;
+    }
+    if (thin_surface_mode && has_density_delta) {
+        output_dict["density_delta_grad"] = density_delta_grad_t;
+        output_dict["quaternions_grad"] = quaternions_grad_t;
+        output_dict["texel_sites_2d_grad"] = texel_sites_grad_t;
+        output_dict["texel_heights_grad"] = texel_heights_grad_t;
     }
     if (return_error) {
         output_dict["point_error"] = point_error;
@@ -638,7 +743,12 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("gaussian_mode") = false,
              py::arg("density_peak") = py::none(),
              py::arg("delta_raw") = py::none(),
-             py::arg("cov_raw") = py::none())
+             py::arg("cov_raw") = py::none(),
+             py::arg("thin_surface_mode") = false,
+             py::arg("density_delta") = py::none(),
+             py::arg("quaternions") = py::none(),
+             py::arg("texel_sites_2d") = py::none(),
+             py::arg("texel_heights") = py::none())
         .def("trace_backward",
              trace_backward,
              py::arg("points"),
@@ -661,7 +771,12 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("gaussian_mode") = false,
              py::arg("density_peak") = py::none(),
              py::arg("delta_raw") = py::none(),
-             py::arg("cov_raw") = py::none());
+             py::arg("cov_raw") = py::none(),
+             py::arg("thin_surface_mode") = false,
+             py::arg("density_delta") = py::none(),
+             py::arg("quaternions") = py::none(),
+             py::arg("texel_sites_2d") = py::none(),
+             py::arg("texel_heights") = py::none());
 
     module.def("create_ct_pipeline", create_ct_pipeline_binding);
 
