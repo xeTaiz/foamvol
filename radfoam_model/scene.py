@@ -10,6 +10,30 @@ import tqdm
 
 import radfoam
 from radfoam_model.render import TraceRays
+
+# K values with a verified forward+backward gradcheck. K=8 is blocked until the
+# CUDA backward's fixed-size w_arr[8] path and adjoint are gradient-checked
+# (see specs/SPLIT-CELL-EXPERIMENT-PLAN-v2.md, Phase 0 item 4).
+_SUPPORTED_THIN_K = (4,)
+# Hard cap from the backward kernel's stack buffer `w_arr[8]` (pipeline.cu).
+_THIN_K_HARD_CAP = 8
+
+
+def assert_supported_thin_K(K: int) -> None:
+    """Validate thin_surface_K. K=4 is the only verified value for now."""
+    if not isinstance(K, int) or K <= 0:
+        raise ValueError(f"thin_surface_K must be a positive int, got {K!r}")
+    if K > _THIN_K_HARD_CAP:
+        raise ValueError(
+            f"thin_surface_K={K} exceeds hard cap {_THIN_K_HARD_CAP} "
+            f"(CUDA backward w_arr size)."
+        )
+    if K not in _SUPPORTED_THIN_K:
+        raise ValueError(
+            f"thin_surface_K={K} is not yet verified. Supported: "
+            f"{_SUPPORTED_THIN_K}. Extend _SUPPORTED_THIN_K only after a "
+            f"finite-difference gradcheck passes for that K."
+        )
 from radfoam_model.utils import *
 
 
@@ -1630,6 +1654,9 @@ class CTScene(torch.nn.Module):
             quaternions,
             texel_sites_2d,
             texel_heights,
+            getattr(self, "_thin_K", 4),
+            getattr(self, "_thin_temp", 10.0),
+            getattr(self, "_thin_height_eps", 1e-4),
         )
 
     def declare_optimizer(self, args, warmup, max_iterations):
@@ -1744,92 +1771,117 @@ class CTScene(torch.nn.Module):
     def initialize_thin_surface(self, args, K: int = 4):
         """Activate the two-sided thin-surface sub-cell partition.
 
-        Called once at iteration M0 (Stage 1 init). Registers density_delta,
-        quaternions, texel_sites_2d, texel_heights as learnable parameters and
-        adds them to the optimizer with separate (lower) learning rates.
+        Called once at iteration M0 (Stage 1 init), or after `load_pt` when
+        resuming training (in which case the four tensors already exist on the
+        scene and are kept as-is — only the optimizer param groups and the LR
+        scheduler are (re)attached).
+
+        Registers density_delta, quaternions, texel_sites_2d, texel_heights as
+        learnable parameters and adds them to the optimizer with separate
+        (lower) learning rates.
         """
+        assert_supported_thin_K(K)
         N = self.primal_points.shape[0]
         device = self.device
 
-        # Initialise density_base ← existing density (they share the same raw storage);
-        # delta starts at 0 so μ₊ = μ₋ = softplus(density_base) initially.
-        self.density_delta = nn.Parameter(
-            torch.zeros(N, 1, device=device, dtype=torch.float32)
+        resume = (
+            getattr(self, "_thin_surface_active", False)
+            and getattr(self, "density_delta", None) is not None
         )
 
-        # Quaternions: identity [w=1, x=0, y=0, z=0] → surface normal points along +X
-        # until the boundary-alignment eigenvectors are available for warm-start.
-        q0 = torch.zeros(N, 4, device=device, dtype=torch.float32)
-        q0[:, 0] = 1.0
-        # Warm-start orientation from cached top eigenvector if available.
-        if hasattr(self, "_last_top_eigvec"):
-            v = self._last_top_eigvec  # (N, 3) unit vectors, detached
-            # Build quaternion that rotates [1,0,0] (default normal) onto v.
-            # Using the half-angle formula: q = [cos(θ/2), sin(θ/2)*(e×v)].
-            ref = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=torch.float32)
-            ref = ref.unsqueeze(0).expand(N, -1)
-            cross = torch.cross(ref, v, dim=-1)         # (N, 3)
-            dot   = (ref * v).sum(dim=-1, keepdim=True) # (N, 1)
-            cn    = cross.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-            # sin(θ) = |cross|, cos(θ) = dot
-            w = torch.sqrt(((dot + 1.0) * 0.5).clamp_min(0.0))  # cos(θ/2)
-            xyz = cross / (2.0 * w.clamp_min(1e-12))             # sin(θ/2) * axis
-            q0 = torch.cat([w, xyz], dim=-1)
-            q0 = q0 / q0.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-            # Flip to upper hemisphere (w ≥ 0) for sign consistency.
-            q0 = q0 * torch.sign(q0[:, :1]).clamp_min(1.0)
-        self.quaternions = nn.Parameter(q0)
+        if not resume:
+            # Initialise density_base ← existing density (they share the same
+            # raw storage); delta starts at 0 so μ₊ = μ₋ = softplus(base).
+            self.density_delta = nn.Parameter(
+                torch.zeros(N, 1, device=device, dtype=torch.float32)
+            )
 
-        # Texel sites: small jittered grid in the unit disc, K sites per cell.
-        angles = torch.linspace(0, 2 * 3.14159265, K + 1, device=device)[:-1]
-        base_sites = torch.stack([
-            torch.cos(angles) * 0.4,
-            torch.sin(angles) * 0.4,
-        ], dim=-1)  # (K, 2)
-        jitter = (torch.rand(N, K, 2, device=device) - 0.5) * 0.05
-        self.texel_sites_2d = nn.Parameter(
-            base_sites.unsqueeze(0).expand(N, -1, -1) + jitter
-        )
+            # Quaternions: identity [w=1, x=0, y=0, z=0] → normal along +X until
+            # boundary-alignment eigenvectors are available for warm-start.
+            q0 = torch.zeros(N, 4, device=device, dtype=torch.float32)
+            q0[:, 0] = 1.0
+            if hasattr(self, "_last_top_eigvec"):
+                v = self._last_top_eigvec  # (N, 3) unit vectors, detached
+                # Quaternion rotating [1,0,0] onto v via the half-angle formula.
+                ref = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=torch.float32)
+                ref = ref.unsqueeze(0).expand(N, -1)
+                cross = torch.cross(ref, v, dim=-1)         # (N, 3)
+                dot   = (ref * v).sum(dim=-1, keepdim=True) # (N, 1)
+                # sin(θ) = |cross|, cos(θ) = dot
+                w = torch.sqrt(((dot + 1.0) * 0.5).clamp_min(0.0))  # cos(θ/2)
+                xyz = cross / (2.0 * w.clamp_min(1e-12))             # sin(θ/2) * axis
+                q0 = torch.cat([w, xyz], dim=-1)
+                q0 = q0 / q0.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                # Flip to upper hemisphere (w ≥ 0) for sign consistency.
+                q0 = q0 * torch.sign(q0[:, :1]).clamp_min(1.0)
+            self.quaternions = nn.Parameter(q0)
 
-        # Heights: zero → flat surface, no contribution until δ grows.
-        self.texel_heights = nn.Parameter(
-            torch.zeros(N, K, device=device, dtype=torch.float32)
-        )
+            # Texel sites: small jittered ring (radius 0.4) in the unit disc.
+            angles = torch.linspace(0, 2 * 3.14159265, K + 1, device=device)[:-1]
+            base_sites = torch.stack([
+                torch.cos(angles) * 0.4,
+                torch.sin(angles) * 0.4,
+            ], dim=-1)  # (K, 2)
+            jitter = (torch.rand(N, K, 2, device=device) - 0.5) * 0.05
+            self.texel_sites_2d = nn.Parameter(
+                base_sites.unsqueeze(0).expand(N, -1, -1) + jitter
+            )
+
+            # Heights: zero → flat surface, no contribution until δ grows.
+            self.texel_heights = nn.Parameter(
+                torch.zeros(N, K, device=device, dtype=torch.float32)
+            )
+        else:
+            # Resuming from a checkpoint that already restored the tensors.
+            # Validate shapes against the current point count and K.
+            for name, shp in [
+                ("density_delta", (N, 1)),
+                ("quaternions", (N, 4)),
+                ("texel_sites_2d", (N, K, 2)),
+                ("texel_heights", (N, K)),
+            ]:
+                t = getattr(self, name)
+                if tuple(t.shape) != shp:
+                    raise RuntimeError(
+                        f"resume thin-surface: {name} shape {tuple(t.shape)} "
+                        f"!= expected {shp} (N={N}, K={K}). The checkpoint "
+                        f"was saved with a different K or point count."
+                    )
+            print(f"[thin-surface] resuming with loaded tensors (N={N}, K={K})")
 
         thin_surface_lr = args.density_lr_init * 0.1
 
-        self.optimizer.add_param_group({
-            "params": self.density_delta,
-            "lr": thin_surface_lr,
-            "name": "density_delta",
-        })
-        self.optimizer.add_param_group({
-            "params": self.quaternions,
-            "lr": thin_surface_lr,
-            "name": "quaternions",
-        })
-        self.optimizer.add_param_group({
-            "params": self.texel_sites_2d,
-            "lr": thin_surface_lr,
-            "name": "texel_sites_2d",
-        })
-        self.optimizer.add_param_group({
-            "params": self.texel_heights,
-            "lr": thin_surface_lr,
-            "name": "texel_heights",
-        })
+        # Attach optimizer param groups (skip names already present — idempotent
+        # across repeated initialize_thin_surface calls on the same optimizer).
+        existing = {g["name"] for g in self.optimizer.param_groups}
+        for p, name in [
+            (self.density_delta, "density_delta"),
+            (self.quaternions, "quaternions"),
+            (self.texel_sites_2d, "texel_sites_2d"),
+            (self.texel_heights, "texel_heights"),
+        ]:
+            if name not in existing:
+                self.optimizer.add_param_group({
+                    "params": p, "lr": thin_surface_lr, "name": name,
+                })
 
         self.thin_surface_scheduler_args = get_cosine_lr_func(
             lr_init=thin_surface_lr,
             lr_final=thin_surface_lr * 0.1,
             max_steps=self._max_iterations - args.thin_surface_start,
         )
+        # Persist scheduler config so load_pt can rebuild it for resumed training.
+        self._thin_surface_scheduler_cfg = {
+            "lr_init": thin_surface_lr,
+            "lr_final": thin_surface_lr * 0.1,
+            "max_steps": self._max_iterations - args.thin_surface_start,
+        }
         self._thin_surface_start = args.thin_surface_start
         self._thin_surface_active = True
         self._thin_K = K
 
         print(f"Initialized thin-surface params: {N} cells, K={K} texels "
-              f"(lr={thin_surface_lr:.2e})")
+              f"(lr={thin_surface_lr:.2e}, resume={resume})")
 
     def update_learning_rate(self, iteration):
         # Freeze positions while density gradients stabilize
@@ -2547,6 +2599,21 @@ class CTScene(torch.nn.Module):
             scene_data["density_peak"] = self.density_peak.detach().float().cpu()
             scene_data["delta_raw"] = self.delta_raw.detach().float().cpu()
             scene_data["cov_raw"] = self.cov_raw.detach().float().cpu()
+        # Thin-surface sub-cell partition (all four tensors + metadata).
+        # Required so test.py / eval_vol.py / voxelize / resumed training can
+        # reconstruct the surface; without this the checkpoint silently drops
+        # to the scalar baseline.
+        if getattr(self, "_thin_surface_active", False) and getattr(self, "density_delta", None) is not None:
+            scene_data["density_delta"] = self.density_delta.detach().float().cpu()
+            scene_data["quaternions"] = self.quaternions.detach().float().cpu()
+            scene_data["texel_sites_2d"] = self.texel_sites_2d.detach().float().cpu()
+            scene_data["texel_heights"] = self.texel_heights.detach().float().cpu()
+            scene_data["thin_surface"] = {
+                "active": True,
+                "K": int(self._thin_K),
+                "start": int(getattr(self, "_thin_surface_start", -1)),
+                "scheduler_cfg": getattr(self, "_thin_surface_scheduler_cfg", None),
+            }
         torch.save(scene_data, pt_path)
 
     def load_pt(self, pt_path):
@@ -2572,6 +2639,32 @@ class CTScene(torch.nn.Module):
                 scene_data["cov_raw"].to(self.device)
             )
             self._gaussian_active = True
+
+        # Thin-surface sub-cell partition. Restores the four tensors and the
+        # metadata flags so `forward()` keys surface mode on. Optimizer param
+        # groups are NOT rebuilt here — call `initialize_thin_surface(args, K)`
+        # after `declare_optimizer` to resume training (it detects the loaded
+        # tensors and only re-attaches the LR scheduler + param groups).
+        if "thin_surface" in scene_data and scene_data["thin_surface"].get("active"):
+            meta = scene_data["thin_surface"]
+            K = int(meta.get("K", 4))
+            assert_supported_thin_K(K)
+            self.density_delta = nn.Parameter(scene_data["density_delta"].to(self.device))
+            self.quaternions = nn.Parameter(scene_data["quaternions"].to(self.device))
+            self.texel_sites_2d = nn.Parameter(scene_data["texel_sites_2d"].to(self.device))
+            self.texel_heights = nn.Parameter(scene_data["texel_heights"].to(self.device))
+            self._thin_K = K
+            self._thin_surface_active = True
+            self._thin_surface_start = int(meta.get("start", -1))
+            self._thin_surface_scheduler_cfg = meta.get("scheduler_cfg", None)
+            if self._thin_surface_scheduler_cfg is not None:
+                self.thin_surface_scheduler_args = get_cosine_lr_func(
+                    lr_init=self._thin_surface_scheduler_cfg["lr_init"],
+                    lr_final=self._thin_surface_scheduler_cfg["lr_final"],
+                    max_steps=self._thin_surface_scheduler_cfg["max_steps"],
+                )
+            print(f"[load_pt] restored thin-surface state: K={K}, "
+                  f"N={self.primal_points.shape[0]}")
 
         self.point_adjacency = scene_data["adjacency"].to(self.device).to(
             torch.uint32)

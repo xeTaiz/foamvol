@@ -173,7 +173,10 @@ py::object trace_forward(Pipeline &self,
                          std::optional<torch::Tensor> density_delta_in,
                          std::optional<torch::Tensor> quaternions_in,
                          std::optional<torch::Tensor> texel_sites_2d_in,
-                         std::optional<torch::Tensor> texel_heights_in) {
+                         std::optional<torch::Tensor> texel_heights_in,
+                         int thin_K,
+                         float thin_temp,
+                         float thin_height_eps) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -271,6 +274,9 @@ py::object trace_forward(Pipeline &self,
     settings.per_neighbor_sigma = per_neighbor_sigma;
     settings.gaussian_mode = gaussian_mode;
     settings.thin_surface_mode = thin_surface_mode;
+    settings.thin_K = thin_K;
+    settings.thin_temp = thin_temp;
+    settings.thin_height_eps = thin_height_eps;
 
     std::vector<int64_t> output_shape;
     for (int i = 0; i < rays.dim() - 1; i++) {
@@ -389,7 +395,10 @@ py::object trace_backward(Pipeline &self,
                           std::optional<torch::Tensor> density_delta_in,
                           std::optional<torch::Tensor> quaternions_in,
                           std::optional<torch::Tensor> texel_sites_2d_in,
-                          std::optional<torch::Tensor> texel_heights_in) {
+                          std::optional<torch::Tensor> texel_heights_in,
+                          int thin_K,
+                          float thin_temp,
+                          float thin_height_eps) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -509,6 +518,9 @@ py::object trace_backward(Pipeline &self,
     settings.per_neighbor_sigma = per_neighbor_sigma;
     settings.gaussian_mode = gaussian_mode;
     settings.thin_surface_mode = thin_surface_mode;
+    settings.thin_K = thin_K;
+    settings.thin_temp = thin_temp;
+    settings.thin_height_eps = thin_height_eps;
 
     bool has_density_delta = density_delta_in.has_value();
     torch::Tensor density_delta_t;
@@ -560,13 +572,16 @@ py::object trace_backward(Pipeline &self,
             torch::dtype(torch::kFloat32).device(rays.device()));
     }
 
-    // Thin-surface gradient tensors
-    const int thin_K = settings.thin_K;
+    // Thin-surface gradient tensors. Shapes MUST match the corresponding
+    // nn.Parameter shapes in CTScene so torch.autograd can accumulate them:
+    //   density_delta (N,1), quaternions (N,4), texel_sites_2d (N,K,2),
+    //   texel_heights (N,K). The trailing size-1 dim on density_delta is
+    //   layout-transparent to the kernel's flat atomicAdd writes.
     torch::Tensor density_delta_grad_t, quaternions_grad_t,
                   texel_sites_grad_t, texel_heights_grad_t;
     if (thin_surface_mode && has_density_delta) {
         density_delta_grad_t = torch::zeros(
-            {(int64_t)num_points},
+            {(int64_t)num_points, 1},
             torch::dtype(torch::kFloat32).device(rays.device()));
         quaternions_grad_t = torch::zeros(
             {(int64_t)num_points, 4},
@@ -748,7 +763,10 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("density_delta") = py::none(),
              py::arg("quaternions") = py::none(),
              py::arg("texel_sites_2d") = py::none(),
-             py::arg("texel_heights") = py::none())
+             py::arg("texel_heights") = py::none(),
+             py::arg("thin_K") = 4,
+             py::arg("thin_temp") = 10.0f,
+             py::arg("thin_height_eps") = 1e-4f)
         .def("trace_backward",
              trace_backward,
              py::arg("points"),
@@ -776,7 +794,10 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("density_delta") = py::none(),
              py::arg("quaternions") = py::none(),
              py::arg("texel_sites_2d") = py::none(),
-             py::arg("texel_heights") = py::none());
+             py::arg("texel_heights") = py::none(),
+             py::arg("thin_K") = 4,
+             py::arg("thin_temp") = 10.0f,
+             py::arg("thin_height_eps") = 1e-4f);
 
     module.def("create_ct_pipeline", create_ct_pipeline_binding);
 

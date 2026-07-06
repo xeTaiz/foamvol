@@ -36,6 +36,9 @@ class TraceRays(torch.autograd.Function):
         _quaternions=None,
         _texel_sites_2d=None,
         _texel_heights=None,
+        _thin_K=4,
+        _thin_temp=10.0,
+        _thin_height_eps=1e-4,
     ):
         ctx.rays = rays
         ctx.start_point = start_point
@@ -56,6 +59,9 @@ class TraceRays(torch.autograd.Function):
         ctx.has_gaussian = _density_peak is not None
         ctx.thin_surface_mode = _thin_surface_mode
         ctx.has_thin_surface = _density_delta is not None
+        ctx.thin_K = _thin_K
+        ctx.thin_temp = _thin_temp
+        ctx.thin_height_eps = _thin_height_eps
         if ctx.has_density_grad:
             ctx.density_grad = _density_grad
         if ctx.has_gaussian:
@@ -93,6 +99,9 @@ class TraceRays(torch.autograd.Function):
             quaternions=_quaternions,
             texel_sites_2d=_texel_sites_2d,
             texel_heights=_texel_heights,
+            thin_K=_thin_K,
+            thin_temp=_thin_temp,
+            thin_height_eps=_thin_height_eps,
         )
 
         errbox = ErrorBox()
@@ -143,6 +152,9 @@ class TraceRays(torch.autograd.Function):
         _cov_raw = ctx.cov_raw if has_gaussian else None
         thin_surface_mode = ctx.thin_surface_mode
         has_thin_surface = ctx.has_thin_surface
+        thin_K = ctx.thin_K
+        thin_temp = ctx.thin_temp
+        thin_height_eps = ctx.thin_height_eps
         _density_delta = ctx.density_delta if has_thin_surface else None
         _quaternions = ctx.quaternions if has_thin_surface else None
         _texel_sites_2d = ctx.texel_sites_2d if has_thin_surface else None
@@ -174,6 +186,9 @@ class TraceRays(torch.autograd.Function):
             quaternions=_quaternions,
             texel_sites_2d=_texel_sites_2d,
             texel_heights=_texel_heights,
+            thin_K=thin_K,
+            thin_temp=thin_temp,
+            thin_height_eps=thin_height_eps,
         )
         points_grad = results["points_grad"]
         attr_grad = results["attr_grad"]
@@ -226,6 +241,9 @@ class TraceRays(torch.autograd.Function):
             ctx.has_gaussian,
             ctx.thin_surface_mode,
             ctx.has_thin_surface,
+            ctx.thin_K,
+            ctx.thin_temp,
+            ctx.thin_height_eps,
         )
         if has_density_grad:
             del ctx.density_grad
@@ -260,4 +278,7 @@ class TraceRays(torch.autograd.Function):
             quaternions_grad,   # _quaternions
             texel_sites_2d_grad, # _texel_sites_2d
             texel_heights_grad, # _texel_heights
+            None,               # _thin_K
+            None,               # _thin_temp
+            None,               # _thin_height_eps
         )
