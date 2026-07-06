@@ -11,6 +11,22 @@ Skip meshing. For voxelization each sample point is assigned to its owning
 Voronoi cell (nearest primal site) and evaluated against that cell's internal
 surface; voxels straddling the surface average both sides via supersampling.
 
+IMPORTANT -- what this metric is and is not:
+  This is a *split-NN query-field* voxelization, not an exact inverse of the
+  CUDA ray renderer. Each voxel sample takes the density of whichever side of
+  its owning cell's learned internal surface the sample point falls on (nearest
+  cell = the Voronoi owner). It does NOT line-integrate along rays, so it is a
+  volumetric field estimate, not a projection-consistent reconstruction.
+  Compare baseline vs thin-surface runs with the SAME script so the query-field
+  convention is held constant across arms.
+
+Side selection / smoothing:
+  By default the side is HARD (no blend): each sample gets mu_plus or mu_minus
+  by sign(signed_dist). Pass blend_eps > 0 (or --blend_eps) to linearly blend
+  across |signed_dist| < blend_eps; this is a voxelization-time smoothing that
+  can silently inflate PSNR against a smooth GT, so it is OFF by default and
+  must be opt-in.
+
 CLI mirrors voxelize.py:
     python split_voxelize.py --model model.pt --resolution 256 --supersample 4
     python split_voxelize.py --model model.pt --gt data/vol_gt.npy
@@ -84,7 +100,7 @@ def split_cell_query(
     cell_radius,        # (N,)
     thin_temp: float = 10.0,
     activation_scale: float = 1.0,
-    eps: float = 1e-4,
+    blend_eps: float = 0.0,
 ):
     """Evaluate the two-sided thin-surface density at a batch of query points.
 
@@ -98,7 +114,8 @@ def split_cell_query(
         w_k = exp(-thin_temp * |p - site3_k|^2 / r^2),
         site3_k = cp + r*(s2d[k,0]*t + s2d[k,1]*b)
       signed distance s = n.(q - cp) - h
-      value = mu_plus if s > 0 else mu_minus  (linear blend across |s| < eps)
+      value = mu_plus if s > 0 else mu_minus  (hard side by default; linear
+      blend across |s| < blend_eps only when blend_eps > 0)
 
     Args:
         query:        (B, 3) sample positions.
@@ -153,13 +170,22 @@ def split_cell_query(
     mu_p = torch.clamp(mu_bar + d_val, min=0.0)
     mu_n = torch.clamp(mu_bar - d_val, min=0.0)
 
-    # Side selection with a thin linear blend band for numerical smoothness.
-    # +n side (s > 0) -> mu_plus ; -n side (s < 0) -> mu_minus.
+    # Side selection. +n side (s > 0) -> mu_plus ; -n side (s < 0) -> mu_minus.
+    # blend_eps == 0 (default): HARD side -- each sample takes one side's
+    # density, no voxelization-time smoothing (avoids silently inflating PSNR).
+    # blend_eps > 0: linear blend across |s| < blend_eps for smoothness.
     s = signed_dist
-    alpha = torch.clamp(0.5 + s / (2.0 * eps), 0.0, 1.0)
+    if blend_eps and blend_eps > 0.0:
+        alpha = torch.clamp(0.5 + s / (2.0 * blend_eps), 0.0, 1.0)
+        side = torch.where(s > blend_eps, torch.ones_like(s),
+                           torch.where(s < -blend_eps, -torch.ones_like(s),
+                                       torch.zeros_like(s)))
+    else:
+        alpha = (s > 0).float()
+        side = torch.where(s > 0, torch.ones_like(s),
+                           torch.where(s < 0, -torch.ones_like(s),
+                                       torch.zeros_like(s)))
     value = alpha * mu_p + (1.0 - alpha) * mu_n
-    side = torch.where(s > eps, torch.ones_like(s),
-                       torch.where(s < -eps, -torch.ones_like(s), torch.zeros_like(s)))
     return value, side, signed_dist
 
 
@@ -178,6 +204,7 @@ def voxelize_split(
     activation_scale=1.0,
     gt_path=None,
     side_map_path=None,
+    blend_eps=0.0,
 ):
     """Voxelize a thin-surface checkpoint into a regular 3D grid.
 
@@ -189,8 +216,11 @@ def voxelize_split(
     scene_data = torch.load(model_path)
     points = scene_data["xyz"].to(device)
     density_flat = scene_data["density"].to(device).squeeze(-1)
-    adjacency = scene_data["adjacency"].to(device).to(torch.int32)
-    adjacency_offsets = scene_data["adjacency_offsets"].to(device).to(torch.int32)
+    # CSR adjacency must be uint32 -- the C++/CUDA pipeline reads it as
+    # uint32_t column indices / row pointers. int32 would misinterpret on
+    # large graphs and is the dtype the trained CTScene stores.
+    adjacency = scene_data["adjacency"].to(device).to(torch.uint32)
+    adjacency_offsets = scene_data["adjacency_offsets"].to(device).to(torch.uint32)
     aabb_tree = radfoam.build_aabb_tree(points)
     _, cell_radius = radfoam.farthest_neighbor(points, adjacency, adjacency_offsets)
 
@@ -213,7 +243,10 @@ def voxelize_split(
     grid_min = torch.tensor([-extent, -extent, -extent], device=device)
     grid_max = torch.tensor([extent, extent, extent], device=device)
 
-    coords = torch.linspace(0, 1, resolution, device=device)
+    # Voxel CENTERS (not endpoints): sample at (i+0.5)/res so each voxel is
+    # represented by its centroid and the grid covers [grid_min, grid_max)
+    # without double-counting the boundary at grid_max.
+    coords = (torch.arange(resolution, device=device) + 0.5) / resolution
     gx, gy, gz = torch.meshgrid(coords, coords, coords, indexing="ij")
     voxel_centers = torch.stack([gx, gy, gz], dim=-1).reshape(-1, 3)
     voxel_centers = grid_min + voxel_centers * (grid_max - grid_min)
@@ -225,6 +258,7 @@ def voxelize_split(
                 query_pts, points, nn_idx, density_flat, density_delta,
                 quaternions, texel_sites_2d, texel_heights, cell_radius,
                 thin_temp=thin_temp, activation_scale=activation_scale,
+                blend_eps=blend_eps,
             )
             return torch.nan_to_num(val), _side
         else:
@@ -319,6 +353,10 @@ def main():
     parser.add_argument("--gt", type=str, default=None)
     parser.add_argument("--side_map", type=str, default=None,
                         help="Optional output path for the +/-1 side-map .npy")
+    parser.add_argument("--blend_eps", type=float, default=0.0,
+                        help="Linear blend band half-width around the surface "
+                             "(0 = hard side, default; >0 softens voxels "
+                             "straddling the surface -- can inflate PSNR)")
     args = parser.parse_args()
 
     output = args.output
@@ -326,7 +364,8 @@ def main():
         output = os.path.join(os.path.dirname(args.model), "volume_split.npy")
     voxelize_split(args.model, args.resolution, output, args.extent,
                    args.blur_sigma, args.supersample, args.thin_temp,
-                   args.activation_scale, args.gt, args.side_map)
+                   args.activation_scale, args.gt, args.side_map,
+                   args.blend_eps)
 
 
 if __name__ == "__main__":

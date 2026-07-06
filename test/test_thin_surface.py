@@ -90,7 +90,7 @@ def test_split_cell_query_side_selection():
     val, side, sd = split_cell_query(
         query, s["points"], nn_idx, s["density"], s["density_delta"],
         s["quaternions"], s["texel_sites_2d"], s["texel_heights"],
-        s["cell_radius"], activation_scale=s["activation_scale"], eps=1e-6)
+        s["cell_radius"], activation_scale=s["activation_scale"], blend_eps=1e-6)
     mu_bar = F.softplus(torch.tensor(2.0), beta=10.0)
     assert torch.isclose(val[0], mu_bar + 0.5, atol=1e-4), val[0]
     assert torch.isclose(val[1], mu_bar - 0.5, atol=1e-4), val[1]
@@ -108,7 +108,7 @@ def test_split_cell_query_inertness():
     val, side, sd = split_cell_query(
         query, s["points"], nn_idx, s["density"], s["density_delta"],
         s["quaternions"], s["texel_sites_2d"], s["texel_heights"],
-        s["cell_radius"], eps=1e-6)
+        s["cell_radius"], blend_eps=1e-6)
     mu_bar = F.softplus(torch.tensor(1.5), beta=10.0)
     assert torch.allclose(val, mu_bar.expand_as(val), atol=1e-5), val
     print("OK test_split_cell_query_inertness")
@@ -130,11 +130,30 @@ def test_split_cell_query_height_field_shifts_boundary():
     val, side, sd = split_cell_query(
         query, s["points"], nn_idx, s["density"], s["density_delta"],
         s["quaternions"], s["texel_sites_2d"], s["texel_heights"],
-        s["cell_radius"], eps=1e-4)
+        s["cell_radius"], blend_eps=1e-4)
     # signed_dist should be ~ (x - h_eval); h_eval ~ h (within the softness).
     assert sd[1] < 0 < sd[0], (sd, "boundary did not shift by ~h")
     assert side[0] > 0 and side[1] < 0, side
     print(f"OK test_split_cell_query_height_field_shifts_boundary (sd={sd.tolist()})")
+
+
+def test_split_cell_query_hard_side_no_blend():
+    """blend_eps=0 (default) -> hard side, no division-by-zero, no smoothing."""
+    s = _single_cell_scene(delta=0.5, mu_raw=2.0)
+    nn_idx = torch.zeros(3, dtype=torch.long)
+    query = torch.tensor([[0.5, 0.0, 0.0], [-0.5, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    val, side, sd = split_cell_query(
+        query, s["points"], nn_idx, s["density"], s["density_delta"],
+        s["quaternions"], s["texel_sites_2d"], s["texel_heights"],
+        s["cell_radius"], blend_eps=0.0)
+    mu_bar = F.softplus(torch.tensor(2.0), beta=10.0)
+    # Hard side: +n -> mu_plus exactly, -n -> mu_minus exactly (no blend).
+    assert torch.isclose(val[0], mu_bar + 0.5, atol=1e-6), val[0]
+    assert torch.isclose(val[1], mu_bar - 0.5, atol=1e-6), val[1]
+    assert side[0] > 0 and side[1] < 0, side
+    # On-surface point (s=0): hard selection picks mu_minus (s>0 is False).
+    assert torch.isclose(val[2], mu_bar - 0.5, atol=1e-6), val[2]
+    print("OK test_split_cell_query_hard_side_no_blend")
 
 
 def test_split_cell_query_matches_kernel_side_convention():
@@ -145,7 +164,7 @@ def test_split_cell_query_matches_kernel_side_convention():
     val, side, _ = split_cell_query(
         query, s["points"], nn_idx, s["density"], s["density_delta"],
         s["quaternions"], s["texel_sites_2d"], s["texel_heights"],
-        s["cell_radius"], eps=1e-6)
+        s["cell_radius"], blend_eps=1e-6)
     mu_bar = F.softplus(torch.tensor(2.0), beta=10.0)
     assert torch.isclose(val[0], mu_bar + 0.4, atol=1e-4), val
     print("OK test_split_cell_query_matches_kernel_side_convention")
@@ -261,6 +280,7 @@ def main():
     test_split_cell_query_side_selection()
     test_split_cell_query_inertness()
     test_split_cell_query_height_field_shifts_boundary()
+    test_split_cell_query_hard_side_no_blend()
     test_split_cell_query_matches_kernel_side_convention()
     test_K_guard()
     test_checkpoint_roundtrip_thin_surface()
