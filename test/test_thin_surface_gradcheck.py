@@ -93,7 +93,12 @@ def _make_1cell_scene(device="cuda", cell_pos=None):
         "init_volume_path": "",
         "frozen_points_file": "",
         "frozen_freeze_density": True,
+        # declare_optimizer (called below, before update_triangulation) needs:
         "density_lr_init": 5e-2,
+        "density_lr_final": 1e-3,
+        "points_lr_init": 2e-4,
+        "points_lr_final": 5e-6,
+        "freeze_points": 9500,
     })()
 
     model = CTScene(args, device=torch.device(device))
@@ -112,7 +117,11 @@ def _make_1cell_scene(device="cuda", cell_pos=None):
         assert pts.shape[0] == MIN_POINTS
         model.primal_points.data.copy_(pts)
 
-    # Must rebuild triangulation after changing point positions.
+    # declare_optimizer MUST run before update_triangulation(rebuild=True):
+    # rebuild may trigger a triangulation permutation, and permute_points()
+    # walks self.optimizer.param_groups -- without an optimizer the scene build
+    # raises AttributeError. Mirrors train.py's order.
+    model.declare_optimizer(args, warmup=0, max_iterations=1000)
     model.update_triangulation(rebuild=True, incremental=False)
 
     # Drive filler (cell 0 is the test cell, fillers are 1..N-1) density to ~0 so
@@ -404,7 +413,11 @@ def test_grazing_fallback():
     with torch.no_grad():
         # Normal = +Y: quaternion rotates [1,0,0] to [0,1,0]
         # 90° about Z: q = [cos(45°), 0, 0, sin(45°)]
-        model.quaternions.data[0] = torch.tensor([0.7071, 0.0, 0.0, 0.7071], device=device)
+        # Set ALL quaternions so normal=+Y (triangulation permutation reorders
+        # cells, so cell 0 is not guaranteed to be the one the ray hits).
+        # Normal=+Y: 90 deg about Z; q=[cos45,0,0,sin45].
+        yquat = torch.tensor([0.7071, 0.0, 0.0, 0.7071], device=device)
+        model.quaternions.data[:] = yquat
         model.density_delta.data[:, 0] = 0.2
 
     # Ray along +X (n·d = [0,1,0]·[1,0,0] = 0, within 1e-3)
@@ -433,26 +446,44 @@ def test_noncrossing_outside_chord():
     print("\n--- Test: non-crossing (surface outside chord) ---")
     device = "cuda"
     model = _make_1cell_scene(device)
-    # Normal = +X, surface offset behind origin (at z=-0.5 in tangent plane)
+    # Normal = +X. Push the surface FAR outside every cell's chord (large
+    # negative height on all texels -> h_eval ~ -large*r -> t_surf well before
+    # t_0 for every hit cell) so the contribution is genuinely non-crossing:
+    # contrib = mu_eff * delta_t, side decided by a hard flag.
     with torch.no_grad():
         model.density_delta.data[:, 0] = 0.3
-        model.texel_heights.data[:, 0] = -0.1  # push surface back
+        model.texel_heights.data[:] = -5.0   # large -> surface outside chord
 
-    # Ray from behind along +X, crossing the cell
     rays = _make_single_ray(device, origin=torch.tensor([[-2.0, 0.0, 0.0]], device=device))
 
     loss = _render_with_grad(model, rays, thin_surface_active=True)
     loss.backward()
 
-    for name in ["density", "density_delta", "quaternions", "texel_heights"]:
+    # Math (non-crossing branch, ct_thinsurface_backward): dL/dt_s = 0, so the
+    # t_surf -> h_eval -> soft-Voronoi -> frame backward is skipped. Thus:
+    #   density / density_delta: grad NONZERO (mu_eff depends on mu_bar & delta).
+    #   quaternions / texel_heights: grad ~ZERO (surface pos/orientation does
+    #       NOT enter the non-crossing contribution; the side is a hard,
+    #       non-differentiable flag). Asserting nonzero here would be a bug in
+    #       the test, not a CUDA failure.
+    for name, expect_nonzero in [("density", True), ("density_delta", True),
+                                  ("quaternions", False), ("texel_heights", False)]:
         param = getattr(model, name, None)
-        if param is not None and param.grad is not None:
-            finite = param.grad.isfinite().all()
-            nonzero = param.grad.abs().sum() > 0
-            check(finite, f"{name} grad is finite (non-crossing)")
-            check(nonzero, f"{name} grad is nonzero (non-crossing)")
-        elif param is not None:
-            check(False, f"{name} grad is None (non-crossing)")
+        if param is None:
+            check(False, f"{name} param exists (non-crossing)"); continue
+        if param.grad is None:
+            check(False, f"{name} grad is None (non-crossing)"); continue
+        finite = param.grad.isfinite().all()
+        gnorm = param.grad.abs().sum().item()
+        check(finite, f"{name} grad is finite (non-crossing)")
+        if expect_nonzero:
+            check(gnorm > 0,
+                  f"{name} grad nonzero (non-crossing; math: mu_eff depends "
+                  f"on it; gnorm={gnorm:.3e})")
+        else:
+            check(gnorm < 1e-6,
+                  f"{name} grad ~zero (non-crossing; math: surface pos/orient "
+                  f"does not enter; gnorm={gnorm:.3e})")
 
 
 def test_finite_gradients_all_params():

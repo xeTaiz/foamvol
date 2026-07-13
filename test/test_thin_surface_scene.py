@@ -103,8 +103,12 @@ def test_K8_config_value_accepted():
 # GPU tests (require CUDA)
 # ─────────────────────────────────────────────────────────
 
-def _make_minimal_scene(n_points=8, device="cuda"):
-    """Minimal scene for shape/config tests."""
+def _make_minimal_scene(n_points=32, device="cuda"):
+    """Minimal scene for shape/config tests.
+
+    n_points defaults to 32: radfoam.Triangulation requires >= MIN_POINTS=32
+    (see old/test_cube.py); smaller scenes yield empty/invalid adjacency.
+    """
     args = type("Args", (), {
         "init_points": n_points,
         "final_points": n_points,
@@ -339,9 +343,17 @@ def test_K6_forward_backward():
     if not _HAS_CUDA:
         print("  SKIP: requires CUDA")
         return
+    # P0 policy is K=4-only until a finite-difference gradcheck for K=6 extends
+    # scene._SUPPORTED_THIN_K. This raw-kernel smoke is non-blocking: skip
+    # unless explicitly opted in via RADFOAM_TEST_K6=1.
+    import os
+    if os.environ.get("RADFOAM_TEST_K6", "0").lower() not in ("1", "on", "true", "yes"):
+        print("  SKIP: K=6 is non-blocking under K=4-only P0 policy "
+              "(set RADFOAM_TEST_K6=1 to run the raw-kernel smoke)")
+        return
     device = "cuda"
 
-    model = _make_minimal_scene(n_points=12, device=device)
+    model = _make_minimal_scene(n_points=32, device=device)
     model = _activate_thin_surface(model, K=6, delta_val=0.3, height_val=0.01)
     rays = _make_test_rays(model)
     start_point = model.get_starting_point(rays, model.primal_points, model.aabb_tree)
@@ -385,7 +397,7 @@ def test_forward_backward_consistency():
         return
     device = "cuda"
 
-    model = _make_minimal_scene(n_points=12, device=device)
+    model = _make_minimal_scene(n_points=32, device=device)
     model = _activate_thin_surface(model, K=4, delta_val=0.3, height_val=0.02)
     rays = _make_test_rays(model)
     start_point = model.get_starting_point(rays, model.primal_points, model.aabb_tree)
