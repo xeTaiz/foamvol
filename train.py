@@ -1159,10 +1159,20 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 if optimizer_args.density_grad_clip > 0 and model.density.grad is not None:
                     model.density.grad.clamp_(-optimizer_args.density_grad_clip, optimizer_args.density_grad_clip)
 
+                # Thin-surface gradient clip (safety: thin params are underdetermined
+                # by the line integral and can take large normalized Adam steps).
+                if getattr(model, '_thin_surface_active', False):
+                    model.clip_thin_surface_grads()
+
                 model.apply_frozen_mask()
 
                 model.optimizer.step()
                 model.update_starvation_count()
+
+                # Safety bounds on thin-surface params (bounds |density_delta| so
+                # mu_plus cannot run away; quaternions rescaled only if drifted).
+                if getattr(model, '_thin_surface_active', False):
+                    model.clamp_thin_surface_params()
 
                 if i < pipeline_args.densify_until:
                     model.density.data.clamp_(min=-1.0)
@@ -1256,6 +1266,23 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         writer.add_scalar("train/ts_delta_loss", ts_delta_loss.item(), i)
                     if ts_height_loss is not None:
                         writer.add_scalar("train/ts_height_loss", ts_height_loss.item(), i)
+                    # P0-F thin-surface activity/parameter diagnostics
+                    if getattr(model, '_thin_surface_active', False):
+                        _ts_diag = model.thin_surface_diagnostics()
+                        if _ts_diag is not None:
+                            for _k, _v in _ts_diag.items():
+                                writer.add_scalar(f"thin/{_k}", _v, i)
+                            for _g in model.optimizer.param_groups:
+                                if _g["name"] in ("density_delta", "quaternions",
+                                                   "texel_sites_2d", "texel_heights"):
+                                    writer.add_scalar(f"lr/{_g['name']}", _g["lr"], i)
+                            # Loud guard: surface density runaway is the observed
+                            # regression mode -- surface it immediately in the log.
+                            if _ts_diag["mu_plus_max"] > 5.0 or _ts_diag["delta_abs_max"] > 4.0:
+                                print(f"[WARN iter {i}] thin-surface runaway: "
+                                      f"mu_plus_max={_ts_diag['mu_plus_max']:.3f} "
+                                      f"delta_abs_max={_ts_diag['delta_abs_max']:.3f} "
+                                      f"active_frac={_ts_diag['active_frac']:.3f}")
                     _rv_until = getattr(optimizer_args, "ref_volume_until", -1)
                     if (getattr(optimizer_args, "ref_volume_weight", 0.0) > 0
                             and hasattr(model, "_ref_volume")

@@ -432,6 +432,45 @@ def test_forward_backward_consistency():
               f"param shape {tuple(param.shape)}")
 
 
+def test_activation_continuity():
+    """Rendering must be identical immediately before and after zero-init
+    thin-surface activation (density_delta=0, texel_heights=0, identity quat).
+
+    Safety guard against an activation-time discontinuity: with delta=0,
+    mu_plus==mu_minus==mu_bar and the two-sided contribution collapses to
+    mu_bar * delta_t (both crossing and non-crossing branches), so the
+    thin-surface forward must equal the scalar forward to fp tolerance. A
+    violation here indicates a kernel/parameterization bug, not dynamics.
+    """
+    print("\n--- Test: activation continuity (zero-init render invariant) ---")
+    if not _HAS_CUDA:
+        print("  SKIP: requires CUDA")
+        return
+    device = "cuda"
+    model = _make_minimal_scene(device=device)
+    rays = _make_test_rays(model)
+    start_point = model.get_starting_point(
+        rays, model.primal_points, model.aabb_tree)
+
+    # Scalar baseline (thin-surface OFF)
+    model._thin_surface_active = False
+    with torch.no_grad():
+        baseline, *_ = model(rays, start_point)
+
+    # Activate with strictly zero init: delta=0, heights=0, identity quaternion.
+    _activate_thin_surface(model, K=4, delta_val=0.0, height_val=0.0)
+    model._thin_surface_active = True
+    with torch.no_grad():
+        thin, *_ = model(rays, start_point)
+
+    max_diff = (baseline - thin).abs().max().item()
+    check(baseline.isfinite().all() and thin.isfinite().all(),
+          f"both renders finite (max_diff={max_diff:.2e})")
+    check(max_diff < 1e-4,
+          f"activation continuity: scalar==thin(zero-init) "
+          f"max_diff={max_diff:.2e} (tol 1e-4)")
+
+
 def main():
     print("=" * 60)
     print("Thin-Surface Scene Tests — Shapes, Config, Inertness")
@@ -447,6 +486,7 @@ def main():
     test_texel_sites_grad_shape()
     test_texel_heights_grad_shape()
     test_zero_init_inertness()
+    test_activation_continuity()
     test_K6_forward_backward()
     test_forward_backward_consistency()
 
