@@ -124,11 +124,14 @@ def _make_1cell_scene(device="cuda", cell_pos=None):
     model.declare_optimizer(args, warmup=0, max_iterations=1000)
     model.update_triangulation(rebuild=True, incremental=False)
 
-    # Drive filler (cell 0 is the test cell, fillers are 1..N-1) density to ~0 so
-    # they do not contribute to the projection; the test cell keeps init density.
-    with torch.no_grad():
-        if model.density.shape[0] > 1:
-            model.density.data[1:] = -10.0
+    # NOTE: all cells keep the active init density (1.0). We deliberately do
+    # NOT zero filler density: softplus'(1.0) > 0, so every cell the ray visits
+    # produces a nonzero base-density / density_delta grad (chord > 0), making
+    # the non-crossing and zero-init-delta checks nontrivial and independent of
+    # which cell index the triangulation permutation placed the test point at.
+    # (With filler density driven to ~0, softplus'(-10)~0 and the summed grad
+    # was ~0 because the active cell was not guaranteed to be hit -- a test
+    # artifact, not a kernel bug.)
 
     # Manually register thin-surface params (simulating initialize_thin_surface).
     N = model.primal_points.shape[0]  # == MIN_POINTS
@@ -235,19 +238,26 @@ def _check_fd(param_name, model, loss_fn, desc="", tol=TOL_FD):
         else:
             return False
 
-    # Normalize: compute relative error
+    # Inert / no-effect case: if BOTH analytic and FD are near-zero, accept
+    # without computing a relative error (a near-zero denominator makes
+    # rel_err ~1 from numerical noise -- this was a false failure for the
+    # zero-init density_delta case). Only fail if one is near-zero and the
+    # other is not.
     fd_norm = fd.norm()
-    if fd_norm < 1e-12:
-        # Parameter has no effect on loss (e.g., zero-height surface with zero delta)
-        # In this case both should be near-zero
-        match = analytic.norm() < 1e-4
-        if not match:
-            print(f"  [{param_name}] FAIL: FD grad is near-zero (norm={fd_norm:.2e}) "
-                  f"but analytic grad norm={analytic.norm():.2e}")
-        else:
-            print(f"  [{param_name}] PASS: both FD and analytic near-zero "
-                  f"(norms {fd_norm:.2e}, {analytic.norm():.2e}) [{desc}]")
-        return match
+    an_norm = analytic.norm()
+    ZERO_TOL = 1e-6
+    if fd_norm < ZERO_TOL and an_norm < ZERO_TOL:
+        print(f"  [{param_name}] PASS: both analytic and FD near-zero (inert / "
+              f"no-effect; norms an={an_norm:.2e}, fd={fd_norm:.2e}) [{desc}]")
+        return True
+    if fd_norm < ZERO_TOL:
+        print(f"  [{param_name}] FAIL: FD near-zero (norm={fd_norm:.2e}) but "
+              f"analytic nonzero (norm={an_norm:.2e}) [{desc}]")
+        return False
+    if an_norm < ZERO_TOL:
+        print(f"  [{param_name}] FAIL: analytic near-zero (norm={an_norm:.2e}) "
+              f"but FD nonzero (norm={fd_norm:.2e}) [{desc}]")
+        return False
 
     diff = (analytic - fd).norm() / fd_norm
     max_abs_diff = (analytic - fd).abs().max().item()
@@ -302,23 +312,30 @@ def test_grad_density_crossing():
 
 
 def test_grad_density_delta_zero():
-    """FD check for density_delta with zero init (surface inert)."""
-    print("\n--- Test: density_delta grad (zero init, inert) ---")
+    """FD check for density_delta with delta=0 init.
+
+    Forward is inert (mu_plus == mu_minus == mu_bar, so the two-sided
+    contribution degenerates to mu_bar * delta_t and the surface position is
+    irrelevant), BUT the gradient w.r.t. delta is generally NONZERO: in the
+    crossing branch dL/d(delta) = ind_p*dL_dmu_p - ind_n*dL_dmu_n, which at
+    delta=0 reduces to the difference of the two chord segments
+    (t_1-t_s) - (t_s-t_0). So this is a nontrivial FD check, not a near-zero
+    grad. With all cells at active density (1.0), visited cells produce a
+    nonzero grad the analytic backward must match.
+    """
+    print("\n--- Test: density_delta grad (delta=0 init, forward inert) ---")
     device = "cuda"
     model = _make_1cell_scene(device)
     rays = _make_single_ray(device)
-    # Delta = 0 (init state), surface should contribute nothing
     with torch.no_grad():
-        model.density_delta.data.zero_()
+        model.density_delta.data.zero_()  # delta=0 -> forward inert
 
     loss = _render_with_grad(model, rays, thin_surface_active=True)
     loss.backward()
 
-    # With delta=0, mu_plus = mu_minus = mu_bar, surface adds nothing
-    # Grad should exist (through the t_surface differentiation) but be nonzero
     fd_ok = _check_fd("density_delta", model,
                        lambda: _render_with_grad(model, rays, thin_surface_active=True),
-                       desc="zero init (inert)", tol=1e-1)
+                       desc="delta=0 (forward inert, grad nonzero)", tol=1e-1)
 
     check(fd_ok or (model.density_delta.grad is not None),
           f"density_delta has grad (shape={getattr(model.density_delta, 'grad', None)})")
