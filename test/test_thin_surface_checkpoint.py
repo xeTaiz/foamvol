@@ -45,12 +45,14 @@ torch.manual_seed(42)
 np.random.seed(42)
 
 
-def _make_minimal_scene(device="cuda", n_points=8):
-    """Create a tiny CTScene with thin-surface activated and nonzero params.
+def _make_minimal_scene(device="cuda", n_points=32):
+    """Create a CTScene with thin-surface activated and nonzero params.
 
-    Uses a small regular grid of points so Delaunay triangulation is well-behaved.
-    Sets density_delta, quaternions, texel_sites_2d, texel_heights to known
-    nonzero values so the round-trip can be verified exactly.
+    n_points defaults to 32: radfoam.Triangulation requires >= MIN_POINTS=32
+    (see old/test_cube.py); smaller scenes yield invalid adjacency and the
+    forward/render path misbehaves. Uses a regular grid for a well-behaved
+    Delaunay mesh. Sets the four thin-surface tensors to known nonzero values
+    so the save/load round-trip can be verified exactly.
     """
     # Minimal args to create the scene
     args = type("Args", (), {
