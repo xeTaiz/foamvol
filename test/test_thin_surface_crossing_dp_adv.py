@@ -436,6 +436,14 @@ def _fd_grad_scalar(model, param_name, rays, eps=1e-3):
 
     Note:  `param.data` is mutated temporarily.  The function restores the
     original values before returning.
+
+    Pre-fix bug:  earlier this helper was passing `model.primal_points`
+    as the `rays` argument to `model.get_starting_point`, which used the
+    scene's 32 cell positions as "camera origins" and produced a
+    start_point of shape (32,) instead of (1,).  Calling `model(rays, sp)`
+    then tripped the broadcast assertion in `CTScene.forward`.  We now
+    compute the per-ray start_point ONCE from the actual `rays` tensor
+    before the perturbation loop and pass it through.
     """
     param = getattr(model, param_name)
     saved = param.data.clone()
@@ -444,23 +452,26 @@ def _fd_grad_scalar(model, param_name, rays, eps=1e-3):
     flat = param.data.reshape(-1)
     gflat = grad.reshape(-1)
 
+    # Compute start_point ONCE from the actual rays (shape [N_rays] long).
+    with torch.no_grad():
+        sp0 = model.get_starting_point(
+            rays, model.primal_points, model.aabb_tree)
+        # sp0 shape: rays.shape[:-1] -> for a (1, 6) rays tensor, that's
+        # shape (1,).  We coerce to long for the model's forward broadcast.
+
     for i in range(flat.shape[0]):
         orig = flat[i].item()
 
         # Forward perturbation
         flat[i] = orig + eps
         with torch.no_grad():
-            sp = model.get_starting_point(
-                model.primal_points, model.primal_points, model.aabb_tree)
-            out_p, _, _, _, _ = model(rays, sp, return_contribution=False)
+            out_p, _, _, _, _ = model(rays, sp0, return_contribution=False)
             loss_p = out_p.sum().item()
 
         # Backward perturbation
         flat[i] = orig - eps
         with torch.no_grad():
-            sp = model.get_starting_point(
-                model.primal_points, model.primal_points, model.aabb_tree)
-            out_m, _, _, _, _ = model(rays, sp, return_contribution=False)
+            out_m, _, _, _, _ = model(rays, sp0, return_contribution=False)
             loss_m = out_m.sum().item()
 
         gflat[i] = (loss_p - loss_m) / (2.0 * eps)
