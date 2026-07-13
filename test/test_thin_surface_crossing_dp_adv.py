@@ -123,13 +123,17 @@ def _build_scalar_or_thin_scene(device, thin_active, density_val=0.0):
 
     # Override to a fixed seed point cloud so both branches share geometry.
     with torch.no_grad():
+        # All helper tensors MUST live on `device` -- otherwise the
+        # torch.cat below crosses device boundaries and crashes (this
+        # was the GPU-run blocker before commit fixing the device
+        # placement).  We construct filler on-device via a CUDA generator.
         real = torch.tensor([[0.0, 0.0, 0.0]], device=device, dtype=torch.float32)
         n_pad = MIN_POINTS - real.shape[0]
-        g = torch.Generator(device="cpu").manual_seed(0)
-        filler = torch.randn(n_pad, 3, generator=g) * 0.1
+        g = torch.Generator(device=device).manual_seed(0)
+        filler = torch.randn(n_pad, 3, generator=g, device=device) * 0.1
         filler = filler / filler.norm(dim=-1, keepdim=True).clamp_min(1e-6) * FILLER_SCALE
-        filler += torch.randn(filler.shape, generator=g) * 1e-4
-        pts = torch.cat([real, filler], dim=0).clamp(-0.999, 0.999).to(device)
+        filler += torch.randn(filler.shape, generator=g, device=device) * 1e-4
+        pts = torch.cat([real, filler], dim=0).clamp(-0.999, 0.999)
         assert pts.shape[0] == MIN_POINTS
         model.primal_points.data.copy_(pts)
         # Active density on all cells so visited cells produce nonzero grad.
@@ -354,13 +358,16 @@ def _build_scene_minus_side(device):
     model = CTScene(args, device=torch.device(device))
 
     with torch.no_grad():
+        # Device-consistent construction (was CPU/CUDA mismatch bug):
+        # build filler on `device` via a CUDA generator, never `.to()` after
+        # cat, and keep every helper tensor on the same device.
         real = torch.tensor([[0.0, 0.0, 0.0]], device=device, dtype=torch.float32)
         n_pad = MIN_POINTS - real.shape[0]
-        g = torch.Generator(device="cpu").manual_seed(1)
-        filler = torch.randn(n_pad, 3, generator=g) * 0.1
+        g = torch.Generator(device=device).manual_seed(1)
+        filler = torch.randn(n_pad, 3, generator=g, device=device) * 0.1
         filler = filler / filler.norm(dim=-1, keepdim=True).clamp_min(1e-6) * FILLER_SCALE
-        filler += torch.randn(filler.shape, generator=g) * 1e-4
-        pts = torch.cat([real, filler], dim=0).clamp(-0.999, 0.999).to(device)
+        filler += torch.randn(filler.shape, generator=g, device=device) * 1e-4
+        pts = torch.cat([real, filler], dim=0).clamp(-0.999, 0.999)
         model.primal_points.data.copy_(pts)
         model.density.data.fill_(1.0)
 
@@ -381,7 +388,9 @@ def _build_scene_minus_side(device):
     # but that's about Y.  For rotation about Y by 180°: q = (cos(90°), 0, sin(90°), 0)
     # = (0, 0, 1, 0).  Surface normal (column 0 of rotation matrix) then is -X.
     flipped_q = torch.tensor([0.0, 0.0, 1.0, 0.0], device=device, dtype=torch.float32)
-    flipped_q = flipped_q / flipped_q.norm()
+    # norm must run on-device to keep the tensor on the target device --
+    # `.norm()` without an explicit dtype/dev stays on the original device.
+    flipped_q = flipped_q / flipped_q.norm().clamp_min(1e-12)
     q_full = flipped_q.unsqueeze(0).expand(N, -1).clone()
     model.quaternions = nn.Parameter(q_full)
     # Set density_delta nonzero so side selection is observable
