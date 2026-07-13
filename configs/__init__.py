@@ -198,6 +198,12 @@ class OptimizationParams(ParamGroup):
         self.thin_surface_delta_weight = 1e-3   # L2 penalty on density_delta
         self.thin_surface_height_weight = 1e-3  # L1 penalty on texel_heights
         self.thin_surface_gate_tau = 0.01  # height L1 norm threshold for regularizer gating
+        # Safety bounds for the underdetermined thin-surface params (see P0-F):
+        # density_delta is unbounded in mu_plus = max(mu_bar+delta,0) and weakly
+        # determined by the line integral when the surface is mid-chord, so L1's
+        # non-vanishing subgradient + Adam normalization can drive delta -> inf.
+        self.thin_surface_delta_clip = 2.0   # bound |density_delta| post-step; 0 = off
+        self.thin_surface_grad_clip = 1.0    # grad clip on the 4 thin params; 0 = off
         super().__init__(parser, "Setting Optimization parameters")
 
 

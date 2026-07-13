@@ -1854,6 +1854,10 @@ class CTScene(torch.nn.Module):
         # Attach optimizer param groups (skip names already present — idempotent
         # across repeated initialize_thin_surface calls on the same optimizer).
         existing = {g["name"] for g in self.optimizer.param_groups}
+        # Per-group eps=1e-8 (NOT the optimizer's eps=1e-15): the thin params are
+        # underdetermined by the line integral (mid-chord identifiability) and can
+        # receive small/sparse gradients; eps=1e-15 (no floor) is unsafe here and
+        # can amplify instability. eps=1e-8 is the standard Adam floor.
         for p, name in [
             (self.density_delta, "density_delta"),
             (self.quaternions, "quaternions"),
@@ -1863,6 +1867,7 @@ class CTScene(torch.nn.Module):
             if name not in existing:
                 self.optimizer.add_param_group({
                     "params": p, "lr": thin_surface_lr, "name": name,
+                    "eps": 1e-8,
                 })
 
         self.thin_surface_scheduler_args = get_cosine_lr_func(
@@ -1879,9 +1884,86 @@ class CTScene(torch.nn.Module):
         self._thin_surface_start = args.thin_surface_start
         self._thin_surface_active = True
         self._thin_K = K
+        self._thin_surface_delta_clip = float(
+            getattr(args, "thin_surface_delta_clip", 2.0))
+        self._thin_surface_grad_clip = float(
+            getattr(args, "thin_surface_grad_clip", 1.0))
 
         print(f"Initialized thin-surface params: {N} cells, K={K} texels "
-              f"(lr={thin_surface_lr:.2e}, resume={resume})")
+              f"(lr={thin_surface_lr:.2e}, resume={resume}, "
+              f"delta_clip={self._thin_surface_delta_clip}, "
+              f"grad_clip={self._thin_surface_grad_clip})")
+
+    @torch.no_grad()
+    def clamp_thin_surface_params(self):
+        """Post-step safety bounds on thin-surface params.
+
+        density_delta is unbounded in mu_plus = max(mu_bar+delta, 0); under L1's
+        non-vanishing subgradient + Adam normalization it can diverge (observed:
+        split-vox max density 7.45 on a converged cube). Clamp |delta| to
+        _thin_surface_delta_clip (0 = off). Quaternions are normalized in the
+        kernel already; we only rescale if their norm has drifted far from 1 to
+        keep the parameter manifold sane (no effect on the forward).
+        """
+        if not getattr(self, "_thin_surface_active", False):
+            return
+        c = getattr(self, "_thin_surface_delta_clip", 0.0)
+        if c and c > 0 and getattr(self, "density_delta", None) is not None:
+            self.density_delta.data.clamp_(-c, c)
+        if getattr(self, "quaternions", None) is not None:
+            qn = self.quaternions.data.norm(dim=-1, keepdim=True)
+            # Rescale only where the norm has drifted out of [0.5, 2.0].
+            drift = (qn < 0.5) | (qn > 2.0)
+            if drift.any():
+                inv = torch.where(drift, 1.0 / qn.clamp_min(1e-12),
+                                  torch.ones_like(qn))
+                self.quaternions.data.mul_(inv)
+
+    def clip_thin_surface_grads(self):
+        """Clip gradients on the four thin-surface params (mirrors the existing
+        density grad clip). No-op if _thin_surface_grad_clip <= 0."""
+        c = float(getattr(self, "_thin_surface_grad_clip", 0.0))
+        if not (c and c > 0):
+            return
+        for name in ("density_delta", "quaternions",
+                     "texel_sites_2d", "texel_heights"):
+            p = getattr(self, name, None)
+            if p is not None and p.grad is not None:
+                p.grad.clamp_(-c, c)
+
+    @torch.no_grad()
+    def thin_surface_diagnostics(self):
+        """P0-F stats for TensorBoard. Returns dict or None if inactive."""
+        if not getattr(self, "_thin_surface_active", False):
+            return None
+        if getattr(self, "density_delta", None) is None:
+            return None
+        dd = self.density_delta.detach().squeeze(-1)        # (N,)
+        mu_bar = self.get_primal_density().detach().squeeze(-1)  # (N,)
+        mu_p = torch.clamp(mu_bar + dd, min=0.0)
+        mu_n = torch.clamp(mu_bar - dd, min=0.0)
+        h = self.texel_heights.detach()                     # (N,K)
+        h_l1 = h.abs().sum(dim=-1)                           # (N,)
+        qn = self.quaternions.detach().norm(dim=-1)          # (N,)
+        tau = getattr(self, "_thin_surface_gate_tau", 0.01)
+        active = (h_l1 > tau).float()
+        warm = 1.0 if hasattr(self, "_last_top_eigvec") else 0.0
+        q = 0.95
+        return {
+            "delta_abs_mean": dd.abs().mean().item(),
+            "delta_abs_p95": dd.abs().float().quantile(q).item() if dd.numel() else 0.0,
+            "delta_abs_max": dd.abs().max().item(),
+            "mu_plus_max": mu_p.max().item(),
+            "mu_plus_mean": mu_p.mean().item(),
+            "mu_minus_max": mu_n.max().item(),
+            "height_l1_mean": h_l1.mean().item(),
+            "height_l1_max": h_l1.max().item(),
+            "quat_norm_mean": qn.mean().item(),
+            "quat_norm_max": qn.max().item(),
+            "active_frac": active.mean().item(),
+            "delta_nonzero_frac": (dd.abs() > 1e-6).float().mean().item(),
+            "warm_start": warm,
+        }
 
     def update_learning_rate(self, iteration):
         # Freeze positions while density gradients stabilize

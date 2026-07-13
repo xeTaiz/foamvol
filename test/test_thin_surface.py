@@ -209,7 +209,44 @@ def _make_fake_scene(N=5, K=4, device="cpu"):
     scene._thin_surface_start = 6000
     scene._thin_surface_scheduler_cfg = {"lr_init": 5e-3, "lr_final": 5e-4,
                                           "max_steps": 4000}
+    scene._thin_surface_delta_clip = 2.0
+    scene._thin_surface_grad_clip = 1.0
+    scene._thin_surface_gate_tau = 0.01
     return scene
+
+
+def test_thin_surface_delta_clamp_safeguard():
+    """clamp_thin_surface_params bounds |density_delta| to the configured clip."""
+    scene = _make_fake_scene(N=8, K=4)
+    with torch.no_grad():
+        scene.density_delta.data.fill_(10.0)  # would explode mu_plus
+    scene.clamp_thin_surface_params()
+    assert scene.density_delta.data.abs().max().item() <= 2.0 + 1e-6
+    with torch.no_grad():
+        scene.density_delta.data.fill_(-7.0)
+    scene.clamp_thin_surface_params()
+    assert scene.density_delta.data.abs().max().item() <= 2.0 + 1e-6
+    # clamp off when _thin_surface_delta_clip == 0
+    scene._thin_surface_delta_clip = 0.0
+    with torch.no_grad():
+        scene.density_delta.data.fill_(10.0)
+    scene.clamp_thin_surface_params()
+    assert scene.density_delta.data.abs().max().item() == 10.0
+    print("OK test_thin_surface_delta_clamp_safeguard")
+
+
+def test_thin_surface_diagnostics_keys():
+    """thin_surface_diagnostics returns the P0-F stat dict with expected keys."""
+    scene = _make_fake_scene(N=8, K=4)
+    d = scene.thin_surface_diagnostics()
+    assert d is not None
+    for k in ["delta_abs_max", "mu_plus_max", "mu_minus_max", "height_l1_max",
+              "quat_norm_max", "active_frac", "delta_nonzero_frac", "warm_start"]:
+        assert k in d, k
+    # inactive -> None
+    scene._thin_surface_active = False
+    assert scene.thin_surface_diagnostics() is None
+    print("OK test_thin_surface_diagnostics_keys")
 
 
 def test_checkpoint_roundtrip_thin_surface(tmp_path=None):
@@ -283,6 +320,8 @@ def main():
     test_split_cell_query_hard_side_no_blend()
     test_split_cell_query_matches_kernel_side_convention()
     test_K_guard()
+    test_thin_surface_delta_clamp_safeguard()
+    test_thin_surface_diagnostics_keys()
     test_checkpoint_roundtrip_thin_surface()
     test_checkpoint_baseline_unchanged()
     print("\nAll thin-surface tests passed.")
