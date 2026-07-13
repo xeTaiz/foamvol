@@ -995,19 +995,49 @@ __global__ void ct_thinsurface_backward(
         // Chord-length gradients
         float dL_dmu_near = 0.0f, dL_dmu_far = 0.0f;
         float dL_dt_s = 0.0f;
-        float dL_ddelta_t;
+        // Chord-endpoint (t_0, t_1) gradients feed the point-position grads via
+        // cell_intersection_grad. These are INDEPENDENT of t_s: in the crossing
+        // branch t_surf depends on cp/n/h_eval but NOT on t_0/t_1, so the only
+        // t_0/t_1 dependence of contrib is the explicit chord lengths
+        // (t_s - t_0),(t_1 - t_s) [crossing] or (t_1 - t_0) [non-crossing].
+        // Previously the crossing branch set dL_ddelta_t=0 and reused
+        // dL_dt0=-dL_ddelta_t, dL_dt1=dL_ddelta_t as the SOLE endpoint grads,
+        // dropping the chord-endpoint (point-position) gradient entirely --
+        // at delta=0 this gave scalar point-grad ~mu_bar but thin point-grad 0,
+        // a confirmed correctness defect (see specs/SPLIT-CELL-EXECUTION-LOG.md).
+        float dL_dt0_chord = 0.0f, dL_dt1_chord = 0.0f;
+        // dL_ddelta_t now carries ONLY the t_q0->t_0 contribution (set in the
+        // t_surf/x0 backward block below when t_q0 == t_0). It must NOT flow to
+        // t_1 (t_q0 does not depend on t_1); the old tail leaked it to t_1.
+        float dL_ddelta_t = 0.0f;
 
         if (crossing) {
             dL_dmu_near = dL_dprojection * (t_s - t_0);
             dL_dmu_far  = dL_dprojection * (t_1 - t_s);
             dL_dt_s     = dL_dprojection * (mu_near - mu_far);
-            dL_ddelta_t = 0.0f; // delta_t not used directly in crossing formula
+            // d(contrib)/d(t_0) = -mu_near ; d(contrib)/d(t_1) = +mu_far.
+            // At delta=0 mu_near=mu_far=mu_bar -> -mu_bar/+mu_bar, matching the
+            // scalar contrib = mu_bar*(t_1 - t_0) endpoint gradient.
+            dL_dt0_chord = -dL_dprojection * mu_near;
+            dL_dt1_chord =  dL_dprojection * mu_far;
         } else {
             bool plus_side = (dp > 0.0f) ? (t_surf <= t_0) : (t_surf >= t_1);
             float mu_eff = plus_side ? mu_p : mu_n;
-            if (plus_side) dL_dmu_far  = dL_dprojection * delta_t; // mu_p is mu_far when dp>0
-            else           dL_dmu_near = dL_dprojection * delta_t;
-            dL_ddelta_t = dL_dprojection * mu_eff;
+            // contrib = mu_eff * (t_1 - t_0); d(contrib)/d(mu_eff) = delta_t.
+            // Route to mu_near/mu_far respecting the dp-sign physical mapping:
+            //   dp>0: mu_near=mu_n, mu_far=mu_p
+            //   dp<0: mu_near=mu_p, mu_far=mu_n
+            // (The old code assigned purely by plus_side, which was correct
+            // only for dp>0 and inverted the mu_p/mu_n adjoint for dp<0.)
+            if (plus_side) {            // mu_eff = mu_p
+                if (dp > 0.0f) dL_dmu_far  = dL_dprojection * delta_t;  // mu_p=mu_far
+                else           dL_dmu_near = dL_dprojection * delta_t;  // mu_p=mu_near
+            } else {                    // mu_eff = mu_n
+                if (dp > 0.0f) dL_dmu_near = dL_dprojection * delta_t;  // mu_n=mu_near
+                else           dL_dmu_far  = dL_dprojection * delta_t;  // mu_n=mu_far
+            }
+            dL_dt0_chord = -dL_dprojection * mu_eff;
+            dL_dt1_chord =  dL_dprojection * mu_eff;
         }
 
         // Unscramble mu_near/mu_far -> mu_p/mu_n
@@ -1107,7 +1137,7 @@ __global__ void ct_thinsurface_backward(
                 // But we handle t_0 grad below via the bisector chain,
                 // so we need to record this extra contribution.
                 // Use dL_ddelta_t to carry the cell-boundary t_0 signal:
-                dL_ddelta_t += -dL_dt_q0; // feeds into dL_dt0 = -dL_ddelta_t below
+                dL_ddelta_t += -dL_dt_q0; // feeds into dL_dt0 = dL_dt0_chord - dL_ddelta_t
             }
         }
 
@@ -1124,8 +1154,11 @@ __global__ void ct_thinsurface_backward(
         }
 
         // ---- Cell-boundary position gradients ----
-        float dL_dt0 = -dL_ddelta_t;
-        float dL_dt1 =  dL_ddelta_t;
+        // chord-endpoint contribution (always present) + t_q0 carrier (only
+        // flows to t_0, when t_q0 == t_0; dL_ddelta_t is 0 in non-crossing and
+        // in crossing-at-delta=0 since the t_surf/x0 block is skipped there).
+        float dL_dt0 = dL_dt0_chord - dL_ddelta_t;
+        float dL_dt1 = dL_dt1_chord;
 
         Vec3f dt0_dprev;
         if (prev_point_idx != UINT32_MAX)
