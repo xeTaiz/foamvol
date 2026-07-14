@@ -29,6 +29,14 @@ Operational unblocker (M1):
     python old/test_cube.py --test 1b --run-tag R0
         # (no --thin-surface) => output/cube_sanity/single_cube_random_R0/
 
+R1 operational support: --thin-lr-scale multiplies the four thin param-group
+    LRs (density_delta, quaternions, texel_sites_2d, texel_heights).
+    Default 1.0 (preserves the failed recipe). 0.0 freezes the surface while
+    still running the two-sided forward kernel and updates base density /
+    primal points normally (R1 isolation test).
+    python old/test_cube.py --test 1b --thin-surface --run-tag R1 --thin-lr-scale 0
+        # all four thin LRs set to 0; _thin_surface_active=True remains.
+
 The default behaviour (no --run-tag) is unchanged: outputs land in the
 historical single_cube_* / cube_2x2x2_* directories, with the standard
 non-suffixed --experiment_name.
@@ -105,7 +113,8 @@ def cube_2x2x2_points():
 # ---------------------------------------------------------------------------
 
 def base_config(scene_type, out_name, init_points, final_points, iterations,
-                densify=False, thin_surface=False, thin_start=6000):
+                densify=False, thin_surface=False, thin_start=6000,
+                thin_lr_scale=1.0):
     """Build a config dict for a cube test run.
 
     thin_surface=True injects the K=4 two-sided split-cell config: the surface
@@ -188,6 +197,10 @@ def base_config(scene_type, out_name, init_points, final_points, iterations,
         cfg["thin_surface_delta_weight"] = 1e-3
         cfg["thin_surface_height_weight"] = 5e-4
         cfg["thin_surface_gate_tau"] = 0.01
+        # R1: global multiplier on all four thin param-group LRs (read by
+        # CTScene.initialize_thin_surface). 1.0 = failed recipe; 0.0 freezes
+        # the surface while the two-sided forward kernel still runs.
+        cfg["thin_surface_lr_scale"] = thin_lr_scale
         # Boundary-alignment warm-start: populates _last_top_eigvec in
         # [densify_from, thin_start) so initialize_thin_surface can orient the
         # quaternions. Gates off per-cell once the surface activates.
@@ -254,6 +267,7 @@ def run_test(test_id, thin_surface=False, thin_start=6000, run_tag=None):
         init_points=t["init_points"], final_points=t["final_points"],
         iterations=t["iterations"], densify=t["densify"],
         thin_surface=thin_surface, thin_start=thin_start,
+        thin_lr_scale=run_test._current_thin_lr_scale,
     )
 
     config_file = os.path.join(out_dir, "config.yaml")
@@ -303,6 +317,13 @@ def main():
                              "--experiment_name so reruns (e.g. R0/R1/R2 ...) "
                              "do not collide with historical results. "
                              "Default: no suffix (preserves prior behaviour).")
+    parser.add_argument("--thin-lr-scale", type=float, default=1.0,
+                        help="R1 operational support: global multiplier on all "
+                             "four thin param-group LRs (density_delta, "
+                             "quaternions, texel_sites_2d, texel_heights). "
+                             "1.0 = default (preserves the failed recipe); "
+                             "0.0 freezes the surface while the two-sided "
+                             "forward kernel still runs. Default: 1.0.")
     args = parser.parse_args()
 
     if args.list:
@@ -314,6 +335,7 @@ def main():
     os.makedirs(OUT_DIR, exist_ok=True)
 
     for tid in tests:
+        run_test._current_thin_lr_scale = args.thin_lr_scale
         run_test(tid, thin_surface=args.thin_surface,
                   thin_start=args.thin_start, run_tag=args.run_tag)
 
