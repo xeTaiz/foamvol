@@ -204,6 +204,17 @@ class OptimizationParams(ParamGroup):
         # non-vanishing subgradient + Adam normalization can drive delta -> inf.
         self.thin_surface_delta_clip = 2.0   # bound |density_delta| post-step; 0 = off
         self.thin_surface_grad_clip = 1.0    # grad clip on the 4 thin params; 0 = off
+        # cube-rescue overrides (R1-R3 in experiments/queue.md Batch B1-R):
+        # global multiplier on all four thin LRs (1.0 = failed recipe; 0.0 tests
+        # activation continuity with the surface frozen at zero init).
+        self.thin_surface_lr_scale = 1.0
+        # per-group LR multipliers (applied AFTER thin_surface_lr_scale). 0.0
+        # freezes that group for the whole run. R2: delta=0.01; R3: geometry
+        # (quaternion+sites+heights)=0.
+        self.thin_surface_delta_lr_scale = 1.0
+        self.thin_surface_quat_lr_scale   = 1.0
+        self.thin_surface_sites_lr_scale  = 1.0
+        self.thin_surface_heights_lr_scale = 1.0
         super().__init__(parser, "Setting Optimization parameters")
 
 

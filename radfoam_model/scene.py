@@ -1850,6 +1850,34 @@ class CTScene(torch.nn.Module):
             print(f"[thin-surface] resuming with loaded tensors (N={N}, K={K})")
 
         thin_surface_lr = args.density_lr_init * 0.1
+        # Cube-rescue LR overrides (see experiments/queue.md Batch B1-R):
+        #   thin_surface_lr_scale        : global multiplier on all four thin LRs
+        #   *_delta_lr_scale / *_quat_lr_scale / *_sites_lr_scale /
+        #     *_heights_lr_scale : per-group multipliers (applied after global)
+        # A scale of 0.0 freezes that group's LR (R1 freezes all; R2 scales
+        # delta; R3 freezes geometry). Defaults (1.0) preserve the failed recipe.
+        _global_scale = float(getattr(args, "thin_surface_lr_scale", 1.0))
+        self._thin_surface_lr_scale = _global_scale
+        self._thin_surface_group_lr_scale = {
+            "density_delta": float(getattr(args, "thin_surface_delta_lr_scale", 1.0)),
+            "quaternions":   float(getattr(args, "thin_surface_quat_lr_scale", 1.0)),
+            "texel_sites_2d": float(getattr(args, "thin_surface_sites_lr_scale", 1.0)),
+            "texel_heights": float(getattr(args, "thin_surface_heights_lr_scale", 1.0)),
+        }
+        # Effective initial per-group LR for the cosine scheduler. Each group
+        # gets its own scheduler so frozen groups (scale 0) stay at 0.
+        self._thin_surface_group_lr_init = {}
+        self._thin_surface_group_scheduler = {}
+        for _name in ("density_delta", "quaternions",
+                       "texel_sites_2d", "texel_heights"):
+            self._thin_surface_group_lr_init[_name] = (
+                thin_surface_lr * _global_scale
+                * self._thin_surface_group_lr_scale[_name])
+            self._thin_surface_group_scheduler[_name] = get_cosine_lr_func(
+                lr_init=self._thin_surface_group_lr_init[_name],
+                lr_final=self._thin_surface_group_lr_init[_name] * 0.1,
+                max_steps=self._max_iterations - args.thin_surface_start,
+            )
 
         # Attach optimizer param groups (skip names already present — idempotent
         # across repeated initialize_thin_surface calls on the same optimizer).
@@ -1864,21 +1892,24 @@ class CTScene(torch.nn.Module):
             (self.texel_sites_2d, "texel_sites_2d"),
             (self.texel_heights, "texel_heights"),
         ]:
+            _lr0 = self._thin_surface_group_lr_init[name]
             if name not in existing:
                 self.optimizer.add_param_group({
-                    "params": p, "lr": thin_surface_lr, "name": name,
+                    "params": p, "lr": _lr0, "name": name,
                     "eps": 1e-8,
                 })
+            else:
+                # resume: force the LR to the requested scale's initial value.
+                for _g in self.optimizer.param_groups:
+                    if _g["name"] == name:
+                        _g["lr"] = _lr0
 
-        self.thin_surface_scheduler_args = get_cosine_lr_func(
-            lr_init=thin_surface_lr,
-            lr_final=thin_surface_lr * 0.1,
-            max_steps=self._max_iterations - args.thin_surface_start,
-        )
-        # Persist scheduler config so load_pt can rebuild it for resumed training.
+        # Kept for backwards compatibility with code that reads the shared
+        # scheduler (use the group schedulers above for per-group LRs).
+        self.thin_surface_scheduler_args = self._thin_surface_group_scheduler["density_delta"]
         self._thin_surface_scheduler_cfg = {
-            "lr_init": thin_surface_lr,
-            "lr_final": thin_surface_lr * 0.1,
+            "lr_init": self._thin_surface_group_lr_init["density_delta"],
+            "lr_final": self._thin_surface_group_lr_init["density_delta"] * 0.1,
             "max_steps": self._max_iterations - args.thin_surface_start,
         }
         self._thin_surface_start = args.thin_surface_start
@@ -1889,9 +1920,13 @@ class CTScene(torch.nn.Module):
         self._thin_surface_grad_clip = float(
             getattr(args, "thin_surface_grad_clip", 1.0))
 
+        _ginfo = ", ".join(
+            f"{n}={self._thin_surface_group_lr_init[n]:.2e}"
+            for n in ("density_delta", "quaternions",
+                       "texel_sites_2d", "texel_heights"))
         print(f"Initialized thin-surface params: {N} cells, K={K} texels "
-              f"(lr={thin_surface_lr:.2e}, resume={resume}, "
-              f"delta_clip={self._thin_surface_delta_clip}, "
+              f"(global_lr_scale={_global_scale}, group_lr=[{_ginfo}], "
+              f"resume={resume}, delta_clip={self._thin_surface_delta_clip}, "
               f"grad_clip={self._thin_surface_grad_clip})")
 
     @torch.no_grad()
@@ -2006,11 +2041,19 @@ class CTScene(torch.nn.Module):
                     param_group["lr"] = lr
             elif param_group["name"] in ("density_delta", "quaternions",
                                          "texel_sites_2d", "texel_heights"):
-                if hasattr(self, "thin_surface_scheduler_args"):
-                    lr = self.thin_surface_scheduler_args(
+                # Per-group cosine scheduler, honoring rescue LR scales (a scale
+                # of 0 keeps that group's LR at 0 for the whole run -- R1/R3).
+                _gn = param_group["name"]
+                _scheds = getattr(self, "_thin_surface_group_scheduler", None)
+                if _scheds is not None and _gn in _scheds:
+                    param_group["lr"] = _scheds[_gn](
                         iteration - self._thin_surface_start
                     )
-                    param_group["lr"] = lr
+                elif hasattr(self, "thin_surface_scheduler_args"):
+                    # Backwards-compat fallback (single shared scheduler).
+                    param_group["lr"] = self.thin_surface_scheduler_args(
+                        iteration - self._thin_surface_start
+                    )
 
     def prune_optimizer(self, mask):
         optimizable_tensors = {}
