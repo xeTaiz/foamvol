@@ -37,6 +37,22 @@ R1 operational support: --thin-lr-scale multiplies the four thin param-group
     python old/test_cube.py --test 1b --thin-surface --run-tag R1 --thin-lr-scale 0
         # all four thin LRs set to 0; _thin_surface_active=True remains.
 
+R2 operational support: per-group rescue overrides for the four thin
+    param-group LRs.
+      --thin-delta-lr-scale     : scalar multiplier on density_delta only
+                                  (R2 = 0.01 trains delta but freezes it on
+                                   a much smaller LR than the failed recipe)
+      --thin-geometry-lr-scale  : scalar multiplier on quaternions +
+                                  texel_sites_2d + texel_heights together
+                                  (R3 = 0 freezes the geometry)
+    Both default 1.0 (preserves the failed recipe).  Both are applied AFTER
+    the global --thin-lr-scale.
+    python old/test_cube.py --test 1b --thin-surface --run-tag R2 \
+        --thin-delta-lr-scale 0.01 --thin-geometry-lr-scale 0
+        # density_delta trains at 1%% of base; geometry (quat/sites/heights)
+        # frozen at 0; _thin_surface_active=True remains; _thin_surface_lr_scale
+        # stays at 1.0 (this is per-group, not global).
+
 The default behaviour (no --run-tag) is unchanged: outputs land in the
 historical single_cube_* / cube_2x2x2_* directories, with the standard
 non-suffixed --experiment_name.
@@ -114,7 +130,8 @@ def cube_2x2x2_points():
 
 def base_config(scene_type, out_name, init_points, final_points, iterations,
                 densify=False, thin_surface=False, thin_start=6000,
-                thin_lr_scale=1.0):
+                thin_lr_scale=1.0,
+                thin_delta_lr_scale=1.0, thin_geometry_lr_scale=1.0):
     """Build a config dict for a cube test run.
 
     thin_surface=True injects the K=4 two-sided split-cell config: the surface
@@ -201,6 +218,13 @@ def base_config(scene_type, out_name, init_points, final_points, iterations,
         # CTScene.initialize_thin_surface). 1.0 = failed recipe; 0.0 freezes
         # the surface while the two-sided forward kernel still runs.
         cfg["thin_surface_lr_scale"] = thin_lr_scale
+        # R2/R3: per-group scale overrides applied AFTER thin_surface_lr_scale
+        # in initialize_thin_surface.  R2 trains only delta; R3 freezes the
+        # three geometry params (quaternions / sites / heights).
+        cfg["thin_surface_delta_lr_scale"] = thin_delta_lr_scale
+        cfg["thin_surface_quat_lr_scale"] = thin_geometry_lr_scale
+        cfg["thin_surface_sites_lr_scale"] = thin_geometry_lr_scale
+        cfg["thin_surface_heights_lr_scale"] = thin_geometry_lr_scale
         # Boundary-alignment warm-start: populates _last_top_eigvec in
         # [densify_from, thin_start) so initialize_thin_surface can orient the
         # quaternions. Gates off per-cell once the surface activates.
@@ -268,6 +292,8 @@ def run_test(test_id, thin_surface=False, thin_start=6000, run_tag=None):
         iterations=t["iterations"], densify=t["densify"],
         thin_surface=thin_surface, thin_start=thin_start,
         thin_lr_scale=run_test._current_thin_lr_scale,
+        thin_delta_lr_scale=run_test._current_thin_delta_lr_scale,
+        thin_geometry_lr_scale=run_test._current_thin_geometry_lr_scale,
     )
 
     config_file = os.path.join(out_dir, "config.yaml")
@@ -324,6 +350,17 @@ def main():
                              "1.0 = default (preserves the failed recipe); "
                              "0.0 freezes the surface while the two-sided "
                              "forward kernel still runs. Default: 1.0.")
+    parser.add_argument("--thin-delta-lr-scale", type=float, default=1.0,
+                        help="R2 operational support: scalar multiplier on the "
+                             "density_delta param-group LR (applied AFTER "
+                             "--thin-lr-scale). 1.0 = default; 0.01 = R2. "
+                             "Default: 1.0.")
+    parser.add_argument("--thin-geometry-lr-scale", type=float, default=1.0,
+                        help="R3 operational support: scalar multiplier applied "
+                             "to all three geometry param-group LRs "
+                             "(quaternions, texel_sites_2d, texel_heights). "
+                             "0.0 = R3 (freezes the geometry).  Applied AFTER "
+                             "--thin-lr-scale. Default: 1.0.")
     args = parser.parse_args()
 
     if args.list:
@@ -336,6 +373,8 @@ def main():
 
     for tid in tests:
         run_test._current_thin_lr_scale = args.thin_lr_scale
+        run_test._current_thin_delta_lr_scale = args.thin_delta_lr_scale
+        run_test._current_thin_geometry_lr_scale = args.thin_geometry_lr_scale
         run_test(tid, thin_surface=args.thin_surface,
                   thin_start=args.thin_start, run_tag=args.run_tag)
 
