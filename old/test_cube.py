@@ -20,6 +20,18 @@ Usage (from repo root):
     python old/test_cube.py --thin-surface              # all tests, thin-surface K=4
     python old/test_cube.py --test 1a --thin-surface    # thin variant of 1a
     python old/test_cube.py --thin-surface --thin-start 4000
+
+Operational unblocker (M1):
+    python old/test_cube.py --test 1b --thin-surface --run-tag R0
+        # writes to output/cube_sanity/single_cube_random_thin_R0/
+        # and uses --experiment_name cube_sanity/single_cube_random_thin_R0
+        # so reruns (R0/R1/R2/...) do not collide with historical results.
+    python old/test_cube.py --test 1b --run-tag R0
+        # (no --thin-surface) => output/cube_sanity/single_cube_random_R0/
+
+The default behaviour (no --run-tag) is unchanged: outputs land in the
+historical single_cube_* / cube_2x2x2_* directories, with the standard
+non-suffixed --experiment_name.
 """
 
 import argparse
@@ -218,9 +230,16 @@ TESTS = {
 # Runner
 # ---------------------------------------------------------------------------
 
-def run_test(test_id, thin_surface=False, thin_start=6000):
+def run_test(test_id, thin_surface=False, thin_start=6000, run_tag=None):
     t = TESTS[test_id]
-    out_name = t["name"] + ("_thin" if thin_surface else "")
+    base_out_name = t["name"] + ("_thin" if thin_surface else "")
+    # M1 operational unblocker: append a unique tag (e.g. R0/R1/...) so rescue
+    # reruns do not collide with historical results and the [SKIP] check below
+    # does not falsely skip a fresh run because the historical metrics.txt is
+    # already in place.  When --run-tag is omitted the default name is
+    # unchanged so existing callers see no behavioural change.
+    tag_suffix = f"_{run_tag}" if run_tag else ""
+    out_name = base_out_name + tag_suffix
     out_dir = os.path.join(OUT_DIR, out_name)
 
     metrics_path = os.path.join(out_dir, "metrics.txt")
@@ -254,7 +273,8 @@ def run_test(test_id, thin_surface=False, thin_start=6000):
         "--experiment_name", f"cube_sanity/{out_name}",
     ] + extra_args
     print(f"[RUN] {test_id}: {t['desc']}"
-          + (" [thin-surface K=4]" if thin_surface else ""))
+          + (" [thin-surface K=4]" if thin_surface else "")
+          + (f" [run_tag={run_tag}]" if run_tag else ""))
     result = subprocess.run(cmd, cwd=REPO_ROOT)
 
     if result.returncode != 0:
@@ -278,6 +298,11 @@ def main():
     parser.add_argument("--thin-start", type=int, default=6000,
                         help="thin_surface_start iteration (default 6000; must be "
                              "< freeze_points)")
+    parser.add_argument("--run-tag", type=str, default=None,
+                        help="Append a unique suffix to the output directory and "
+                             "--experiment_name so reruns (e.g. R0/R1/R2 ...) "
+                             "do not collide with historical results. "
+                             "Default: no suffix (preserves prior behaviour).")
     args = parser.parse_args()
 
     if args.list:
@@ -289,7 +314,8 @@ def main():
     os.makedirs(OUT_DIR, exist_ok=True)
 
     for tid in tests:
-        run_test(tid, thin_surface=args.thin_surface, thin_start=args.thin_start)
+        run_test(tid, thin_surface=args.thin_surface,
+                  thin_start=args.thin_start, run_tag=args.run_tag)
 
 
 if __name__ == "__main__":
