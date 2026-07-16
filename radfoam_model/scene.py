@@ -1800,20 +1800,46 @@ class CTScene(torch.nn.Module):
             # boundary-alignment eigenvectors are available for warm-start.
             q0 = torch.zeros(N, 4, device=device, dtype=torch.float32)
             q0[:, 0] = 1.0
-            if hasattr(self, "_last_top_eigvec"):
-                v = self._last_top_eigvec  # (N, 3) unit vectors, detached
-                # Quaternion rotating [1,0,0] onto v via the half-angle formula.
-                ref = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=torch.float32)
-                ref = ref.unsqueeze(0).expand(N, -1)
-                cross = torch.cross(ref, v, dim=-1)         # (N, 3)
-                dot   = (ref * v).sum(dim=-1, keepdim=True) # (N, 1)
-                # sin(θ) = |cross|, cos(θ) = dot
-                w = torch.sqrt(((dot + 1.0) * 0.5).clamp_min(0.0))  # cos(θ/2)
-                xyz = cross / (2.0 * w.clamp_min(1e-12))             # sin(θ/2) * axis
-                q0 = torch.cat([w, xyz], dim=-1)
-                q0 = q0 / q0.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-                # Flip to upper hemisphere (w ≥ 0) for sign consistency.
-                q0 = q0 * torch.sign(q0[:, :1]).clamp_min(1.0)
+            # Warm-start from `_last_top_eigvec` (a (N, 3) tensor cached by
+            # `_boundary_top_eigvec`).  Defensively validate its shape: the
+            # cache is keyed to the point count at the time it was populated
+            # and may not have been updated by an intermediate prune/densify
+            # path.  If it disagrees with the current N we discard it and
+            # fall back to identity quaternions rather than crash on a shape
+            # mismatch in `torch.cross(ref, v, dim=-1)` (CH4 reproducer:
+            # standalone prune between iters 5999->6000 shrunk primal_points
+            # but left the cache at its pre-prune N).
+            v_cache = getattr(self, "_last_top_eigvec", None)
+            if v_cache is not None:
+                v_shape = tuple(v_cache.shape)
+                if len(v_shape) >= 1 and v_shape[0] == N:
+                    v = v_cache  # (N, 3) unit vectors, detached
+                    # Quaternion rotating [1,0,0] onto v via the half-angle formula.
+                    ref = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=torch.float32)
+                    ref = ref.unsqueeze(0).expand(N, -1)
+                    cross = torch.cross(ref, v, dim=-1)         # (N, 3)
+                    dot   = (ref * v).sum(dim=-1, keepdim=True) # (N, 1)
+                    # sin(θ) = |cross|, cos(θ) = dot
+                    w = torch.sqrt(((dot + 1.0) * 0.5).clamp_min(0.0))  # cos(θ/2)
+                    xyz = cross / (2.0 * w.clamp_min(1e-12))             # sin(θ/2) * axis
+                    q0 = torch.cat([w, xyz], dim=-1)
+                    q0 = q0 / q0.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                    # Flip to upper hemisphere (w ≥ 0) for sign consistency.
+                    q0 = q0 * torch.sign(q0[:, :1]).clamp_min(1.0)
+                else:
+                    # Stale cache (e.g. left over from a prune or densify
+                    # that did not permute/invalidate it).  Drop it and
+                    # fall through to the identity-quaternion fallback so
+                    # the activation never crashes; the warm-start will
+                    # be rebuilt on the next boundary-loss call.
+                    print(
+                        f"[thin-surface] WARNING: _last_top_eigvec shape "
+                        f"{v_shape} disagrees with current N={N}; discarding "
+                        f"stale warm-start cache and falling back to identity "
+                        f"quaternions.  Re-run a boundary-alignment loss to "
+                        f"repopulate the cache."
+                    )
+                    delattr(self, "_last_top_eigvec")
             self.quaternions = nn.Parameter(q0)
 
             # Texel sites: small jittered ring (radius 0.4) in the unit disc.
@@ -2103,6 +2129,34 @@ class CTScene(torch.nn.Module):
         if hasattr(self, '_frozen_mask'):
             self._frozen_mask = self._frozen_mask[valid_points_mask]
 
+        # Per-cell boundary-loss caches (set by `_boundary_top_eigvec`) are
+        # keyed by row index to primal_points.  After a prune the surviving
+        # rows are a strict subset, so the caches must be permuted by the
+        # same `valid_points_mask` to stay aligned with primal_points --
+        # otherwise `initialize_thin_surface` would read pre-prune warm-start
+        # vectors and `torch.cross(ref, v, dim=-1)` would crash with a shape
+        # mismatch at thin activation (CH4 reproducer).
+        for cache_name in (
+            "_last_top_eigvec",
+            "_last_M_trace",
+            "_last_M_valid",
+            "_last_normal_lap_residual",
+        ):
+            if not hasattr(self, cache_name):
+                continue
+            t = getattr(self, cache_name)
+            if t is None:
+                continue
+            if t.shape[0] == valid_points_mask.shape[0]:
+                setattr(self, cache_name, t[valid_points_mask])
+            else:
+                # Cache shape disagrees with point count -- this means the
+                # cache was left behind by a previous prune/densify path that
+                # forgot to update it.  Drop it; the next boundary-loss call
+                # repopulates it.  initialize_thin_surface also has its own
+                # shape guard for `_last_top_eigvec`.
+                delattr(self, cache_name)
+
     def cat_tensors_to_optimizer(self, new_params):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -2179,6 +2233,24 @@ class CTScene(torch.nn.Module):
                 self._frozen_mask,
                 torch.zeros(n_new, dtype=torch.bool, device=self.device),
             ])
+
+        # Per-cell boundary-loss caches (set by `_boundary_top_eigvec`) are
+        # row-aligned with primal_points at the time they are populated.
+        # Newly densified cells have no boundary graph (and no cache entry)
+        # until `_boundary_top_eigvec` runs again, so any cached tensor
+        # would be structurally misaligned with the new row range.  Drop
+        # the caches entirely -- they will be re-populated on the next
+        # call to the boundary losses / `initialize_thin_surface` warm
+        # start.  This protects the warm-start shape from the moment a
+        # densification step fires before thin activation.
+        for cache_name in (
+            "_last_top_eigvec",
+            "_last_M_trace",
+            "_last_M_valid",
+            "_last_normal_lap_residual",
+        ):
+            if hasattr(self, cache_name):
+                delattr(self, cache_name)
 
     def prune_and_densify(
         self, point_error, point_contribution, upsample_factor=1.2,
