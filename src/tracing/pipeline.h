@@ -21,6 +21,13 @@ struct TraceSettings {
     int  thin_K = 4;
     float thin_temp = 10.0f;
     float thin_height_eps = 1e-4f;
+    // Relative-delta parameterization (M5 chest rescue prototype).
+    // When true, the kernel computes delta = rho * mu_bar * tanh(raw_delta)
+    // instead of using density_delta as a raw additive offset, so the split
+    // is bounded by rho * mu_bar and both sides remain nonneg.  Geometry
+    // is untouched.  See CH5-CH7 in specs/SPLIT-CELL-EXECUTION-LOG.md.
+    bool  thin_surface_relative_delta = false;
+    float thin_surface_delta_max_frac = 0.5f;   // rho in (0, 1]
 };
 
 inline TraceSettings default_trace_settings() {

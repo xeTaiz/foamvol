@@ -39,6 +39,11 @@ class TraceRays(torch.autograd.Function):
         _thin_K=4,
         _thin_temp=10.0,
         _thin_height_eps=1e-4,
+        # M5 relative-delta rescue: when True the kernel computes
+        # delta = rho * mu_bar * tanh(raw_delta) instead of treating
+        # density_delta as a raw additive offset.  Bounded and nonneg-safe.
+        _thin_surface_relative_delta=False,
+        _thin_surface_delta_max_frac=0.5,
     ):
         ctx.rays = rays
         ctx.start_point = start_point
@@ -62,6 +67,8 @@ class TraceRays(torch.autograd.Function):
         ctx.thin_K = _thin_K
         ctx.thin_temp = _thin_temp
         ctx.thin_height_eps = _thin_height_eps
+        ctx.thin_surface_relative_delta = _thin_surface_relative_delta
+        ctx.thin_surface_delta_max_frac = _thin_surface_delta_max_frac
         if ctx.has_density_grad:
             ctx.density_grad = _density_grad
         if ctx.has_gaussian:
@@ -102,6 +109,8 @@ class TraceRays(torch.autograd.Function):
             thin_K=_thin_K,
             thin_temp=_thin_temp,
             thin_height_eps=_thin_height_eps,
+            thin_surface_relative_delta=_thin_surface_relative_delta,
+            thin_surface_delta_max_frac=_thin_surface_delta_max_frac,
         )
 
         errbox = ErrorBox()
@@ -155,6 +164,8 @@ class TraceRays(torch.autograd.Function):
         thin_K = ctx.thin_K
         thin_temp = ctx.thin_temp
         thin_height_eps = ctx.thin_height_eps
+        thin_surface_relative_delta = ctx.thin_surface_relative_delta
+        thin_surface_delta_max_frac = ctx.thin_surface_delta_max_frac
         _density_delta = ctx.density_delta if has_thin_surface else None
         _quaternions = ctx.quaternions if has_thin_surface else None
         _texel_sites_2d = ctx.texel_sites_2d if has_thin_surface else None
@@ -189,6 +200,8 @@ class TraceRays(torch.autograd.Function):
             thin_K=thin_K,
             thin_temp=thin_temp,
             thin_height_eps=thin_height_eps,
+            thin_surface_relative_delta=thin_surface_relative_delta,
+            thin_surface_delta_max_frac=thin_surface_delta_max_frac,
         )
         points_grad = results["points_grad"]
         attr_grad = results["attr_grad"]
@@ -263,6 +276,8 @@ class TraceRays(torch.autograd.Function):
             ctx.thin_K,
             ctx.thin_temp,
             ctx.thin_height_eps,
+            ctx.thin_surface_relative_delta,
+            ctx.thin_surface_delta_max_frac,
         )
         if has_density_grad:
             del ctx.density_grad
@@ -300,4 +315,6 @@ class TraceRays(torch.autograd.Function):
             None,               # _thin_K
             None,               # _thin_temp
             None,               # _thin_height_eps
+            None,               # _thin_surface_relative_delta (M5)
+            None,               # _thin_surface_delta_max_frac (M5)
         )

@@ -764,7 +764,20 @@ __global__ void ct_thinsurface_forward(
         float raw_base  = density[point_idx];
         float mu_bar    = (sp_beta * raw_base > 20.0f) ? raw_base
                           : logf(1.0f + expf(sp_beta * raw_base)) / sp_beta;
-        float delta_val = density_delta[point_idx];
+        // raw_delta is the learnable parameter. Two parameterizations:
+        //   absolute (legacy):  delta_val = raw_delta
+        //   relative (M5 rescue): delta_val = rho * mu_bar * tanh(raw_delta)
+        // so that |delta_val| <= rho * mu_bar and both mu_p, mu_n >= 0 for
+        // rho in (0, 1].  At raw_delta=0 both collapse to delta_val=0, so
+        // activation continuity at init is preserved by construction.
+        float raw_delta = density_delta[point_idx];
+        float delta_val;
+        if (settings.thin_surface_relative_delta) {
+            float rho = settings.thin_surface_delta_max_frac;
+            delta_val = rho * mu_bar * tanhf(raw_delta);
+        } else {
+            delta_val = raw_delta;
+        }
         float mu_p      = fmaxf(mu_bar + delta_val, 0.0f);
         float mu_n      = fmaxf(mu_bar - delta_val, 0.0f);
 
@@ -914,7 +927,23 @@ __global__ void ct_thinsurface_backward(
                           : logf(1.0f + expf(sp_beta * raw_base)) / sp_beta;
         float d_softplus = 1.0f / (1.0f + expf(-sp_beta * raw_base));
 
-        float delta_val = density_delta[point_idx];
+        float raw_delta = density_delta[point_idx];
+        // Mirror the forward-branch dispatch (see ct_thinsurface_forward):
+        //   absolute: delta_val = raw_delta,                 d(raw_delta)/d(delta_val) = 1
+        //   relative: delta_val = rho * mu_bar * tanh(raw), d/d(raw) chain via sech^2
+        // t_raw holds tanh(raw_delta) for both branches so the mu_p / mu_n
+        // adjoint below stays a single code path; the absolute branch sets
+        // t_raw = 0 so the extra dL/dmu_bar additive collapses to 0 too.
+        float t_raw;
+        float delta_val;
+        if (settings.thin_surface_relative_delta) {
+            float rho = settings.thin_surface_delta_max_frac;
+            t_raw     = tanhf(raw_delta);
+            delta_val = rho * mu_bar * t_raw;
+        } else {
+            t_raw     = 0.0f;
+            delta_val = raw_delta;
+        }
         float mu_p      = fmaxf(mu_bar + delta_val, 0.0f);
         float mu_n      = fmaxf(mu_bar - delta_val, 0.0f);
         float ind_p     = (mu_p > 0.0f) ? 1.0f : 0.0f;
@@ -1053,8 +1082,25 @@ __global__ void ct_thinsurface_backward(
         // mu_p = max(mu_bar + delta_val, 0), mu_n = max(mu_bar - delta_val, 0)
         float dL_dmu_bar = ind_p * dL_dmu_p + ind_n * dL_dmu_n;
         float dL_ddelta  = ind_p * dL_dmu_p - ind_n * dL_dmu_n;
-        atomicAdd(density_base_grad  + point_idx, dL_dmu_bar * d_softplus);
-        atomicAdd(density_delta_grad + point_idx, dL_ddelta);
+        // Final mu_bar adjoint = contribution from explicit mu_p / mu_n via
+        // mu_bar + delta (== 1 from ind_* mask) PLUS any contribution from
+        // delta depending on mu_bar (only in the relative parameterization:
+        // delta = rho * mu_bar * tanh(raw), so d(delta)/d(mu_bar) = rho * tanh(raw)).
+        if (settings.thin_surface_relative_delta) {
+            float rho = settings.thin_surface_delta_max_frac;
+            dL_dmu_bar += dL_ddelta * rho * t_raw;
+            // Chain to the raw learnable parameter:
+            //   delta = rho * mu_bar * tanh(raw)  ->
+            //   d(delta)/d(raw) = rho * mu_bar * (1 - tanh^2(raw)) = rho * mu_bar * sech^2(raw)
+            float sech2 = 1.0f - t_raw * t_raw;
+            atomicAdd(density_delta_grad + point_idx,
+                      dL_ddelta * rho * mu_bar * sech2);
+        } else {
+            // Absolute (legacy): delta = raw_delta, so d(delta)/d(raw_delta)=1
+            // and there is no extra mu_bar contribution from delta.
+            atomicAdd(density_delta_grad + point_idx, dL_ddelta);
+        }
+        atomicAdd(density_base_grad + point_idx, dL_dmu_bar * d_softplus);
 
         // ---- dL/d(t_surf) -> dL/d(h_eval) + dL/d(current_point) + dL/dn ----
         // t_surf = (cp · n - origin · n + h_eval) / dp

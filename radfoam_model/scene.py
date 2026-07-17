@@ -1657,6 +1657,12 @@ class CTScene(torch.nn.Module):
             getattr(self, "_thin_K", 4),
             getattr(self, "_thin_temp", 10.0),
             getattr(self, "_thin_height_eps", 1e-4),
+            # M5 chest rescue: relative-delta parameterization
+            # (delta = rho * mu_bar * tanh(raw)).  Persisted through
+            # initialize_thin_surface's _thin_surface_relative_delta flag
+            # so eval / resume use the same interpretation as training.
+            getattr(self, "_thin_surface_relative_delta", False),
+            float(getattr(self, "_thin_surface_delta_max_frac", 0.5)),
         )
 
     def declare_optimizer(self, args, warmup, max_iterations):
@@ -1945,6 +1951,14 @@ class CTScene(torch.nn.Module):
             getattr(args, "thin_surface_delta_clip", 2.0))
         self._thin_surface_grad_clip = float(
             getattr(args, "thin_surface_grad_clip", 1.0))
+        # M5 relative-delta parameterization: store the chosen mode so it
+        # propagates through the autograd function call and the checkpoint
+        # metadata (save_pt / load_pt).  Defaults to False (legacy absolute
+        # delta = raw additive offset); opt in per-config / per-run.
+        self._thin_surface_relative_delta = bool(
+            getattr(args, "thin_surface_relative_delta", False))
+        self._thin_surface_delta_max_frac = float(
+            getattr(args, "thin_surface_delta_max_frac", 0.5))
 
         _ginfo = ", ".join(
             f"{n}={self._thin_surface_group_lr_init[n]:.2e}"
@@ -1953,23 +1967,37 @@ class CTScene(torch.nn.Module):
         print(f"Initialized thin-surface params: {N} cells, K={K} texels "
               f"(global_lr_scale={_global_scale}, group_lr=[{_ginfo}], "
               f"resume={resume}, delta_clip={self._thin_surface_delta_clip}, "
-              f"grad_clip={self._thin_surface_grad_clip})")
+              f"grad_clip={self._thin_surface_grad_clip}, "
+              f"relative_delta={self._thin_surface_relative_delta}, "
+              f"rho={self._thin_surface_delta_max_frac})")
 
     @torch.no_grad()
     def clamp_thin_surface_params(self):
         """Post-step safety bounds on thin-surface params.
 
-        density_delta is unbounded in mu_plus = max(mu_bar+delta, 0); under L1's
-        non-vanishing subgradient + Adam normalization it can diverge (observed:
-        split-vox max density 7.45 on a converged cube). Clamp |delta| to
-        _thin_surface_delta_clip (0 = off). Quaternions are normalized in the
-        kernel already; we only rescale if their norm has drifted far from 1 to
-        keep the parameter manifold sane (no effect on the forward).
+        density_delta clamping semantics depend on parameterization:
+          absolute (legacy):  delta_val = raw_delta,  so clamp |raw_delta|
+          relative (M5):      delta_val = rho * mu_bar * tanh(raw_delta);
+                              tanh already bounds it to (-1,+1), so the
+                              resulting delta stays within rho * mu_bar no
+                              matter how raw_delta grows. We still clamp
+                              raw_delta itself as a soft Adam LR cap (off if
+                              thin_surface_delta_clip <= 0).  Quaternions
+                              are normalized in the kernel already; we only
+                              rescale if their norm has drifted far from 1
+                              to keep the parameter manifold sane (no effect
+                              on the forward).
         """
         if not getattr(self, "_thin_surface_active", False):
             return
         c = getattr(self, "_thin_surface_delta_clip", 0.0)
-        if c and c > 0 and getattr(self, "density_delta", None) is not None:
+        # In the relative parameterization the kernel's `tanh` already
+        # bounds the effective delta to (-rho*mu_bar, +rho*mu_bar), so the
+        # absolute post-step raw clamp is redundant; skip it to preserve
+        # optimizer headroom (otherwise tanh would saturate prematurely).
+        if (c and c > 0
+            and getattr(self, "density_delta", None) is not None
+            and not getattr(self, "_thin_surface_relative_delta", False)):
             self.density_delta.data.clamp_(-c, c)
         if getattr(self, "quaternions", None) is not None:
             qn = self.quaternions.data.norm(dim=-1, keepdim=True)
@@ -1994,13 +2022,26 @@ class CTScene(torch.nn.Module):
 
     @torch.no_grad()
     def thin_surface_diagnostics(self):
-        """P0-F stats for TensorBoard. Returns dict or None if inactive."""
+        """P0-F stats for TensorBoard. Returns dict or None if inactive.
+
+        For the relative-delta parameterization (M5) the recorded `dd` is
+        the effective delta = rho * mu_bar * tanh(raw), not the raw learnable
+        parameter.  We surface an extra `delta_raw_*` triplet for diagnosing
+        Adam-side saturation if desired, and tag the dict with `delta_mode`.
+        """
         if not getattr(self, "_thin_surface_active", False):
             return None
         if getattr(self, "density_delta", None) is None:
             return None
-        dd = self.density_delta.detach().squeeze(-1)        # (N,)
+        raw = self.density_delta.detach().squeeze(-1)       # (N,) raw learnable
         mu_bar = self.get_primal_density().detach().squeeze(-1)  # (N,)
+        if getattr(self, "_thin_surface_relative_delta", False):
+            rho = float(getattr(self, "_thin_surface_delta_max_frac", 0.5))
+            dd = rho * mu_bar * torch.tanh(raw)             # effective delta
+            mode = "relative"
+        else:
+            dd = raw                                          # effective delta
+            mode = "absolute"
         mu_p = torch.clamp(mu_bar + dd, min=0.0)
         mu_n = torch.clamp(mu_bar - dd, min=0.0)
         h = self.texel_heights.detach()                     # (N,K)
@@ -2011,6 +2052,7 @@ class CTScene(torch.nn.Module):
         warm = 1.0 if hasattr(self, "_last_top_eigvec") else 0.0
         q = 0.95
         return {
+            "delta_mode": mode,
             "delta_abs_mean": dd.abs().mean().item(),
             "delta_abs_p95": dd.abs().float().quantile(q).item() if dd.numel() else 0.0,
             "delta_abs_max": dd.abs().max().item(),
@@ -2023,6 +2065,13 @@ class CTScene(torch.nn.Module):
             "quat_norm_max": qn.max().item(),
             "active_frac": active.mean().item(),
             "delta_nonzero_frac": (dd.abs() > 1e-6).float().mean().item(),
+            # Raw learnable param stats (M5): under the relative parameterization
+            # this can drift without bound since tanh already handles the
+            # semantic clipping. Useful to detect Adam-side saturation.
+            "delta_raw_abs_mean": raw.abs().mean().item(),
+            "delta_raw_abs_p95": raw.abs().float().quantile(q).item()
+                                  if raw.numel() else 0.0,
+            "delta_raw_abs_max": raw.abs().max().item(),
             "warm_start": warm,
         }
 
@@ -2810,6 +2859,14 @@ class CTScene(torch.nn.Module):
                 "K": int(self._thin_K),
                 "start": int(getattr(self, "_thin_surface_start", -1)),
                 "scheduler_cfg": getattr(self, "_thin_surface_scheduler_cfg", None),
+                # M5 chest rescue: persist the relative-delta parameterization
+                # so eval/resume don't silently reinterpret density_delta.
+                # Default False (legacy absolute) when missing -- safe for
+                # checkpoints saved before this field existed.
+                "relative_delta": bool(
+                    getattr(self, "_thin_surface_relative_delta", False)),
+                "delta_max_frac": float(
+                    getattr(self, "_thin_surface_delta_max_frac", 0.5)),
             }
         torch.save(scene_data, pt_path)
 
@@ -2854,6 +2911,14 @@ class CTScene(torch.nn.Module):
             self._thin_surface_active = True
             self._thin_surface_start = int(meta.get("start", -1))
             self._thin_surface_scheduler_cfg = meta.get("scheduler_cfg", None)
+            # M5 relative-delta parameterization (legacy default = absolute).
+            # A naive reinterpretation of an absolute-delta checkpoint under
+            # relative mode would silently feed raw delta values into tanh,
+            # which is why this flag MUST round-trip through the checkpoint.
+            self._thin_surface_relative_delta = bool(
+                meta.get("relative_delta", False))
+            self._thin_surface_delta_max_frac = float(
+                meta.get("delta_max_frac", 0.5))
             if self._thin_surface_scheduler_cfg is not None:
                 self.thin_surface_scheduler_args = get_cosine_lr_func(
                     lr_init=self._thin_surface_scheduler_cfg["lr_init"],
@@ -2861,7 +2926,9 @@ class CTScene(torch.nn.Module):
                     max_steps=self._thin_surface_scheduler_cfg["max_steps"],
                 )
             print(f"[load_pt] restored thin-surface state: K={K}, "
-                  f"N={self.primal_points.shape[0]}")
+                  f"N={self.primal_points.shape[0]}, "
+                  f"relative_delta={self._thin_surface_relative_delta}, "
+                  f"rho={self._thin_surface_delta_max_frac}")
 
         self.point_adjacency = scene_data["adjacency"].to(self.device).to(
             torch.uint32)
