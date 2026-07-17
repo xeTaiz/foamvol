@@ -167,6 +167,68 @@ def _make_single_ray(device="cuda", origin=None, direction=None):
     return torch.cat([origin, direction], dim=-1)  # (1, 6)
 
 
+def _clone_scene(base_model):
+    """Clone a CTScene for use with a different thin-surface parameterization.
+
+    The cloned scene has its own nn.Module state (so zero_grad() etc. track
+    grads on its own parameters) but shares the C++ Triangulation, AABB tree,
+    and CSR adjacency buffers with the source -- those depend only on
+    primal_points and are immutable for forward.  All learnable parameters
+    are detached-cloned so the clone is autograd-independent.
+
+    This is the only way to make an absolute-vs-relative forward comparison
+    bit-identical on scene inputs: two independent calls to _make_1cell_scene
+    produce two different randomized scenes (different RNG draws during
+    random_initialize, different filler shells, possibly different Delaunay
+    vertex orderings in the C++ binding).  Even if the *kernel* is bit-
+    identical at init, two different scenes trivially produce two different
+    projections -- a test artifact, not a kernel bug.
+    """
+    new_model = object.__new__(CTScene)
+    nn.Module.__init__(new_model)
+
+    # Scalar / config attrs (all copied verbatim; the clone starts in the
+    # same mode as the base, callers can override the parameterization flags).
+    new_model.activation_scale = base_model.activation_scale
+    new_model.device = base_model.device
+    new_model.num_init_points = base_model.num_init_points
+    new_model.num_final_points = base_model.num_final_points
+    new_model._thin_surface_active = base_model._thin_surface_active
+    new_model._thin_K = base_model._thin_K
+    new_model._thin_surface_gate_tau = base_model._thin_surface_gate_tau
+    new_model._thin_surface_start = base_model._thin_surface_start
+    new_model._max_iterations = base_model._max_iterations
+    new_model._thin_surface_relative_delta = base_model._thin_surface_relative_delta
+    new_model._thin_surface_delta_max_frac = base_model._thin_surface_delta_max_frac
+    new_model._thin_temp = getattr(base_model, "_thin_temp", 10.0)
+    new_model._thin_height_eps = getattr(base_model, "_thin_height_eps", 1e-4)
+
+    # Learnable parameters: detached-cloned so each scene has its own
+    # nn.Parameter (independent autograd graph + independent .grad slot).
+    new_model.primal_points = nn.Parameter(base_model.primal_points.detach().clone())
+    new_model.density = nn.Parameter(base_model.density.detach().clone())
+    new_model.density_delta = nn.Parameter(base_model.density_delta.detach().clone())
+    new_model.quaternions = nn.Parameter(base_model.quaternions.detach().clone())
+    new_model.texel_sites_2d = nn.Parameter(base_model.texel_sites_2d.detach().clone())
+    new_model.texel_heights = nn.Parameter(base_model.texel_heights.detach().clone())
+
+    # Shared immutable C++/CSR buffers (depend only on primal_points, which
+    # is the same tensor values on both scenes -- we just clone it).
+    new_model.triangulation = base_model.triangulation
+    new_model.aabb_tree = base_model.aabb_tree
+    new_model.point_adjacency = base_model.point_adjacency
+    new_model.point_adjacency_offsets = base_model.point_adjacency_offsets
+    new_model._cached_cell_radius = base_model._cached_cell_radius
+    new_model.pipeline = base_model.pipeline
+
+    # Forward-only scenes don't need an optimizer; leave it None so any
+    # accidental .zero_grad() / .backward() on the clone can't mutate the
+    # base scene's optimizer state.
+    new_model.optimizer = None
+
+    return new_model
+
+
 def _render_with_grad(model, rays, mode="relative", rho=RHO):
     """Run a forward pass with the requested parameterization and return
     the scalar loss = sum(proj) used by the FD check.
@@ -294,22 +356,58 @@ def test_forward_continuity_at_init():
     Math:  abs mode: delta_val = raw_delta            -> at init: 0
            rel mode: delta_val = rho * mu_bar * tanh(raw) -> at init: 0
            both yield mu_p = mu_n = mu_bar -> contrib identical.
+
+    Implementation: build ONE valid scene (the "base") then clone it twice
+    via _clone_scene() so the absolute and relative forward passes see
+    identical points/density/topology/params.  Without this, two independent
+    _make_1cell_scene calls produce two randomized scenes that differ by
+    enough floating-point noise in their bounds to break the 1e-7 continuity
+    check purely from scene mismatch -- a test artifact, not a kernel bug.
     """
     print("\n--- Test 1: activation forward continuity at init (rho=.5) ---")
     device = "cuda"
     rays = _make_single_ray(device)
 
-    # Absolute reference (delta_val = raw_delta at init)
-    model_abs = _make_1cell_scene(device)
+    # Single source of truth: build a valid scene once, clone twice.
+    base_model = _make_1cell_scene(device)
+
+    # Absolute reference (delta_val = raw_delta at init).  The clone starts
+    # in relative mode (matching the base); flip it to absolute here.
+    model_abs = _clone_scene(base_model)
     model_abs._thin_surface_relative_delta = False
     model_abs._thin_surface_delta_max_frac = 0.5
     out_abs = _render_with_grad(model_abs, rays, mode="absolute")
 
-    # Relative at rho=.5 (delta_val = rho * mu_bar * tanh(raw))
-    model_rel = _make_1cell_scene(device)
+    # Relative at rho=.5 (delta_val = rho * mu_bar * tanh(raw)).
+    model_rel = _clone_scene(base_model)
     model_rel._thin_surface_relative_delta = True
     model_rel._thin_surface_delta_max_frac = RHO
     out_rel = _render_with_grad(model_rel, rays, mode="relative", rho=RHO)
+
+    # Sanity: confirm the two scenes really do see identical scene state.
+    # If the base model mutates during forward (it shouldn't -- forward is
+    # read-only), this guard catches it before we trust the equality.
+    pts_match = torch.equal(
+        model_abs.primal_points.detach(), model_rel.primal_points.detach()
+    )
+    dens_match = torch.equal(
+        model_abs.density.detach(), model_rel.density.detach()
+    )
+    dd_match = torch.equal(
+        model_abs.density_delta.detach(), model_rel.density_delta.detach()
+    )
+    quat_match = torch.equal(
+        model_abs.quaternions.detach(), model_rel.quaternions.detach()
+    )
+    sites_match = torch.equal(
+        model_abs.texel_sites_2d.detach(), model_rel.texel_sites_2d.detach()
+    )
+    heights_match = torch.equal(
+        model_abs.texel_heights.detach(), model_rel.texel_heights.detach()
+    )
+    check(pts_match and dens_match and dd_match and quat_match and sites_match and heights_match,
+          "clone parity: primal_points/density/density_delta/quaternions/sites/heights "
+          "are byte-identical between absolute and relative scenes")
 
     # Per-element comparison: at init both paths compute delta_val = 0 exactly
     # (rho * mu_bar * tanh(0) = rho * mu_bar * 0 = 0 in IEEE-754 float32), so
