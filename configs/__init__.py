@@ -215,6 +215,16 @@ class OptimizationParams(ParamGroup):
         self.thin_surface_quat_lr_scale   = 1.0
         self.thin_surface_sites_lr_scale  = 1.0
         self.thin_surface_heights_lr_scale = 1.0
+        # Relative-delta parameterization (Milestone 5 chest rescue prototype;
+        # see specs/SPLIT-CELL-EXECUTION-LOG.md CH5-CH7). Replaces the raw
+        # additive density_delta (unbounded, mu_plus can run away) with a
+        # bounded split:
+        #     delta = rho * mu_bar * tanh(raw)
+        # so |delta| <= rho * mu_bar always, and both mu_p / mu_n stay
+        # nonneg whenever rho <= 1.  rho==0 collapses to scalar (CH5-like).
+        # Default OFF: opt-in per config so existing checkpoints stay valid.
+        self.thin_surface_relative_delta = False
+        self.thin_surface_delta_max_frac = 0.5   # rho; only read when above is True
         super().__init__(parser, "Setting Optimization parameters")
 
 

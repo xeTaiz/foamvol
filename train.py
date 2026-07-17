@@ -1120,7 +1120,20 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     ts_delta_w  = getattr(optimizer_args, 'thin_surface_delta_weight', 1e-3)
                     ts_height_w = getattr(optimizer_args, 'thin_surface_height_weight', 1e-3)
                     if ts_delta_w > 0 and hasattr(model, 'density_delta'):
-                        ts_delta_loss = model.density_delta.pow(2).mean()
+                        # M5 chest rescue: under the relative parameterization,
+                        # the L2 penalty targets the EFFECTIVE delta so a
+                        # well-scaled split isn't penalized for using a large
+                        # raw parameter.  Falls back to the raw param in the
+                        # absolute (legacy) case for backward compatibility.
+                        if getattr(model, '_thin_surface_relative_delta', False):
+                            rho = float(getattr(model, '_thin_surface_delta_max_frac', 0.5))
+                            mu_bar = torch.nn.functional.softplus(
+                                model.density.squeeze(-1), beta=10.0)
+                            dd_eff = rho * mu_bar * torch.tanh(
+                                model.density_delta.squeeze(-1))
+                            ts_delta_loss = dd_eff.pow(2).mean()
+                        else:
+                            ts_delta_loss = model.density_delta.pow(2).mean()
                         loss = loss + ts_delta_w * ts_delta_loss
                     if ts_height_w > 0 and hasattr(model, 'texel_heights'):
                         ts_height_loss = model.texel_heights.abs().mean()

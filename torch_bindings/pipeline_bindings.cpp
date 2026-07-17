@@ -176,7 +176,9 @@ py::object trace_forward(Pipeline &self,
                          std::optional<torch::Tensor> texel_heights_in,
                          int thin_K,
                          float thin_temp,
-                         float thin_height_eps) {
+                         float thin_height_eps,
+                         bool thin_surface_relative_delta,
+                         float thin_surface_delta_max_frac) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -277,6 +279,12 @@ py::object trace_forward(Pipeline &self,
     settings.thin_K = thin_K;
     settings.thin_temp = thin_temp;
     settings.thin_height_eps = thin_height_eps;
+    // M5 chest rescue: relative-delta parameterization.  When on, the
+    // kernel applies delta = rho * mu_bar * tanh(raw_delta) so the split
+    // is bounded by rho * mu_bar and both sides stay nonneg for rho in (0,1].
+    // Geometry is unaffected.
+    settings.thin_surface_relative_delta = thin_surface_relative_delta;
+    settings.thin_surface_delta_max_frac  = thin_surface_delta_max_frac;
 
     // Hard cap: the CUDA backward kernel uses a fixed-size stack buffer
     // `float w_arr[8]` (pipeline.cu, ct_thinsurface_backward). An invalid K
@@ -408,7 +416,9 @@ py::object trace_backward(Pipeline &self,
                           std::optional<torch::Tensor> texel_heights_in,
                           int thin_K,
                           float thin_temp,
-                          float thin_height_eps) {
+                          float thin_height_eps,
+                          bool thin_surface_relative_delta,
+                          float thin_surface_delta_max_frac) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -531,6 +541,9 @@ py::object trace_backward(Pipeline &self,
     settings.thin_K = thin_K;
     settings.thin_temp = thin_temp;
     settings.thin_height_eps = thin_height_eps;
+    // Mirror the forward branch (see trace_forward).
+    settings.thin_surface_relative_delta = thin_surface_relative_delta;
+    settings.thin_surface_delta_max_frac  = thin_surface_delta_max_frac;
 
     // Hard cap (same as trace_forward): protect the CUDA backward w_arr[8].
     if (thin_surface_mode && (thin_K <= 0 || thin_K > 8)) {
@@ -783,7 +796,10 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("texel_heights") = py::none(),
              py::arg("thin_K") = 4,
              py::arg("thin_temp") = 10.0f,
-             py::arg("thin_height_eps") = 1e-4f)
+             py::arg("thin_height_eps") = 1e-4f,
+             // M5 relative-delta parameterization.  Off by default; opt in.
+             py::arg("thin_surface_relative_delta") = false,
+             py::arg("thin_surface_delta_max_frac") = 0.5f)
         .def("trace_backward",
              trace_backward,
              py::arg("points"),
@@ -814,7 +830,10 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("texel_heights") = py::none(),
              py::arg("thin_K") = 4,
              py::arg("thin_temp") = 10.0f,
-             py::arg("thin_height_eps") = 1e-4f);
+             py::arg("thin_height_eps") = 1e-4f,
+             // M5 relative-delta parameterization.  Off by default; opt in.
+             py::arg("thin_surface_relative_delta") = false,
+             py::arg("thin_surface_delta_max_frac") = 0.5f);
 
     module.def("create_ct_pipeline", create_ct_pipeline_binding);
 
