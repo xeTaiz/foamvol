@@ -299,6 +299,23 @@ def log_diagnostics(model, writer, step):
         writer.add_histogram("diagnostics/cell_radius", cell_radius, step)
 
 
+def _log_diag_kv(writer, key, value, step):
+    """Write a single thin-surface diagnostic entry.
+
+    `thin_surface_diagnostics()` returns numeric stats *and* a categorical
+    `delta_mode` string (e.g. "relative"/"absolute").  TensorBoard's
+    `add_scalar` rejects strings with ValueError, so route non-numeric
+    entries through `add_text` (categorical info never changes intra-run).
+
+    Exposed at module scope so regression tests can import and exercise it
+    without spinning up the full training loop.
+    """
+    if isinstance(value, (int, float)):
+        writer.add_scalar(f"thin/{key}", float(value), step)
+    else:
+        writer.add_text(f"thin/{key}", str(value), step)
+
+
 def _resolve_global_sigma(model, pipeline_args):
     """Return absolute physical IDW sigma for global (non-per-cell) consumers.
 
@@ -1284,7 +1301,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         _ts_diag = model.thin_surface_diagnostics()
                         if _ts_diag is not None:
                             for _k, _v in _ts_diag.items():
-                                writer.add_scalar(f"thin/{_k}", _v, i)
+                                # Route via helper so non-numeric entries
+                                # (e.g. categorical `delta_mode`) don't crash
+                                # `writer.add_scalar`.
+                                _log_diag_kv(writer, _k, _v, i)
                             for _g in model.optimizer.param_groups:
                                 if _g["name"] in ("density_delta", "quaternions",
                                                    "texel_sites_2d", "texel_heights"):
