@@ -87,6 +87,29 @@ def _build_tet_topology(points):
     }
 
 
+def _topology_from_live_triangulation(tri, num_points, device):
+    """Extract topology from an already-valid live ``Triangulation``.
+
+    Rebuilding solely for diagnostics can fail for an otherwise renderable
+    near-degenerate point cloud.  The live triangulation is the one currently
+    backing the renderer, so reuse it whenever its permutation covers all
+    model points.  Callers may fall back to ``_build_tet_topology`` if that
+    invariant is unavailable (e.g. a lightweight test stub).
+    """
+    tri_perm = tri.permutation().long()
+    if tri_perm.numel() != num_points:
+        raise ValueError("live triangulation does not cover all model points")
+    tri_inv_perm = torch.empty(num_points, dtype=torch.long, device=device)
+    tri_inv_perm[tri_perm] = torch.arange(num_points, dtype=torch.long, device=device)
+    return {
+        "tets": tri.tets().long(),
+        "tet_adjacency": tri.tet_adjacency().long(),
+        "vert_to_tet": tri.vert_to_tet().long(),
+        "tri_perm": tri_perm,
+        "tri_inv_perm": tri_inv_perm,
+    }
+
+
 def field_from_model(model):
     """Build a field dict from a live CTScene (no checkpoint save/load)."""
     with torch.no_grad():
@@ -95,6 +118,15 @@ def field_from_model(model):
         _, cell_radius = radfoam.farthest_neighbor(
             model.primal_points, adj.to(torch.int32), adj_off.to(torch.int32)
         )
+        try:
+            topology = _topology_from_live_triangulation(
+                model.triangulation, model.primal_points.shape[0],
+                model.primal_points.device,
+            )
+        except (AttributeError, ValueError):
+            # Retain the standalone/test fallback when no compatible live
+            # triangulation is available.
+            topology = _build_tet_topology(model.primal_points)
         return {
             "points": model.primal_points,
             "density_flat": model.density.squeeze(-1),
@@ -105,7 +137,7 @@ def field_from_model(model):
             "aabb_tree": model.aabb_tree,
             "cell_radius": cell_radius,
             "device": model.primal_points.device,
-            **_build_tet_topology(model.primal_points),
+            **topology,
         }
 
 
