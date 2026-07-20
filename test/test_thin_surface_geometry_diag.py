@@ -14,8 +14,9 @@ Covered diagnostics:
         -> quat_normal_coherence_sq, quat_normal_flip_frac
   (c) height mean/std and uniform-vs-curved measure
         -> height_mean, height_std, height_curvedness
-  (d) effective height scale relative to cell radius
-        -> height_radius_ratio_mean, height_radius_ratio_p95
+  (d) height extent (texel_heights are dimensionless; forward applies r*h_k):
+        (a dimensionless) height_l1_norm_mean, height_l1_norm_p95  (h_l1/p95)
+        (b world units) height_extent_mean, height_extent_p95       (r*h_l1)
 
 The test is CPU-only and uses a radfoam stub (mirrors the other thin-surface
 test files) so it runs without a CUDA device or a compiled extension.
@@ -262,28 +263,65 @@ def test_height_uniform_vs_curved():
 # ---------------------------------------------------------------------------
 # (d) height/radius ratio scales with height and inverse with radius.
 # ---------------------------------------------------------------------------
-def test_height_radius_ratio():
-    print("\n--- (d) height/radius ratio ---")
-    n = 4
+def test_height_extent_and_normalized():
+    print("\n--- (d) height extent (world r*h_l1) + dimensionless normalized ---")
+    n = 8
     scene = _activate(_make_scene(n_points=n))
     K = scene.texel_heights.shape[1]
-    # heights all 0.2, radius 1.0 -> h_l1 = K*0.2 = 0.8, ratio = 0.8
-    scene.texel_heights.data.fill_(0.2)
+    h_l1_lo = K * 0.1                       # half the cells at h=0.1
+    h_l1_hi = K * 0.2                       # half at h=0.2
+    h = torch.zeros(n, K)
+    h[: n // 2] = 0.1
+    h[n // 2:] = 0.2
+    scene.texel_heights.data.copy_(h)
     scene._cached_cell_radius = torch.ones(n)
     d = scene.thin_surface_diagnostics()
-    expected = K * 0.2
-    assert math.isclose(d["height_radius_ratio_mean"], expected, abs_tol=1e-6), \
-        f"ratio mean = K*0.2 = {expected}, got {d['height_radius_ratio_mean']}"
-    assert math.isclose(d["height_radius_ratio_p95"], expected, abs_tol=1e-6), \
-        f"uniform -> p95 == mean, got {d['height_radius_ratio_p95']}"
-    print(f"  [PASS] h=0.2,r=1: ratio={d['height_radius_ratio_mean']:.4f}")
 
-    # Halve the radius -> ratio doubles (scale-invariance check).
+    # (a) dimensionless normalized height L1 = h_l1 / p95(h_l1).
+    # p95(h_l1)=h_l1_hi; lo cells -> 0.5, hi cells -> 1.0; mean -> 0.75.
+    assert math.isclose(d["height_l1_norm_p95"], 1.0, abs_tol=1e-6), \
+        f"normalized p95 cell ==1, got {d['height_l1_norm_p95']}"
+    assert math.isclose(d["height_l1_norm_mean"], 0.75, abs_tol=1e-6), \
+        f"normalized mean = (0.5+1.0)/2 = 0.75, got {d['height_l1_norm_mean']}"
+    print(f"  [PASS] normalized: mean={d['height_l1_norm_mean']:.4f}, "
+          f"p95={d['height_l1_norm_p95']:.4f}")
+
+    # (b) world height extent = cell_radius * h_l1 (r=1 here).
+    assert math.isclose(d["height_extent_mean"], (h_l1_lo + h_l1_hi) / 2,
+                        abs_tol=1e-6), \
+        f"extent mean = r*(h_l1 mean) = {(h_l1_lo+h_l1_hi)/2}, " \
+        f"got {d['height_extent_mean']}"
+    assert math.isclose(d["height_extent_p95"], h_l1_hi, abs_tol=1e-6), \
+        f"extent p95 = r*h_l1_hi = {h_l1_hi}, got {d['height_extent_p95']}"
+    print(f"  [PASS] extent r=1: mean={d['height_extent_mean']:.4f}, "
+          f"p95={d['height_extent_p95']:.4f}")
+
+    # Radius scaling: world extent scales linearly with r; dimensionless
+    # normalized measure is INVARIANT (it must not confound scene scale / cell
+    # count -- the defect the old h_l1/r ratio had).
     scene._cached_cell_radius = torch.full((n,), 0.5)
     d = scene.thin_surface_diagnostics()
-    assert math.isclose(d["height_radius_ratio_mean"], 2 * expected, abs_tol=1e-6), \
-        f"half radius -> 2x ratio, got {d['height_radius_ratio_mean']}"
-    print(f"  [PASS] r=0.5: ratio doubles to {d['height_radius_ratio_mean']:.4f}")
+    assert math.isclose(d["height_l1_norm_mean"], 0.75, abs_tol=1e-6), \
+        f"normalized invariant to radius, got {d['height_l1_norm_mean']}"
+    assert math.isclose(d["height_l1_norm_p95"], 1.0, abs_tol=1e-6), \
+        f"normalized p95 invariant, got {d['height_l1_norm_p95']}"
+    assert math.isclose(d["height_extent_mean"], 0.5 * (h_l1_lo + h_l1_hi) / 2,
+                        abs_tol=1e-6), \
+        f"extent halves with r, got {d['height_extent_mean']}"
+    assert math.isclose(d["height_extent_p95"], 0.5 * h_l1_hi, abs_tol=1e-6), \
+        f"extent p95 halves with r, got {d['height_extent_p95']}"
+    print(f"  [PASS] r=0.5: normalized unchanged; extent halves "
+          f"(mean={d['height_extent_mean']:.4f}, p95={d['height_extent_p95']:.4f})")
+
+    # Uniform heights + zero heights edge case: p95 normaliser must not blow up
+    # and a degenerate (all-zero) field reports NaN rather than /0.
+    scene.texel_heights.data.fill_(0.0)
+    d = scene.thin_surface_diagnostics()
+    assert math.isnan(d["height_l1_norm_mean"]), \
+        f"all-zero heights -> NaN normalized, got {d['height_l1_norm_mean']}"
+    assert math.isclose(d["height_extent_mean"], 0.0, abs_tol=1e-6), \
+        f"all-zero heights -> extent 0, got {d['height_extent_mean']}"
+    print(f"  [PASS] all-zero heights: normalized=NaN, extent=0.0000")
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +374,8 @@ def test_all_new_keys_numeric_and_loggable():
         "grad_norm_texel_sites_2d", "grad_norm_texel_heights",
         "quat_normal_coherence_sq", "quat_normal_flip_frac",
         "height_mean", "height_std", "height_curvedness",
-        "height_radius_ratio_mean", "height_radius_ratio_p95",
+        "height_l1_norm_mean", "height_l1_norm_p95",
+        "height_extent_mean", "height_extent_p95",
     ]
     for k in new_keys:
         assert k in d, f"missing new key {k}"
@@ -385,7 +424,7 @@ def main():
     _run(test_coherence_aligned_normals, "coherence_aligned_normals")
     _run(test_coherence_mixed_and_flipped, "coherence_mixed_and_flipped")
     _run(test_height_uniform_vs_curved, "height_uniform_vs_curved")
-    _run(test_height_radius_ratio, "height_radius_ratio")
+    _run(test_height_extent_and_normalized, "height_extent_and_normalized")
     _run(test_grad_norms, "grad_norms")
     _run(test_all_new_keys_numeric_and_loggable,
          "all_new_keys_numeric_and_loggable")
