@@ -37,6 +37,34 @@ def assert_supported_thin_K(K: int) -> None:
 from radfoam_model.utils import *
 
 
+def quaternion_to_normals(q: torch.Tensor) -> torch.Tensor:
+    """Surface normal vectors implied by per-cell orientation quaternions.
+
+    The thin-surface model interprets each quaternion as the rotation that
+    maps the reference direction [1, 0, 0] onto the cell's outward surface
+    normal (see ``initialize_thin_surface``'s half-angle warm-start, which
+    builds exactly this rotation).  Rotating [1, 0, 0] by the unit quaternion
+    (w, x, y, z) gives the first column of the rotation matrix:
+
+        n = (1 - 2(y^2 + z^2),  2(x y + w z),  2(x z - w y))
+
+    The result is renormalized so a drifted (non-unit) quaternion still maps
+    to a unit direction; this is a pure diagnostic transform and does NOT
+    feed any loss or the optimizer, so it cannot change rendering or math.
+    """
+    q = q.detach()
+    w = q[..., 0]
+    x = q[..., 1]
+    y = q[..., 2]
+    z = q[..., 3]
+    nx = 1.0 - 2.0 * (y * y + z * z)
+    ny = 2.0 * (x * y + w * z)
+    nz = 2.0 * (x * z - w * y)
+    n = torch.stack([nx, ny, nz], dim=-1)
+    n = n / n.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    return n
+
+
 IDWResult = namedtuple("IDWResult", [
     "nn_idx",      # (B,) containing cell indices
     "pad_idx",     # (B, K+1) padded neighbor indices (slot 0 = self)
@@ -2051,6 +2079,68 @@ class CTScene(torch.nn.Module):
         active = (h_l1 > tau).float()
         warm = 1.0 if hasattr(self, "_last_top_eigvec") else 0.0
         q = 0.95
+
+        # --- Geometry-health diagnostics (additive, TensorBoard-safe). --------
+        # These are read-only numeric summaries surfaced for the LC64
+        # oriented-height run diagnosis.  They never feed a loss or the
+        # optimizer and use only already-detached tensors, so they cannot
+        # change rendering, initialization, or optimization behaviour.
+        # All new keys are numeric (Python float); `float('nan')` is a valid
+        # float for `writer.add_scalar` and only appears when a quantity is
+        # genuinely undefined (no gradients yet / no neighbours / no radius).
+
+        # (a) Per-group gradient norms before the optimizer step.
+        # `optimizer.zero_grad(set_to_none=True)` runs at the START of the
+        # next iteration, so the grad tensors driving this step are still
+        # resident in `.grad` when diagnostics run (after step, before the
+        # next zero_grad).  These therefore reflect the post-clip,
+        # pre-step gradients -- i.e. exactly what Adam consumed.  NaN if no
+        # backward has populated `.grad` for that group yet.
+        grad_norms = {}
+        for _gname in ("density_delta", "quaternions",
+                       "texel_sites_2d", "texel_heights"):
+            _p = getattr(self, _gname, None)
+            if _p is not None and _p.grad is not None:
+                grad_norms[_gname] = _p.grad.detach().float().norm().item()
+            else:
+                grad_norms[_gname] = float("nan")
+
+        # (b) Quaternion-implied surface-normal neighbour coherence using
+        # the CSR Delaunay adjacency.  `coh_sq` = mean of (n_i . n_j)^2 over
+        # oriented edges (sign-insensitive, in [0,1]; 1 = neighbours share a
+        # direction).  `flip_frac` = fraction of edges whose normals point in
+        # opposite hemispheres (n_i . n_j < 0) -- a large value indicates the
+        # orientation field is flipping rather than smoothly rotating.
+        normals = quaternion_to_normals(self.quaternions)     # (N, 3)
+        coh_sq, flip_frac = self._normal_neighbor_coherence(normals)
+
+        # (c) Height mean/std and a uniform-vs-curved measure.
+        # `curvedness` per cell = std_K / (|mean_K| + std_K + eps), in [0,1].
+        # All-K-equal (pure parallel translation) -> std_K = 0 -> curvedness 0.
+        # Spread across texels (tilt/curvature) -> curvedness > 0.
+        h_mean = h.mean().item()
+        h_std = h.std(unbiased=False).item() if h.numel() > 1 else 0.0
+        per_cell_std = h.std(dim=-1, unbiased=False) if h.shape[-1] > 1 \
+            else torch.zeros_like(h_l1)
+        per_cell_abs_mean = h.abs().mean(dim=-1)
+        curvedness = (per_cell_std /
+                      (per_cell_abs_mean + per_cell_std + 1e-12))
+
+        # (d) Effective height scale relative to the cell radius.  h_l1 is the
+        # L1 extent of the K texel heights; dividing by the cached Voronoi
+        # cell radius gives a scale-invariant measure of how aggressively the
+        # sub-cell surface protrudes beyond its cell.
+        cr = getattr(self, "_cached_cell_radius", None)
+        if cr is not None:
+            cr = cr.detach().to(device=h_l1.device, dtype=h_l1.dtype)
+            ratio = h_l1 / cr.clamp_min(1e-12)
+            height_radius_ratio_mean = ratio.mean().item()
+            height_radius_ratio_p95 = (
+                ratio.float().quantile(q).item() if ratio.numel() else 0.0)
+        else:
+            height_radius_ratio_mean = float("nan")
+            height_radius_ratio_p95 = float("nan")
+
         return {
             "delta_mode": mode,
             "delta_abs_mean": dd.abs().mean().item(),
@@ -2073,7 +2163,58 @@ class CTScene(torch.nn.Module):
                                   if raw.numel() else 0.0,
             "delta_raw_abs_max": raw.abs().max().item(),
             "warm_start": warm,
+            # (a) per-group pre-step gradient norms (NaN if no grad yet).
+            "grad_norm_density_delta": grad_norms["density_delta"],
+            "grad_norm_quaternions": grad_norms["quaternions"],
+            "grad_norm_texel_sites_2d": grad_norms["texel_sites_2d"],
+            "grad_norm_texel_heights": grad_norms["texel_heights"],
+            # (b) normal neighbour coherence over the CSR adjacency.
+            "quat_normal_coherence_sq": coh_sq,
+            "quat_normal_flip_frac": flip_frac,
+            # (c) height distribution + uniform-vs-curved measure.
+            "height_mean": h_mean,
+            "height_std": h_std,
+            "height_curvedness": curvedness.mean().item(),
+            # (d) effective height scale relative to cell radius.
+            "height_radius_ratio_mean": height_radius_ratio_mean,
+            "height_radius_ratio_p95": height_radius_ratio_p95,
         }
+
+    @torch.no_grad()
+    def _normal_neighbor_coherence(self, normals: torch.Tensor):
+        """Sign-insensitive neighbour coherence of a per-cell direction field.
+
+        Uses the CSR Delaunay adjacency (``point_adjacency`` /
+        ``point_adjacency_offsets``).  For every oriented edge (i -> j) it
+        forms d = n_i . n_j and returns:
+
+          coh_sq    = mean of d^2 over non-self edges   (in [0,1]; 1 = aligned)
+          flip_frac = fraction of edges with d < 0       (hemisphere flips)
+
+        Both are returned as python floats.  When the mesh has no neighbour
+        edges (or only self-loops) the quantities are undefined and returned
+        as ``float('nan')``.  Read-only / no-grad -- a pure diagnostic.
+        """
+        nan = float("nan")
+        offsets = self.point_adjacency_offsets.long()
+        adj = self.point_adjacency.long()
+        N = normals.shape[0]
+        counts = offsets[1:] - offsets[:-1]
+        if counts.numel() == 0 or counts.sum().item() == 0:
+            return nan, nan
+        src = torch.repeat_interleave(
+            torch.arange(N, device=normals.device), counts)
+        ni = normals[src]
+        nj = normals[adj]
+        dot = (ni * nj).sum(dim=-1)
+        valid = src != adj
+        n_valid = int(valid.sum().item())
+        if n_valid == 0:
+            return nan, nan
+        dot = dot[valid]
+        coh_sq = (dot * dot).mean().item()
+        flip_frac = (dot < 0).float().mean().item()
+        return coh_sq, flip_frac
 
     def update_learning_rate(self, iteration):
         # Freeze positions while density gradients stabilize
