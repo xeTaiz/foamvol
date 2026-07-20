@@ -2126,20 +2126,43 @@ class CTScene(torch.nn.Module):
         curvedness = (per_cell_std /
                       (per_cell_abs_mean + per_cell_std + 1e-12))
 
-        # (d) Effective height scale relative to the cell radius.  h_l1 is the
-        # L1 extent of the K texel heights; dividing by the cached Voronoi
-        # cell radius gives a scale-invariant measure of how aggressively the
-        # sub-cell surface protrudes beyond its cell.
-        cr = getattr(self, "_cached_cell_radius", None)
-        if cr is not None:
-            cr = cr.detach().to(device=h_l1.device, dtype=h_l1.dtype)
-            ratio = h_l1 / cr.clamp_min(1e-12)
-            height_radius_ratio_mean = ratio.mean().item()
-            height_radius_ratio_p95 = (
-                ratio.float().quantile(q).item() if ratio.numel() else 0.0)
+        # (d) Height extent diagnostics.
+        # `texel_heights` are DIMENSIONLESS raw learnable parameters; the
+        # forward kernel applies the world-space offset as `r * h_k`
+        # (src/tracing/pipeline.cu, ct_thinsurface_forward: the height eval
+        # accumulates `w * (r * texel_heights[...])`). The physical surface
+        # extent per cell is therefore `cell_radius * h_l1`, NOT `h_l1` alone.
+        #
+        # Two complementary, correctly-dimensioned measures:
+        #   (a) dimensionless normalized height L1 = h_l1 / p95(h_l1):
+        #       scale-invariant relative magnitude (the p95 cell normalises
+        #       to ~1). It does NOT divide by a world length, so it does not
+        #       confound scene scale or cell count.
+        #   (b) world height extent = cell_radius * h_l1:
+        #       the physical protrusion of the sub-cell surface in scene units.
+        # The previous `height_radius_ratio = h_l1 / cell_radius` had units of
+        # 1/length and confounded cell count; it is replaced by the pair above.
+        h_l1_p95 = h_l1.float().quantile(q).item() if h_l1.numel() else 0.0
+        if h_l1.numel() and h_l1_p95 > 0.0:
+            norm_ratio = h_l1 / h_l1_p95
+            height_l1_norm_mean = norm_ratio.mean().item()
+            height_l1_norm_p95 = (
+                norm_ratio.float().quantile(q).item()
+                if norm_ratio.numel() else 0.0)
         else:
-            height_radius_ratio_mean = float("nan")
-            height_radius_ratio_p95 = float("nan")
+            height_l1_norm_mean = float("nan")
+            height_l1_norm_p95 = float("nan")
+
+        cr = getattr(self, "_cached_cell_radius", None)
+        if cr is not None and h_l1.numel():
+            cr = cr.detach().to(device=h_l1.device, dtype=h_l1.dtype)
+            extent = cr * h_l1
+            height_extent_mean = extent.mean().item()
+            height_extent_p95 = (
+                extent.float().quantile(q).item() if extent.numel() else 0.0)
+        else:
+            height_extent_mean = float("nan")
+            height_extent_p95 = float("nan")
 
         return {
             "delta_mode": mode,
@@ -2175,9 +2198,12 @@ class CTScene(torch.nn.Module):
             "height_mean": h_mean,
             "height_std": h_std,
             "height_curvedness": curvedness.mean().item(),
-            # (d) effective height scale relative to cell radius.
-            "height_radius_ratio_mean": height_radius_ratio_mean,
-            "height_radius_ratio_p95": height_radius_ratio_p95,
+            # (d) height extent: (a) dimensionless normalized height L1
+            #     h_l1 / p95(h_l1); (b) world height extent cell_radius * h_l1.
+            "height_l1_norm_mean": height_l1_norm_mean,
+            "height_l1_norm_p95": height_l1_norm_p95,
+            "height_extent_mean": height_extent_mean,
+            "height_extent_p95": height_extent_p95,
         }
 
     @torch.no_grad()
