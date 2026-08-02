@@ -1016,6 +1016,13 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         _loss_cpu = None
         with tqdm.trange(pipeline_args.iterations) as train:
             for i in train:
+                # True stationary-frame control (LC64 plan v2):
+                # enforce the hard point freeze at iteration START,
+                # before any forward / backward / optimizer.step
+                # can read a stale Adam state or run a step on the
+                # primal-points param group.  Idempotent; no-op when
+                # points_hard_freeze_at is disabled (default).
+                model.enforce_hard_point_freeze(i)
                 return_diag = (pipeline_args.diag and i % diag_interval == diag_interval - 1 and not pipeline_args.debug)
                 proj_output, contribution, hit_count, _, _ = model(ray_batch, return_contribution=return_diag)
 
@@ -1195,6 +1202,15 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     model.clip_thin_surface_grads()
 
                 model.apply_frozen_mask()
+
+                # Defensive re-application of the hard point freeze
+                # immediately before the optimizer step.  Some
+                # replacement paths (e.g. update_triangulation,
+                # permute_points) may have re-bound self.primal_points
+                # since the start-of-iteration call; this guarantees
+                # the step on iter >= T sees LR=0 / requires_grad=False
+                # on the CURRENT tensor.  Idempotent.
+                model.enforce_hard_point_freeze(i)
 
                 model.optimizer.step()
                 model.update_starvation_count()

@@ -255,6 +255,7 @@ class CTScene(torch.nn.Module):
         primal_points = mg[perm]
 
         self.primal_points = nn.Parameter(primal_points)
+        self.enforce_hard_point_freeze(0)
         self.faces = None
 
         self.update_triangulation(rebuild=False)
@@ -273,6 +274,7 @@ class CTScene(torch.nn.Module):
         primal_points = primal_points[perm]
 
         self.primal_points = nn.Parameter(primal_points)
+        self.enforce_hard_point_freeze(0)
         self.faces = None
 
         self.update_triangulation(rebuild=False)
@@ -725,6 +727,7 @@ class CTScene(torch.nn.Module):
                 optimizable_tensors[group["name"]] = group["params"][0]
 
         self.primal_points = optimizable_tensors["primal_points"]
+        self.enforce_hard_point_freeze(0)  # Re-apply after primal-points replacement
         self.density = optimizable_tensors["density"]
         if "density_grad" in optimizable_tensors:
             self.density_grad = optimizable_tensors["density_grad"]
@@ -774,6 +777,7 @@ class CTScene(torch.nn.Module):
         if needs_permute:
             perm = self.triangulation.permutation().to(torch.long)
             self.permute_points(perm)
+        self.enforce_hard_point_freeze(0)
 
         self.aabb_tree = radfoam.build_aabb_tree(self.primal_points)
 
@@ -1724,6 +1728,15 @@ class CTScene(torch.nn.Module):
         )
         self.grad_scheduler_args = None
 
+        # True stationary-frame control (LC64 plan v2).  When
+        # iteration >= points_hard_freeze_at, the primal-points
+        # param group becomes non-trainable: LR=0,
+        # primal_points.requires_grad_(False), and Adam state
+        # cleared.  -1 disables; legacy freeze_points schedule is
+        # unchanged.
+        self._points_hard_freeze_at = int(
+            getattr(args, "points_hard_freeze_at", -1))
+
     def initialize_gradients(self, args):
         N = self.primal_points.shape[0]
         self.density_grad = nn.Parameter(
@@ -2241,6 +2254,62 @@ class CTScene(torch.nn.Module):
         coh_sq = (dot * dot).mean().item()
         flip_frac = (dot < 0).float().mean().item()
         return coh_sq, flip_frac
+
+    def _hard_freeze_threshold(self):
+        """Safe getter for the hard-freeze threshold (default -1)."""
+        return int(getattr(self, "_points_hard_freeze_at", -1))
+
+    def enforce_hard_point_freeze(self, iteration):
+        """Enforce the true stationary-frame control gate.
+
+        Called at the start of every iteration (and defensively right
+        before `optimizer.step`).  When iteration >= the threshold T:
+          - re-resolves the CURRENT primal-points optimizer param group
+            (identity may have changed since the last call due to
+            permute / prune / densify / load_pt);
+          - sets its LR to 0;
+          - sets primal_points.requires_grad_(False)  (idempotent);
+          - clears the Adam state entry for the primal-points parameter
+            so the next step is treated as fresh.
+
+        Idempotent and free when T < 0 (disabled default sentinel).
+        """
+        T = self._hard_freeze_threshold()
+        if T < 0:
+            return
+        if iteration < T:
+            return
+        # Re-resolve every time: the primal_points tensor identity can
+        # change via permute_points / prune_points / densification_postfix
+        # / load_pt / load_frozen_checkpoint / initialize_gradients.  We
+        # always target the CURRENT tensor by reading
+        # `self.primal_points` and walking the optimizer's param_groups.
+        pp = getattr(self, "primal_points", None)
+        if pp is None:
+            return
+        for _g in self.optimizer.param_groups:
+            if _g["name"] == "primal_points":
+                _g["lr"] = 0.0
+                break
+        # Idempotent requires_grad_(False).  This re-asserts the freeze
+        # on the CURRENT tensor after every replacement path (which is
+        # how the post-replacement hooks below propagate it).
+        pp.requires_grad_(False)
+        # Clear Adam state.  PyTorch Adam lazily re-creates state on the
+        # next .step(); dropping the entry here ensures stale momentum
+        # from before the freeze cannot drag the points on a hypothetical
+        # step (e.g. if some downstream code toggles requires_grad back).
+        self.optimizer.state.pop(pp, None)
+
+    def pre_step(self, iteration):
+        """Train-loop hook.  Forwards to enforce_hard_point_freeze.
+
+        Idempotent; cheap when disabled.  The reviewer contract uses
+        `enforce_hard_point_freeze` as the canonical name; `pre_step` is
+        the historical name kept for backwards compatibility with the
+        prior uncommitted patch and is a thin alias.
+        """
+        self.enforce_hard_point_freeze(iteration)
 
     def update_learning_rate(self, iteration):
         # Freeze positions while density gradients stabilize
@@ -3041,6 +3110,7 @@ class CTScene(torch.nn.Module):
         scene_data = torch.load(pt_path)
 
         self.primal_points = nn.Parameter(scene_data["xyz"].to(self.device))
+        self.enforce_hard_point_freeze(0)  # Re-apply after primal-points replacement
         self.density = nn.Parameter(scene_data["density"].to(self.device))
 
         if "density_grad" in scene_data:
