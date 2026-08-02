@@ -198,6 +198,14 @@ class OptimizationParams(ParamGroup):
         self.thin_surface_delta_weight = 1e-3   # L2 penalty on density_delta
         self.thin_surface_height_weight = 1e-3  # L1 penalty on texel_heights
         self.thin_surface_gate_tau = 0.01  # height L1 norm threshold for regularizer gating
+        # True stationary-frame control (LC64 plan v2): an integer
+        # iteration threshold at which primal points are non-trainable.
+        # Default -1 = disabled; legacy freeze_points soft cosine
+        # is unchanged.  Production code (scene.enforce_hard_point_freeze)
+        # sets LR=0, requires_grad=False, and clears Adam state for the
+        # CURRENT primal-points optimizer group once iter >= T.
+        self.points_hard_freeze_at = -1
+
         # Safety bounds for the underdetermined thin-surface params (see P0-F):
         # density_delta is unbounded in mu_plus = max(mu_bar+delta,0) and weakly
         # determined by the line integral when the surface is mid-chord, so L1's
