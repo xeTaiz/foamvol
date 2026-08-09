@@ -255,7 +255,7 @@ class CTScene(torch.nn.Module):
         primal_points = mg[perm]
 
         self.primal_points = nn.Parameter(primal_points)
-        self.enforce_hard_point_freeze(0)
+        self._reapply_hard_freeze()
         self.faces = None
 
         self.update_triangulation(rebuild=False)
@@ -274,7 +274,7 @@ class CTScene(torch.nn.Module):
         primal_points = primal_points[perm]
 
         self.primal_points = nn.Parameter(primal_points)
-        self.enforce_hard_point_freeze(0)
+        self._reapply_hard_freeze()
         self.faces = None
 
         self.update_triangulation(rebuild=False)
@@ -727,7 +727,7 @@ class CTScene(torch.nn.Module):
                 optimizable_tensors[group["name"]] = group["params"][0]
 
         self.primal_points = optimizable_tensors["primal_points"]
-        self.enforce_hard_point_freeze(0)  # Re-apply after primal-points replacement
+        self._reapply_hard_freeze()  # Re-apply after primal-points replacement
         self.density = optimizable_tensors["density"]
         if "density_grad" in optimizable_tensors:
             self.density_grad = optimizable_tensors["density_grad"]
@@ -777,7 +777,7 @@ class CTScene(torch.nn.Module):
         if needs_permute:
             perm = self.triangulation.permutation().to(torch.long)
             self.permute_points(perm)
-        self.enforce_hard_point_freeze(0)
+        self._reapply_hard_freeze()
 
         self.aabb_tree = radfoam.build_aabb_tree(self.primal_points)
 
@@ -1736,6 +1736,14 @@ class CTScene(torch.nn.Module):
         # unchanged.
         self._points_hard_freeze_at = int(
             getattr(args, "points_hard_freeze_at", -1))
+        # Sticky "freeze is currently active" flag (set by
+        # enforce_hard_point_freeze when iter >= T) and the last
+        # iteration seen by enforce_hard_point_freeze.  Both are
+        # used by the frozen-state helper so replacement paths
+        # (permute / prune / densify / load) can re-apply the freeze
+        # without being passed an iteration bound.
+        self._hard_freeze_active = False
+        self._last_iteration = None
 
     def initialize_gradients(self, args):
         N = self.primal_points.shape[0]
@@ -2259,6 +2267,48 @@ class CTScene(torch.nn.Module):
         """Safe getter for the hard-freeze threshold (default -1)."""
         return int(getattr(self, "_points_hard_freeze_at", -1))
 
+    def _should_hard_freeze(self, iteration=None):
+        """Robust frozen-state helper.
+
+        Returns True iff the hard point freeze should be active RIGHT NOW.
+
+          - If ``iteration`` is provided: ``iteration >= T`` (where T is
+            the configured ``points_hard_freeze_at``).
+          - If ``iteration`` is None: rely on the sticky
+            ``_hard_freeze_active`` flag set by a previous
+            ``enforce_hard_point_freeze`` call with ``iter >= T``.
+
+        Always returns False when T < 0 (default-disabled sentinel).
+        Safe to call before optimizer declaration.
+        """
+        T = self._hard_freeze_threshold()
+        if T < 0:
+            return False
+        if iteration is not None:
+            return int(iteration) >= T
+        return bool(getattr(self, "_hard_freeze_active", False))
+
+    def _reapply_hard_freeze(self):
+        """Replacement-lifecycle hook helper.
+
+        Re-applies the hard freeze IF the frozen-state helper says so.
+        Uses ``_last_iteration`` (set by previous enforce calls) as the
+        iteration bound, falling back to the threshold itself if no
+        iteration has been seen yet.  Safe to call from any replacement
+        path (permute / prune / densify / load) and before optimizer
+        declaration (no-op when T < 0 or before any enforce call).
+        """
+        if not self._should_hard_freeze():
+            return
+        iter_for_enforce = getattr(self, "_last_iteration", None)
+        if iter_for_enforce is None:
+            # No iteration seen yet (e.g., a checkpoint reload that
+            # immediately triggers a replacement path).  Fall back to
+            # the threshold itself so the freeze fires on the very
+            # first replacement when T is non-negative.
+            iter_for_enforce = self._hard_freeze_threshold()
+        self.enforce_hard_point_freeze(iter_for_enforce)
+
     def enforce_hard_point_freeze(self, iteration):
         """Enforce the true stationary-frame control gate.
 
@@ -2267,17 +2317,38 @@ class CTScene(torch.nn.Module):
           - re-resolves the CURRENT primal-points optimizer param group
             (identity may have changed since the last call due to
             permute / prune / densify / load_pt);
+          - atomically rebinds the param group to the CURRENT
+            ``self.primal_points`` tensor if identity changed;
           - sets its LR to 0;
           - sets primal_points.requires_grad_(False)  (idempotent);
-          - clears the Adam state entry for the primal-points parameter
-            so the next step is treated as fresh.
+          - clears the Adam state entry for BOTH the old (rebound-out)
+            and the new (current) primal-points parameter so a future
+            step (or a hypothetical toggle of requires_grad) cannot
+            drag the points.
 
         Idempotent and free when T < 0 (disabled default sentinel).
+
+        Side effects (always, even when T<0 or iter<T):
+          - ``self._last_iteration`` is updated to the integer iteration
+            so replacement paths called between iterations can re-apply
+            the freeze via ``_reapply_hard_freeze()`` without needing a
+            hard-coded iteration bound.
+          - ``self._hard_freeze_active`` tracks the sticky "is the
+            freeze currently engaged" flag, used by ``_should_hard_freeze``
+            when called without an explicit iteration.
         """
         T = self._hard_freeze_threshold()
+        self._last_iteration = int(iteration)
         if T < 0:
+            # Disabled sentinel: explicitly clear the sticky flag so a
+            # later re-enable (e.g., re-declare the optimizer with a
+            # different points_hard_freeze_at) starts clean.
+            self._hard_freeze_active = False
             return
         if iteration < T:
+            # Below threshold: leave _hard_freeze_active alone (sticky
+            # once tripped) so replacement paths called later can still
+            # detect the freeze through the helper.
             return
         # Re-resolve every time: the primal_points tensor identity can
         # change via permute_points / prune_points / densification_postfix
@@ -2287,18 +2358,30 @@ class CTScene(torch.nn.Module):
         pp = getattr(self, "primal_points", None)
         if pp is None:
             return
+        self._hard_freeze_active = True
+        # Atomically (re)bind the primal-points optimizer param group to
+        # the CURRENT self.primal_points tensor.  This guarantees the
+        # invariant ``group['params'][0] is self.primal_points`` after
+        # every replacement path.  Old Adam state (keyed by the OLD
+        # tensor id) is dropped according to the existing clear-state
+        # policy (``state.pop(p, None)``).
         for _g in self.optimizer.param_groups:
             if _g["name"] == "primal_points":
+                _old_param = _g["params"][0]
+                if _old_param is not pp:
+                    _g["params"][0] = pp
+                    self.optimizer.state.pop(_old_param, None)
                 _g["lr"] = 0.0
                 break
         # Idempotent requires_grad_(False).  This re-asserts the freeze
         # on the CURRENT tensor after every replacement path (which is
         # how the post-replacement hooks below propagate it).
         pp.requires_grad_(False)
-        # Clear Adam state.  PyTorch Adam lazily re-creates state on the
-        # next .step(); dropping the entry here ensures stale momentum
-        # from before the freeze cannot drag the points on a hypothetical
-        # step (e.g. if some downstream code toggles requires_grad back).
+        # Clear Adam state for the current primal-points parameter.
+        # PyTorch Adam lazily re-creates state on the next .step();
+        # dropping the entry here ensures stale momentum from before
+        # the freeze cannot drag the points on a hypothetical step
+        # (e.g. if some downstream code toggles requires_grad back).
         self.optimizer.state.pop(pp, None)
 
     def pre_step(self, iteration):
@@ -2317,9 +2400,20 @@ class CTScene(torch.nn.Module):
             hasattr(self, "_gradient_freeze_points_until")
             and iteration < self._gradient_freeze_points_until
         )
+        # True stationary-frame control (LC64 plan v2): if hard freeze
+        # is active at/after the threshold, the primal-points LR MUST
+        # remain exactly 0.0 -- the scheduler must never temporarily
+        # restore a positive LR.  This makes update_learning_rate safe
+        # to call even if enforce_hard_point_freeze was skipped at the
+        # start of the iteration (e.g., during a replacement-only path).
+        hard_freeze_active = self._should_hard_freeze(iteration)
+        # Keep the last-iteration tracker fresh so replacement paths
+        # called after this point can re-apply the freeze via
+        # _reapply_hard_freeze().
+        self._last_iteration = int(iteration)
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "primal_points":
-                if freeze_for_grad:
+                if hard_freeze_active or freeze_for_grad:
                     param_group["lr"] = 0.0
                 else:
                     param_group["lr"] = self.xyz_scheduler_args(iteration)
@@ -2413,6 +2507,13 @@ class CTScene(torch.nn.Module):
             self._starvation_count = self._starvation_count[valid_points_mask]
         if hasattr(self, '_frozen_mask'):
             self._frozen_mask = self._frozen_mask[valid_points_mask]
+
+        # Re-apply the hard point freeze after primal-points replacement
+        # (prune creates a fresh nn.Parameter, so the optimizer group
+        # identity must be rebound and the freeze re-asserted on the
+        # new tensor).  Uses _reapply_hard_freeze so the call is safe
+        # whether or not the freeze is currently active.
+        self._reapply_hard_freeze()
 
         # Per-cell boundary-loss caches (set by `_boundary_top_eigvec`) are
         # keyed by row index to primal_points.  After a prune the surviving
@@ -2518,6 +2619,12 @@ class CTScene(torch.nn.Module):
                 self._frozen_mask,
                 torch.zeros(n_new, dtype=torch.bool, device=self.device),
             ])
+
+        # Re-apply the hard point freeze after primal-points replacement
+        # (densification_postfix builds a fresh nn.Parameter for the
+        # new cells).  Uses _reapply_hard_freeze so the call is safe
+        # whether or not the freeze is currently active.
+        self._reapply_hard_freeze()
 
         # Per-cell boundary-loss caches (set by `_boundary_top_eigvec`) are
         # row-aligned with primal_points at the time they are populated.
@@ -3110,7 +3217,7 @@ class CTScene(torch.nn.Module):
         scene_data = torch.load(pt_path)
 
         self.primal_points = nn.Parameter(scene_data["xyz"].to(self.device))
-        self.enforce_hard_point_freeze(0)  # Re-apply after primal-points replacement
+        self._reapply_hard_freeze()  # Re-apply after primal-points replacement
         self.density = nn.Parameter(scene_data["density"].to(self.device))
 
         if "density_grad" in scene_data:
