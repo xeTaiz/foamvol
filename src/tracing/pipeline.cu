@@ -878,8 +878,7 @@ __global__ void ct_thinsurface_forward(
 // optimizer level; the binding rejects mixed inputs so the kernel never
 // sees a stale density pointer).
 //
-// Backward is NOT implemented in Commit 2A; the trace_backward binding
-// rejects independent-mode calls before any kernel launch.
+// The matching CUDA-native backward is implemented by ct_independent_backward.
 // ============================================================================
 
 template <int block_size>
@@ -1372,6 +1371,347 @@ __global__ void ct_thinsurface_backward(
         // chord-endpoint contribution (always present) + t_q0 carrier (only
         // flows to t_0, when t_q0 == t_0; dL_ddelta_t is 0 in non-crossing and
         // in crossing-at-delta=0 since the t_surf/x0 block is skipped there).
+        float dL_dt0 = dL_dt0_chord - dL_ddelta_t;
+        float dL_dt1 = dL_dt1_chord;
+
+        Vec3f dt0_dprev;
+        if (prev_point_idx != UINT32_MAX)
+            dt0_dprev = cell_intersection_grad(prev_point, current_point, ray);
+        else
+            dt0_dprev = Vec3f::Zero();
+        Vec3f dt1_dcur  = cell_intersection_grad(current_point, next_point, ray);
+        Vec3f dt0_dcur  = cell_intersection_grad(current_point, prev_point, ray);
+        Vec3f dt1_dnext = cell_intersection_grad(next_point, current_point, ray);
+
+        prev_point_grad += dL_dt0 * dt0_dprev;
+        dL_dcurrent_point += dL_dt0 * dt0_dcur + dL_dt1 * dt1_dcur;
+        next_point_grad    += dL_dt1 * dt1_dnext;
+
+        current_point_grad += dL_dcurrent_point;
+
+        if (prev_point_idx != UINT32_MAX)
+            atomic_add_vec(points_grad + prev_point_idx, prev_point_grad);
+        prev_point = current_point;
+        prev_point_idx = point_idx;
+        prev_point_grad = current_point_grad;
+        current_point_grad = next_point_grad;
+        next_point_grad = Vec3f::Zero();
+
+        return true;
+    };
+
+    uint32_t start_point = start_point_index[thread_idx];
+
+    trace<block_size, 2>(ray,
+                         points,
+                         point_adjacency,
+                         point_adjacency_offsets,
+                         adjacent_diff,
+                         start_point,
+                         settings.max_intersections,
+                         functor);
+}
+
+// ============================================================================
+// ct_independent_backward
+// ----------------------------------------------------------------------------
+// LC64 plan v3 Commit 2B -- CUDA-native independent-side BACKWARD.
+//
+// Forward contract (ct_independent_forward, Commit 2A):
+//     mu_plus  = activation_scale * softplus(raw_plus,  beta=10)
+//     mu_minus = activation_scale * softplus(raw_minus, beta=10)
+//
+// This kernel reuses the legacy ct_thinsurface_backward geometry
+// (quaternion + K texel sites + soft-Voronoi heights + cell_radius),
+// the crossing / non-crossing / dp-sign semantics, and the cell-bisector
+// position-gradient chain.  The ONLY divergence from the legacy
+// backward is the mu-p / mu-n chain to the per-side raw logits:
+//
+//     dL/draw_p  = dL/dmu_p  * activation_scale * sigmoid(beta * raw_p)
+//     dL/draw_n  = dL/dmu_n  * activation_scale * sigmoid(beta * raw_n)
+//
+// (The factor 1/beta from the normalized softplus cancels with the beta
+// in the sigmoid numerator -- the same identity the forward kernel uses
+// for its mu-p / mu-n constants.)  No legacy base density gradient is
+// produced: density_base_grad is left untouched and the binding passes
+// nullptr so the autograd slot is None under independent mode.
+// ============================================================================
+
+template <int block_size>
+__global__ void ct_independent_backward(
+    TraceSettings settings,
+    const Vec3f *__restrict__ points,
+    const float *__restrict__ raw_plus,      // (N, 1) raw logit, softplus'd to mu_plus
+    const float *__restrict__ raw_minus,     // (N, 1) raw logit, softplus'd to mu_minus
+    const float *__restrict__ quaternions,   // (N, 4) [w,x,y,z]
+    const float *__restrict__ texel_sites_2d,// (N, K, 2)
+    const float *__restrict__ texel_heights, // (N, K)
+    const float *__restrict__ cell_radius,   // (N,)
+    const uint32_t *__restrict__ point_adjacency,
+    const uint32_t *__restrict__ point_adjacency_offsets,
+    const Vec4h *__restrict__ adjacent_diff,
+    const Ray *__restrict__ rays,
+    uint32_t num_rays,
+    const uint32_t *__restrict__ start_point_index,
+    const float *__restrict__ ray_projection_grad,
+    const float *__restrict__ ray_error,
+    Vec3f *__restrict__ points_grad,
+    float *__restrict__ raw_plus_grad,
+    float *__restrict__ raw_minus_grad,
+    float *__restrict__ quaternions_grad,
+    float *__restrict__ texel_sites_2d_grad,
+    float *__restrict__ texel_heights_grad,
+    float *__restrict__ point_error)
+{
+    uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (thread_idx >= num_rays)
+        return;
+
+    Ray ray = rays[thread_idx];
+    ray.direction /= ray.direction.norm();
+
+    float dL_dprojection = ray_projection_grad[thread_idx];
+    float error = 0.0f;
+    if (ray_error) error = ray_error[thread_idx];
+
+    constexpr float sp_beta = 10.0f;
+    const int K = settings.thin_K;
+    const float thin_temp = settings.thin_temp;
+    const float thin_height_eps = settings.thin_height_eps;
+    const float activation_scale = settings.thin_surface_activation_scale;
+
+    uint32_t prev_point_idx = UINT32_MAX;
+    Vec3f prev_point = Vec3f::Zero();
+    Vec3f prev_point_grad = Vec3f::Zero();
+    Vec3f current_point_grad = Vec3f::Zero();
+    Vec3f next_point_grad = Vec3f::Zero();
+
+    auto functor = [&](uint32_t point_idx,
+                       float t_0,
+                       float t_1,
+                       const Vec3f &current_point,
+                       const Vec3f &next_point) {
+        float delta_t = fmaxf(t_1 - t_0, 0.0f);
+
+        if (point_error) {
+            atomicAdd(point_error + point_idx, delta_t * error);
+        }
+
+        // ---- Recompute forward quantities (independent mode) ----
+        // mu_p = activation_scale * softplus(raw_p, beta=10)  (always nonneg)
+        // mu_n = activation_scale * softplus(raw_m, beta=10)  (always nonneg)
+        // dsigmoid_p = sigmoid(beta * raw_p) ; same for raw_m.
+        //   d(softplus)/d(raw) = sigmoid(beta*raw), so
+        //   d(mu_p)/d(raw_p) = activation_scale * sigmoid(beta*raw_p).
+        float raw_p  = raw_plus[point_idx];
+        float raw_m  = raw_minus[point_idx];
+        float e_p    = expf(sp_beta * raw_p);
+        float e_m    = expf(sp_beta * raw_m);
+        float mu_p   = activation_scale *
+                       ((sp_beta * raw_p > 20.0f) ? raw_p
+                        : logf(1.0f + e_p) / sp_beta);
+        float mu_n   = activation_scale *
+                       ((sp_beta * raw_m > 20.0f) ? raw_m
+                        : logf(1.0f + e_m) / sp_beta);
+        // sigmoid(beta * raw) -- exact form for the dmu/draw chain.
+        // Numerically-stable form avoids overflow when beta*raw is large.
+        float dsig_p = (sp_beta * raw_p > 20.0f) ? 1.0f : e_p / (1.0f + e_p);
+        float dsig_m = (sp_beta * raw_m > 20.0f) ? 1.0f : e_m / (1.0f + e_m);
+
+        const float *q = quaternions + point_idx * 4;
+        Vec3f n, tang, bita;
+        quat_to_frame(q, n, tang, bita);
+
+        float dp = n.dot(ray.direction);
+
+        // ---- Grazing-ray fallback (no surface position) ----
+        if (fabsf(dp) < 1e-3f) {
+            // contrib = 0.5 * (mu_p + mu_n) * delta_t  (averaged side density;
+            // matches the forward fallback exactly).
+            float dL_dmu_p = dL_dprojection * 0.5f * delta_t;
+            float dL_dmu_n = dL_dprojection * 0.5f * delta_t;
+            atomicAdd(raw_plus_grad  + point_idx,
+                      dL_dmu_p * activation_scale * dsig_p);
+            atomicAdd(raw_minus_grad + point_idx,
+                      dL_dmu_n * activation_scale * dsig_m);
+
+            // Position chain (mu_bar == 0.5*(mu_p + mu_n), so the chord-endpoint
+            // gradient is dL_dprojection * mu_bar, identical to the legacy
+            // fallback for the symmetric case).
+            float mu_bar = 0.5f * (mu_p + mu_n);
+            float dL_ddelta_t = dL_dprojection * mu_bar;
+            float dL_dt0 = -dL_ddelta_t, dL_dt1 = dL_ddelta_t;
+            Vec3f dt0_dprev;
+            if (prev_point_idx != UINT32_MAX)
+                dt0_dprev = cell_intersection_grad(prev_point, current_point, ray);
+            else
+                dt0_dprev = Vec3f::Zero();
+            Vec3f dt1_dcur  = cell_intersection_grad(current_point, next_point, ray);
+            Vec3f dt0_dcur  = cell_intersection_grad(current_point, prev_point, ray);
+            Vec3f dt1_dnext = cell_intersection_grad(next_point, current_point, ray);
+
+            prev_point_grad += dL_dt0 * dt0_dprev;
+            current_point_grad += dL_dt0 * dt0_dcur + dL_dt1 * dt1_dcur;
+            next_point_grad += dL_dt1 * dt1_dnext;
+
+            if (prev_point_idx != UINT32_MAX)
+                atomic_add_vec(points_grad + prev_point_idx, prev_point_grad);
+            prev_point = current_point;
+            prev_point_idx = point_idx;
+            prev_point_grad = current_point_grad;
+            current_point_grad = next_point_grad;
+            next_point_grad = Vec3f::Zero();
+            return true;
+        }
+
+        float r = cell_radius[point_idx];
+
+        // ---- Recompute fixed-point quantities (identical to legacy) ----
+        float t_flat = (current_point - ray.origin).dot(n) / dp;
+        bool q0_from_tflat = (dp < 0.0f) && (t_flat >= t_0);
+        float t_q0 = q0_from_tflat ? t_flat : t_0;
+        Vec3f x0 = ray.origin + t_q0 * ray.direction;
+
+        float h_sum = 0.0f, w_sum = 0.0f;
+        float w_arr[8]; // max K=8
+        for (int k = 0; k < K; ++k) {
+            const float *s2d = texel_sites_2d + (point_idx * K + k) * 2;
+            Vec3f site3 = current_point + r * (s2d[0] * tang + s2d[1] * bita);
+            float d2 = (x0 - site3).squaredNorm() / (r * r + 1e-20f);
+            float w = expf(-thin_temp * d2);
+            w_arr[k] = w;
+            h_sum += w * (r * texel_heights[point_idx * K + k]);
+            w_sum += w;
+        }
+        float w_sum_safe = fmaxf(w_sum, 1e-20f);
+        float h_eval = h_sum / w_sum_safe;
+
+        float t_surf = ((current_point - ray.origin).dot(n) + h_eval) / dp;
+
+        // Two-sided partition matches ct_independent_forward exactly.
+        float mu_near = (dp > 0.0f) ? mu_n : mu_p;
+        float mu_far  = (dp > 0.0f) ? mu_p : mu_n;
+        float t_s = fminf(fmaxf(t_surf, t_0), t_1);
+        bool crossing = (t_surf > t_0 + thin_height_eps) &&
+                        (t_surf < t_1 - thin_height_eps);
+
+        // ---- Backward pass: chord-length gradients ----
+        // Same structure as the legacy path, but the mu derivation is
+        // independent so the final unscramble writes to raw_plus/raw_minus
+        // directly (no mu_bar / delta intermediate).
+        float dL_dmu_near = 0.0f, dL_dmu_far = 0.0f;
+        float dL_dt_s = 0.0f;
+        float dL_dt0_chord = 0.0f, dL_dt1_chord = 0.0f;
+        float dL_ddelta_t = 0.0f;
+
+        if (crossing) {
+            dL_dmu_near = dL_dprojection * (t_s - t_0);
+            dL_dmu_far  = dL_dprojection * (t_1 - t_s);
+            dL_dt_s     = dL_dprojection * (mu_near - mu_far);
+            dL_dt0_chord = -dL_dprojection * mu_near;
+            dL_dt1_chord =  dL_dprojection * mu_far;
+        } else {
+            bool plus_side = (dp > 0.0f) ? (t_surf <= t_0) : (t_surf >= t_1);
+            float mu_eff = plus_side ? mu_p : mu_n;
+            if (plus_side) {            // mu_eff = mu_p
+                if (dp > 0.0f) dL_dmu_far  = dL_dprojection * delta_t;
+                else           dL_dmu_near = dL_dprojection * delta_t;
+            } else {                    // mu_eff = mu_n
+                if (dp > 0.0f) dL_dmu_near = dL_dprojection * delta_t;
+                else           dL_dmu_far  = dL_dprojection * delta_t;
+            }
+            dL_dt0_chord = -dL_dprojection * mu_eff;
+            dL_dt1_chord =  dL_dprojection * mu_eff;
+        }
+
+        // Unscramble mu_near/mu_far -> mu_p/mu_n
+        float dL_dmu_p, dL_dmu_n;
+        if (dp > 0.0f) {
+            dL_dmu_n = dL_dmu_near;
+            dL_dmu_p = dL_dmu_far;
+        } else {
+            dL_dmu_p = dL_dmu_near;
+            dL_dmu_n = dL_dmu_far;
+        }
+
+        // Independent-side chain rule:
+        //   dL/draw_p = dL/dmu_p * activation_scale * sigmoid(beta * raw_p)
+        //   dL/draw_m = dL/dmu_n * activation_scale * sigmoid(beta * raw_m)
+        atomicAdd(raw_plus_grad  + point_idx,
+                  dL_dmu_p * activation_scale * dsig_p);
+        atomicAdd(raw_minus_grad + point_idx,
+                  dL_dmu_n * activation_scale * dsig_m);
+
+        // ---- dL/d(t_surf) -> dL/d(h_eval) + dL/d(current_point) + dL/dn ----
+        Vec3f dL_dn = Vec3f::Zero();
+        Vec3f dL_dtang = Vec3f::Zero();
+        Vec3f dL_dbita = Vec3f::Zero();
+        Vec3f dL_dcurrent_point = Vec3f::Zero();
+
+        if (fabsf(dL_dt_s) > 0.0f) {
+            float dL_dt_surf = dL_dt_s;
+            float dL_dh_eval = dL_dt_surf / dp;
+            dL_dcurrent_point += dL_dt_surf * n / dp;
+            dL_dn += dL_dt_surf * (current_point - ray.origin - t_surf * ray.direction) / dp;
+
+            float dL_dh_sum   = dL_dh_eval / w_sum_safe;
+            float dL_dw_total = -dL_dh_eval * h_eval / w_sum_safe;
+
+            Vec3f dL_dx0 = Vec3f::Zero();
+
+            for (int k = 0; k < K; ++k) {
+                float w = w_arr[k];
+                float h_k = texel_heights[point_idx * K + k];
+                const float *s2d = texel_sites_2d + (point_idx * K + k) * 2;
+                Vec3f site3 = current_point + r * (s2d[0] * tang + s2d[1] * bita);
+
+                float dL_dw = dL_dh_sum * (r * h_k) + dL_dw_total;
+
+                float dL_dhk = dL_dh_sum * w * r;
+                atomicAdd(texel_heights_grad + point_idx * K + k, dL_dhk);
+
+                float dL_dd2 = dL_dw * (-thin_temp) * w;
+
+                Vec3f diff = x0 - site3;
+                float inv_r2 = 1.0f / (r * r + 1e-20f);
+
+                dL_dx0 += dL_dd2 * 2.0f * diff * inv_r2;
+
+                Vec3f dL_dsite3 = dL_dd2 * (-2.0f) * diff * inv_r2;
+
+                dL_dcurrent_point += dL_dsite3;
+                dL_dtang += dL_dsite3 * (r * s2d[0]);
+                dL_dbita += dL_dsite3 * (r * s2d[1]);
+
+                float dL_ds0 = dL_dsite3.dot(r * tang);
+                float dL_ds1 = dL_dsite3.dot(r * bita);
+                atomicAdd(texel_sites_2d_grad + (point_idx * K + k) * 2 + 0, dL_ds0);
+                atomicAdd(texel_sites_2d_grad + (point_idx * K + k) * 2 + 1, dL_ds1);
+            }
+
+            float dL_dt_q0 = dL_dx0.dot(ray.direction);
+
+            if (q0_from_tflat) {
+                dL_dcurrent_point += dL_dt_q0 * n / dp;
+                dL_dn += dL_dt_q0 * (current_point - ray.origin - t_flat * ray.direction) / dp;
+            } else {
+                dL_ddelta_t += -dL_dt_q0;
+            }
+        }
+
+        // ---- Quaternion backward ----
+        if (dL_dn.squaredNorm() > 0.0f || dL_dtang.squaredNorm() > 0.0f ||
+            dL_dbita.squaredNorm() > 0.0f) {
+            float local_qg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            quat_to_frame_bwd(q, dL_dn, dL_dtang, dL_dbita, local_qg);
+            float *qg = quaternions_grad + point_idx * 4;
+            atomicAdd(qg + 0, local_qg[0]);
+            atomicAdd(qg + 1, local_qg[1]);
+            atomicAdd(qg + 2, local_qg[2]);
+            atomicAdd(qg + 3, local_qg[3]);
+        }
+
+        // ---- Cell-boundary position gradients ----
         float dL_dt0 = dL_dt0_chord - dL_ddelta_t;
         float dL_dt1 = dL_dt1_chord;
 
@@ -3502,26 +3842,19 @@ class CUDADensityPipeline : public Pipeline {
                         float *quaternions_grad = nullptr,
                         float *texel_sites_2d_grad = nullptr,
                         float *texel_heights_grad = nullptr,
-                        // LC64 plan v3 Commit 2A -- independent-side raw
-                        // logits.  Only read under forward; backward is
-                        // explicitly NOT implemented in this commit and the
-                        // binding raises before reaching this point.
+                        // LC64 plan v3 Commit 2B -- independent-side raw
+                        // logits (forward inputs) plus per-cell raw
+                        // gradients (backward outputs).  The chain rule
+                        //   dL/draw_side = dL/dmu_side * activation_scale
+                        //                   * sigmoid(beta * raw_side)
+                        // is applied in ct_independent_backward; the
+                        // legacy base-density gradient is left at zero
+                        // (binding passes nullptr) and is not used by the
+                        // optimizer under independent mode.
                         const float *raw_plus = nullptr,
-                        const float *raw_minus = nullptr) override {
-
-        // LC64 plan v3 Commit 2A -- backward under independent mode is
-        // explicitly out of scope.  The Python binding rejects this
-        // earlier with a NotImplementedError, but guard again here so a
-        // direct C++ caller (e.g. a custom test driver) cannot silently
-        // fall through to the legacy backward path and produce a
-        // silently-wrong gradient for raw_plus/raw_minus.
-        if (settings.thin_surface_independent_mode) {
-            throw std::runtime_error(
-                "CUDADensityPipeline::trace_backward: independent-side "
-                "backward is not implemented in LC64 plan v3 Commit 2A. "
-                "It will land in Commit 2B; until then, calling backward "
-                "under thin_surface_independent_mode is a hard error.");
-        }
+                        const float *raw_minus = nullptr,
+                        float *raw_plus_grad = nullptr,
+                        float *raw_minus_grad = nullptr) override {
 
         CUDAArray<Vec4h> adjacent_diff(point_adjacency_size + 32);
         prefetch_adjacent_diff(reinterpret_cast<const Vec3f *>(points),
@@ -3534,7 +3867,44 @@ class CUDADensityPipeline : public Pipeline {
                                nullptr);
 
         constexpr uint32_t block_size = 128;
-        if (settings.thin_surface_mode && density_delta && quaternions &&
+        // LC64 plan v3 Commit 2B -- independent-mode backward takes
+        // precedence over the legacy thin-surface branch when the
+        // discriminator is on.  The forward path mirrors this dispatch
+        // (see trace_forward).  The C++ binding rejects mixed inputs
+        // (raw_plus/raw_minus without thin-surface geometry) before
+        // any kernel launch, so all four geometry pointers are
+        // guaranteed non-null under independent mode.
+        if (settings.thin_surface_mode && settings.thin_surface_independent_mode &&
+            raw_plus && raw_minus && quaternions &&
+            texel_sites_2d && texel_heights && cell_radius) {
+            launch_kernel_1d<block_size>(
+                ct_independent_backward<block_size>,
+                num_rays,
+                nullptr,
+                settings,
+                points,
+                raw_plus,
+                raw_minus,
+                quaternions,
+                texel_sites_2d,
+                texel_heights,
+                cell_radius,
+                point_adjacency,
+                point_adjacency_offsets,
+                adjacent_diff.begin(),
+                rays,
+                num_rays,
+                start_point_index,
+                ray_projection_grad,
+                ray_error,
+                points_grad,
+                raw_plus_grad,
+                raw_minus_grad,
+                quaternions_grad,
+                texel_sites_2d_grad,
+                texel_heights_grad,
+                point_error);
+        } else if (settings.thin_surface_mode && density_delta && quaternions &&
             texel_sites_2d && texel_heights && cell_radius) {
             launch_kernel_1d<block_size>(
                 ct_thinsurface_backward<block_size>,

@@ -75,30 +75,43 @@ class TraceRays(torch.autograd.Function):
         ctx.gaussian_mode = _gaussian_mode
         ctx.has_gaussian = _density_peak is not None
         ctx.thin_surface_mode = _thin_surface_mode
+        # LC64 plan v3 Commit 2B -- under independent mode, density_delta
+        # is None (mutually exclusive with raw_plus / raw_minus) but
+        # the SURFACE GEOMETRY (quaternions, texel_sites_2d,
+        # texel_heights) is still required by the backward pass.  The
+        # legacy has_thin_surface flag gates only the density_delta
+        # branch; we add a parallel flag that also fires under
+        # independent mode so the geometry is preserved on ctx for
+        # the backward pass.  The two flags stay separate so the
+        # legacy code path keeps its existing semantics.
         ctx.has_thin_surface = _density_delta is not None
+        ctx.has_thin_surface_geom = (_density_delta is not None
+                                      or _thin_surface_independent_mode)
         ctx.thin_K = _thin_K
         ctx.thin_temp = _thin_temp
         ctx.thin_height_eps = _thin_height_eps
         ctx.thin_surface_relative_delta = _thin_surface_relative_delta
         ctx.thin_surface_delta_max_frac = _thin_surface_delta_max_frac
-        # LC64 plan v3 Commit 2A -- independent-side raw logits.
-        # Saved verbatim across the autograd context so backward can
-        # gate on the discriminator and raise if the user calls
-        # backward() under independent mode before Commit 2B.
+        # LC64 plan v3 Commit 2B -- independent-side raw logits are
+        # ALWAYS saved on ctx when present, regardless of the
+        # discriminator.  Commit 2A only saved under independent mode
+        # because the binding would reject; Commit 2B's binding
+        # dispatches to ct_independent_backward and needs the raw
+        # inputs to compute the chain rule.  Mixed / missing tensors
+        # are still rejected at the binding (see trace_backward).
         ctx.thin_surface_independent_mode = _thin_surface_independent_mode
         ctx.thin_surface_activation_scale = _thin_surface_activation_scale
         ctx.has_raw_plus = _raw_plus is not None
         ctx.has_raw_minus = _raw_minus is not None
-        if _thin_surface_independent_mode:
-            ctx.raw_plus = _raw_plus
-            ctx.raw_minus = _raw_minus
+        ctx.raw_plus = _raw_plus
+        ctx.raw_minus = _raw_minus
         if ctx.has_density_grad:
             ctx.density_grad = _density_grad
         if ctx.has_gaussian:
             ctx.density_peak = _density_peak
             ctx.delta_raw = _delta_raw
             ctx.cov_raw = _cov_raw
-        if ctx.has_thin_surface:
+        if ctx.has_thin_surface_geom:
             ctx.density_delta = _density_delta
             ctx.quaternions = _quaternions
             ctx.texel_sites_2d = _texel_sites_2d
@@ -165,24 +178,6 @@ class TraceRays(torch.autograd.Function):
         del grad_num_intersections
         del errbox_grad
 
-        # LC64 plan v3 Commit 2A -- independent-side backward is NOT
-        # implemented in this commit.  Fail fast with a clear error
-        # before any kernel launch (the C++ binding also rejects this
-        # as a defensive second guard).  Calling backward under
-        # independent mode is a configuration error, not a runtime
-        # regression; the forward contract is the only supported path
-        # until Commit 2B.
-        if getattr(ctx, "thin_surface_independent_mode", False):
-            raise NotImplementedError(
-                "Independent-side backward is not implemented in "
-                "LC64 plan v3 Commit 2A. The forward path renders "
-                "raw_plus / raw_minus via the CUDA dispatch in "
-                "ct_independent_forward, but the backward path lands "
-                "in Commit 2B. Until then, calling backward() under "
-                "thin_surface_independent_mode=True is a hard error "
-                "(no silent scalar / legacy-delta fallback)."
-            )
-
         rays = ctx.rays
         start_point = ctx.start_point
         pipeline = ctx.pipeline
@@ -206,22 +201,28 @@ class TraceRays(torch.autograd.Function):
         _cov_raw = ctx.cov_raw if has_gaussian else None
         thin_surface_mode = ctx.thin_surface_mode
         has_thin_surface = ctx.has_thin_surface
+        # LC64 plan v3 Commit 2B -- the legacy has_thin_surface flag
+        # controls density_delta saving; under independent mode the
+        # surface geometry (quaternions, texel_sites_2d, texel_heights)
+        # is still needed for the backward chain.  has_thin_surface_geom
+        # is the union of (legacy thin-surface) OR (independent mode).
+        has_thin_surface_geom = ctx.has_thin_surface_geom
         thin_K = ctx.thin_K
         thin_temp = ctx.thin_temp
         thin_height_eps = ctx.thin_height_eps
         thin_surface_relative_delta = ctx.thin_surface_relative_delta
         thin_surface_delta_max_frac = ctx.thin_surface_delta_max_frac
         _density_delta = ctx.density_delta if has_thin_surface else None
-        _quaternions = ctx.quaternions if has_thin_surface else None
-        _texel_sites_2d = ctx.texel_sites_2d if has_thin_surface else None
-        _texel_heights = ctx.texel_heights if has_thin_surface else None
-        # LC64 plan v3 Commit 2A -- independent-side raw logits are
-        # NOT read by backward (the binding rejects independent-mode
-        # backward above).  Pass None for legacy arg ordering.
-        _raw_plus = None
-        _raw_minus = None
-        thin_surface_independent_mode = False
-        thin_surface_activation_scale = 1.0
+        _quaternions = ctx.quaternions if has_thin_surface_geom else None
+        _texel_sites_2d = ctx.texel_sites_2d if has_thin_surface_geom else None
+        _texel_heights = ctx.texel_heights if has_thin_surface_geom else None
+        # LC64 plan v3 Commit 2B -- independent-side raw logits are
+        # read by the backward when the discriminator is on.  Saved
+        # on ctx during forward (see the augmented save block).
+        _raw_plus = ctx.raw_plus
+        _raw_minus = ctx.raw_minus
+        thin_surface_independent_mode = ctx.thin_surface_independent_mode
+        thin_surface_activation_scale = ctx.thin_surface_activation_scale
 
         results = pipeline.trace_backward(
             _points,
@@ -269,23 +270,49 @@ class TraceRays(torch.autograd.Function):
         quaternions_grad = results.get("quaternions_grad", None)
         texel_sites_2d_grad = results.get("texel_sites_2d_grad", None)
         texel_heights_grad = results.get("texel_heights_grad", None)
+        # LC64 plan v3 Commit 2B -- per-side raw logits gradients.  Only
+        # present when the discriminator is on; legacy / absolute /
+        # relative paths return None (the binding does not allocate the
+        # tensors and the dict key is absent).  Shape must be (N, 1)
+        # matching the parameter layout.
+        raw_plus_grad = results.get("raw_plus_grad", None)
+        raw_minus_grad = results.get("raw_minus_grad", None)
         ctx.errbox.point_error = results.get("point_error", None)
 
         # Autograd-contract guard: every returned thin-surface grad MUST match
         # the corresponding forward-input parameter shape, else AccumulateGrad
-        # cannot accumulate it (a silent or hard failure). This catches any
-        # future regression of the C++ grad-tensor allocation shapes.
-        if has_thin_surface:
+        # cannot accumulate it (a silent or hard failure). Geometry exists in
+        # both legacy-delta and independent-side modes; density_delta is legacy-only.
+        if has_thin_surface_geom:
             _expected = {
-                "density_delta_grad": (ctx.density_delta, density_delta_grad),
                 "quaternions_grad": (ctx.quaternions, quaternions_grad),
                 "texel_sites_2d_grad": (ctx.texel_sites_2d, texel_sites_2d_grad),
                 "texel_heights_grad": (ctx.texel_heights, texel_heights_grad),
             }
+            if has_thin_surface:
+                _expected["density_delta_grad"] = (
+                    ctx.density_delta, density_delta_grad)
             for _name, (_param, _grad) in _expected.items():
                 assert _grad is not None, (
-                    f"{_name} is None but thin-surface mode is active "
-                    f"(has_thin_surface=True)")
+                    f"{_name} is None but thin-surface geometry is active")
+                assert tuple(_grad.shape) == tuple(_param.shape), (
+                    f"{_name} shape {tuple(_grad.shape)} != param "
+                    f"{tuple(_param.shape)}; autograd cannot accumulate")
+
+        # LC64 plan v3 Commit 2B -- shape contract for independent-side
+        # raw gradients.  Both raw_plus / raw_minus params are (N, 1);
+        # the corresponding grads must match or autograd cannot
+        # accumulate.  The binding allocates them with the right
+        # shape; this guard catches any future regression of the
+        # allocation logic.
+        if thin_surface_independent_mode:
+            for _name, (_param, _grad) in (
+                ("raw_plus_grad",  (ctx.raw_plus,  raw_plus_grad)),
+                ("raw_minus_grad", (ctx.raw_minus, raw_minus_grad)),
+            ):
+                assert _grad is not None, (
+                    f"{_name} is None but thin_surface_independent_mode "
+                    f"is True (raw logits must have grads)")
                 assert tuple(_grad.shape) == tuple(_param.shape), (
                     f"{_name} shape {tuple(_grad.shape)} != param "
                     f"{tuple(_param.shape)}; autograd cannot accumulate")
@@ -308,6 +335,10 @@ class TraceRays(torch.autograd.Function):
             texel_sites_2d_grad[~texel_sites_2d_grad.isfinite()] = 0
         if texel_heights_grad is not None:
             texel_heights_grad[~texel_heights_grad.isfinite()] = 0
+        if raw_plus_grad is not None:
+            raw_plus_grad[~raw_plus_grad.isfinite()] = 0
+        if raw_minus_grad is not None:
+            raw_minus_grad[~raw_minus_grad.isfinite()] = 0
 
         del (
             ctx.rays,
@@ -343,18 +374,24 @@ class TraceRays(torch.autograd.Function):
             del ctx.density_grad
         if has_gaussian:
             del ctx.density_peak, ctx.delta_raw, ctx.cov_raw
-        if has_thin_surface:
+        if has_thin_surface_geom:
             del ctx.density_delta, ctx.quaternions, ctx.texel_sites_2d, ctx.texel_heights
-        # LC64 plan v3 Commit 2A -- independent-side raw logits saved
-        # on ctx during forward; release here so the autograd context
-        # does not hold Parameter references past the backward call.
-        if getattr(ctx, "thin_surface_independent_mode", False):
-            del ctx.raw_plus, ctx.raw_minus
+        # LC64 plan v3 Commit 2B -- raw_plus / raw_minus are now saved
+        # on ctx whenever they are present (forward stores them
+        # unconditionally; binding rejects mixed inputs at validation).
+        # Release the references here so the autograd context does not
+        # hold Parameter handles past the backward call.
+        del ctx.raw_plus, ctx.raw_minus
 
         return (
             None,               # pipeline
             points_grad,        # _points
-            attr_grad,          # _density
+            # LC64 plan v3 Commit 2B -- under independent mode the base
+            # density is frozen (requires_grad=False) so the autograd
+            # slot for _density must return None.  In legacy / absolute
+            # / relative mode the binding's attr_grad is the gradient
+            # of the scalar base density (N, 1) and is returned as-is.
+            None if thin_surface_independent_mode else attr_grad,  # _density
             None,               # _point_adjacency
             None,               # _point_adjacency_offsets
             None,               # rays
@@ -382,8 +419,13 @@ class TraceRays(torch.autograd.Function):
             None,               # _thin_height_eps
             None,               # _thin_surface_relative_delta (M5)
             None,               # _thin_surface_delta_max_frac (M5)
-            None,               # _raw_plus (Commit 2A)
-            None,               # _raw_minus (Commit 2A)
+            # LC64 plan v3 Commit 2B -- raw_plus / raw_minus per-side
+            # raw logits gradients.  None outside independent mode
+            # (the binding does not allocate, so the slot must stay
+            # None and the autograd graph cannot be left referencing a
+            # parameter it never had).
+            raw_plus_grad if thin_surface_independent_mode else None,   # _raw_plus
+            raw_minus_grad if thin_surface_independent_mode else None,  # _raw_minus
             None,               # _thin_surface_independent_mode (Commit 2A)
             None,               # _thin_surface_activation_scale (Commit 2A)
         )

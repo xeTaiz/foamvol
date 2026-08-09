@@ -15,8 +15,7 @@ Verifies the forward dispatch on a real GPU:
     quat, zero heights) -> matches scalar baseline to fp tol
   - malformed / mixed inputs fail BEFORE launch (returns a check on
     the C++ binding's pre-launch validation through Python)
-  - independent backward explicitly fails with NotImplementedError
-    (Python level) and a clear RuntimeError (C++ binding level)
+  - independent backward runs end-to-end and returns finite raw-side gradients
 
 Run with:
     micromamba run -n radfoam python test/test_thin_surface_independent_forward_cuda.py
@@ -460,9 +459,19 @@ def test_malformed_inputs_fail_before_launch():
           "raw_plus under non-independent mode raises RuntimeError")
 
 
-def test_independent_backward_explicitly_fails():
-    """calling backward under independent mode raises NotImplementedError."""
-    print("\n--- Test 7: independent backward explicitly fails ---")
+def test_independent_backward_smoke():
+    """LC64 plan v3 Commit 2B -- independent backward NOW WORKS.
+
+    The previous Commit 2A test asserted backward() raised
+    NotImplementedError; that contract is gone.  The new contract is
+    that backward runs end-to-end and produces finite raw_plus_grad /
+    raw_minus_grad of shape (N, 1) with the chain-rule identity
+    dL/draw_side = dL/dmu_side * activation_scale * sigmoid(10*raw_side).
+    Detailed FD checks live in
+    test/test_thin_surface_independent_backward_cuda.py.  This test
+    here is a small smoke check to keep the test suite green.
+    """
+    print("\n--- Test 7: independent backward smoke (Commit 2B) ---")
     device = "cuda"
     model = _make_scene(device=device)
     model = _activate_independent(model, K=4, raw_plus_val=0.7,
@@ -476,23 +485,50 @@ def test_independent_backward_explicitly_fails():
     model._thin_surface_density_mode = "independent"
     model._thin_surface_active = True
 
+    # Clear any existing grads
+    for name in ("raw_plus", "raw_minus", "quaternions",
+                 "texel_sites_2d", "texel_heights", "primal_points",
+                 "density"):
+        p = getattr(model, name, None)
+        if p is not None:
+            p.grad = None
+
     out, *_ = model(rays, start_point)
-    raised = False
-    try:
-        out.sum().backward()
-    except NotImplementedError as e:
-        raised = "Independent-side backward" in str(e) or "Commit 2B" in str(e)
-    except RuntimeError as e:
-        # C++ binding fails fast too
-        raised = "Commit 2A" in str(e) or "independent" in str(e).lower()
-    check(raised,
-          "backward() under independent mode raises NotImplementedError "
-          "/ RuntimeError (no silent fallback)")
+    loss = out.sum()
+    loss.backward()
+
+    # raw_plus_grad / raw_minus_grad exist, finite, and (N, 1) shaped
+    rp_grad = model.raw_plus.grad
+    rm_grad = model.raw_minus.grad
+    check(rp_grad is not None, "raw_plus.grad is not None (Commit 2B)")
+    check(rm_grad is not None, "raw_minus.grad is not None (Commit 2B)")
+    if rp_grad is not None and rm_grad is not None:
+        check(rp_grad.shape == model.raw_plus.shape,
+              f"raw_plus.grad shape {tuple(rp_grad.shape)} == param "
+              f"{tuple(model.raw_plus.shape)}")
+        check(rm_grad.shape == model.raw_minus.shape,
+              f"raw_minus.grad shape {tuple(rm_grad.shape)} == param "
+              f"{tuple(model.raw_minus.shape)}")
+        check(rp_grad.isfinite().all(),
+              f"raw_plus.grad all finite (norm={rp_grad.norm().item():.3e})")
+        check(rm_grad.isfinite().all(),
+              f"raw_minus.grad all finite (norm={rm_grad.norm().item():.3e})")
+
+    # Independent mode still optimizes the shared surface geometry and points,
+    # but must not render through or differentiate the legacy base density.
+    for name in ("primal_points", "quaternions", "texel_sites_2d",
+                 "texel_heights"):
+        grad = getattr(model, name).grad
+        check(grad is not None, f"{name}.grad is not None")
+        if grad is not None:
+            check(grad.isfinite().all(), f"{name}.grad all finite")
+    check(model.density.grad is None,
+          "legacy base density has no gradient in independent mode")
 
 
 def main():
     print("=" * 60)
-    print("LC64 plan v3 Commit 2A -- CUDA-independent FORWARD smoke")
+    print("LC64 plan v3 Commit 2B -- CUDA-independent forward/backward smoke")
     print("=" * 60)
     if not torch.cuda.is_available():
         print("CUDA not available; SKIPPING all tests.")
@@ -504,13 +540,13 @@ def main():
     test_activation_scale_scales_side_attenuation()
     test_geometry_zero_split_invariance()
     test_malformed_inputs_fail_before_launch()
-    test_independent_backward_explicitly_fails()
+    test_independent_backward_smoke()
 
     print("\n" + "=" * 60)
     if _any_failed:
         print("SUMMARY: SOME TESTS FAILED (see above)")
         sys.exit(1)
-    print("SUMMARY: ALL COMMIT-2A SMOKE TESTS PASSED")
+    print("SUMMARY: ALL INDEPENDENT FORWARD/BACKWARD SMOKE TESTS PASSED")
 
 
 if __name__ == "__main__":
