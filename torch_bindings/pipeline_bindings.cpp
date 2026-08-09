@@ -178,7 +178,15 @@ py::object trace_forward(Pipeline &self,
                          float thin_temp,
                          float thin_height_eps,
                          bool thin_surface_relative_delta,
-                         float thin_surface_delta_max_frac) {
+                         float thin_surface_delta_max_frac,
+                         // LC64 plan v3 Commit 2A -- independent-side raw
+                         // logits (each (N,1)).  Only read when
+                         // thin_surface_independent_mode is true; nullptr
+                         // for legacy / absolute / relative.
+                         std::optional<torch::Tensor> raw_plus_in,
+                         std::optional<torch::Tensor> raw_minus_in,
+                         bool thin_surface_independent_mode,
+                         float thin_surface_activation_scale) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -264,6 +272,68 @@ py::object trace_forward(Pipeline &self,
     torch::Tensor texel_heights_t;
     if (has_texel_heights) texel_heights_t = texel_heights_in.value().contiguous();
 
+    // LC64 plan v3 Commit 2A -- independent-side raw logits.
+    bool has_raw_plus = raw_plus_in.has_value();
+    bool has_raw_minus = raw_minus_in.has_value();
+    torch::Tensor raw_plus_t;
+    torch::Tensor raw_minus_t;
+    if (has_raw_plus) raw_plus_t = raw_plus_in.value().contiguous();
+    if (has_raw_minus) raw_minus_t = raw_minus_in.value().contiguous();
+
+    // Pre-launch validation (mixed/missing) -- per the acceptance contract
+    // these must fail before kernel launch, not after the dispatcher has
+    // selected the wrong branch.
+    if (thin_surface_independent_mode) {
+        if (!thin_surface_mode) {
+            throw std::runtime_error(
+                "thin_surface_independent_mode=True requires "
+                "thin_surface_mode=True (independent mode reuses the "
+                "thin-surface geometry: quaternion + K texel sites + "
+                "heights + cell_radius).");
+        }
+        if (!has_raw_plus || !has_raw_minus) {
+            throw std::runtime_error(
+                "thin_surface_independent_mode=True requires both "
+                "raw_plus and raw_minus tensors (each (N,1)). Missing: "
+                + std::string(has_raw_plus ? "" : "raw_plus ")
+                + std::string(has_raw_minus ? "" : "raw_minus"));
+        }
+        if (raw_plus_t.scalar_type() != at::kFloat ||
+            raw_minus_t.scalar_type() != at::kFloat) {
+            throw std::runtime_error(
+                "raw_plus / raw_minus must have float32 dtype under "
+                "thin_surface_independent_mode.");
+        }
+        if (raw_plus_t.device().type() != at::kCUDA ||
+            raw_minus_t.device().type() != at::kCUDA) {
+            throw std::runtime_error(
+                "raw_plus / raw_minus must be on a CUDA device under "
+                "thin_surface_independent_mode.");
+        }
+        if (raw_plus_t.size(0) != num_points ||
+            raw_minus_t.size(0) != num_points) {
+            throw std::runtime_error(
+                "raw_plus / raw_minus must have num_points rows under "
+                "thin_surface_independent_mode (got " +
+                std::to_string(raw_plus_t.size(0)) + " vs " +
+                std::to_string(num_points) + ").");
+        }
+        if (has_density_delta) {
+            throw std::runtime_error(
+                "thin_surface_independent_mode is mutually exclusive with "
+                "density_delta (legacy absolute/relative thin-surface path). "
+                "Pass density_delta=None under independent mode.");
+        }
+    } else {
+        if (has_raw_plus || has_raw_minus) {
+            throw std::runtime_error(
+                "raw_plus / raw_minus must be None when "
+                "thin_surface_independent_mode is False (legacy / absolute / "
+                "relative thin-surface path). Mixed inputs are rejected "
+                "before kernel launch.");
+        }
+    }
+
     TraceSettings settings = default_trace_settings();
     if (!max_intersections.is_none()) {
         settings.max_intersections = max_intersections.cast<uint32_t>();
@@ -285,6 +355,9 @@ py::object trace_forward(Pipeline &self,
     // Geometry is unaffected.
     settings.thin_surface_relative_delta = thin_surface_relative_delta;
     settings.thin_surface_delta_max_frac  = thin_surface_delta_max_frac;
+    // LC64 plan v3 Commit 2A -- forward-only independent-side dispatch.
+    settings.thin_surface_independent_mode = thin_surface_independent_mode;
+    settings.thin_surface_activation_scale = thin_surface_activation_scale;
 
     // Hard cap: the CUDA backward kernel uses a fixed-size stack buffer
     // `float w_arr[8]` (pipeline.cu, ct_thinsurface_backward). An invalid K
@@ -373,6 +446,12 @@ py::object trace_forward(Pipeline &self,
             : nullptr,
         has_texel_heights
             ? reinterpret_cast<const float *>(texel_heights_t.data_ptr())
+            : nullptr,
+        thin_surface_independent_mode && has_raw_plus
+            ? reinterpret_cast<const float *>(raw_plus_t.data_ptr())
+            : nullptr,
+        thin_surface_independent_mode && has_raw_minus
+            ? reinterpret_cast<const float *>(raw_minus_t.data_ptr())
             : nullptr);
 
     py::dict output_dict;
@@ -418,7 +497,14 @@ py::object trace_backward(Pipeline &self,
                           float thin_temp,
                           float thin_height_eps,
                           bool thin_surface_relative_delta,
-                          float thin_surface_delta_max_frac) {
+                          float thin_surface_delta_max_frac,
+                          // LC64 plan v3 Commit 2A -- independent-side raw
+                          // logits (FW shape only; backward under this mode
+                          // is explicitly rejected below).
+                          std::optional<torch::Tensor> raw_plus_in,
+                          std::optional<torch::Tensor> raw_minus_in,
+                          bool thin_surface_independent_mode,
+                          float thin_surface_activation_scale) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -544,12 +630,30 @@ py::object trace_backward(Pipeline &self,
     // Mirror the forward branch (see trace_forward).
     settings.thin_surface_relative_delta = thin_surface_relative_delta;
     settings.thin_surface_delta_max_frac  = thin_surface_delta_max_frac;
+    settings.thin_surface_independent_mode = thin_surface_independent_mode;
+    settings.thin_surface_activation_scale = thin_surface_activation_scale;
 
     // Hard cap (same as trace_forward): protect the CUDA backward w_arr[8].
     if (thin_surface_mode && (thin_K <= 0 || thin_K > 8)) {
         throw std::runtime_error(
             "thin_surface_mode requires 1 <= thin_K <= 8 (got " +
             std::to_string(thin_K) + "); CUDA backward w_arr[8] hard cap.");
+    }
+
+    // LC64 plan v3 Commit 2A -- independent-side backward is NOT
+    // implemented in this commit.  Reject at the binding so a backward
+    // call under independent mode fails fast with a clear error
+    // (Python's TraceRays.backward also raises NotImplementedError;
+    // this guard catches direct C++ callers and a future regression
+    // where the Python check is dropped).
+    if (thin_surface_independent_mode) {
+        throw std::runtime_error(
+            "trace_backward: independent-side backward is not "
+            "implemented in LC64 plan v3 Commit 2A. The forward "
+            "path renders raw_plus / raw_minus via "
+            "ct_independent_forward (Commit 2A); the backward "
+            "path lands in Commit 2B. Until then, calling backward "
+            "under thin_surface_independent_mode is a hard error.");
     }
 
     bool has_density_delta = density_delta_in.has_value();
@@ -694,6 +798,16 @@ py::object trace_backward(Pipeline &self,
             : nullptr,
         (thin_surface_mode && has_texel_heights)
             ? reinterpret_cast<float *>(texel_heights_grad_t.data_ptr())
+            : nullptr,
+        // LC64 plan v3 Commit 2A -- independent-side raw logits.  The
+        // C++ binding rejects independent-mode backward above before
+        // any kernel launch, so the data pointers here are only used
+        // in the legacy code paths (None when independent_mode=False).
+        thin_surface_independent_mode && raw_plus_in.has_value()
+            ? reinterpret_cast<const float *>(raw_plus_in.value().data_ptr())
+            : nullptr,
+        thin_surface_independent_mode && raw_minus_in.has_value()
+            ? reinterpret_cast<const float *>(raw_minus_in.value().data_ptr())
             : nullptr);
 
     py::dict output_dict;
@@ -799,7 +913,16 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("thin_height_eps") = 1e-4f,
              // M5 relative-delta parameterization.  Off by default; opt in.
              py::arg("thin_surface_relative_delta") = false,
-             py::arg("thin_surface_delta_max_frac") = 0.5f)
+             py::arg("thin_surface_delta_max_frac") = 0.5f,
+             // LC64 plan v3 Commit 2A -- independent-side raw logits.
+             // Off by default; when True, raw_plus / raw_minus must be
+             // provided (each (N,1)) and activation_scale multiplies the
+             // activated side attenuation.  Forward only; backward
+             // raises NotImplementedError until Commit 2B.
+             py::arg("raw_plus") = py::none(),
+             py::arg("raw_minus") = py::none(),
+             py::arg("thin_surface_independent_mode") = false,
+             py::arg("thin_surface_activation_scale") = 1.0f)
         .def("trace_backward",
              trace_backward,
              py::arg("points"),
@@ -833,7 +956,15 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("thin_height_eps") = 1e-4f,
              // M5 relative-delta parameterization.  Off by default; opt in.
              py::arg("thin_surface_relative_delta") = false,
-             py::arg("thin_surface_delta_max_frac") = 0.5f);
+             py::arg("thin_surface_delta_max_frac") = 0.5f,
+             // LC64 plan v3 Commit 2A -- independent-side raw logits.
+             // Backward under this mode raises NotImplementedError until
+             // Commit 2B (see trace_forward above for the forward
+             // semantics).
+             py::arg("raw_plus") = py::none(),
+             py::arg("raw_minus") = py::none(),
+             py::arg("thin_surface_independent_mode") = false,
+             py::arg("thin_surface_activation_scale") = 1.0f);
 
     module.def("create_ct_pipeline", create_ct_pipeline_binding);
 

@@ -5,6 +5,8 @@
 #include "../utils/geometry.h"
 #include "pipeline.h"
 
+#include <stdexcept>
+
 #include "../utils/common_kernels.cuh"
 #include "tracing_utils.cuh"
 
@@ -820,6 +822,173 @@ __global__ void ct_thinsurface_forward(
         float t_surf = ((current_point - ray.origin).dot(n) + h_eval) / dp;
 
         // Two-sided partition
+        float mu_near = (dp > 0.0f) ? mu_n : mu_p;
+        float mu_far  = (dp > 0.0f) ? mu_p : mu_n;
+
+        float t_s = fminf(fmaxf(t_surf, t_0), t_1);
+        bool crossing = (t_surf > t_0 + thin_height_eps) &&
+                        (t_surf < t_1 - thin_height_eps);
+
+        float contrib;
+        if (crossing) {
+            contrib = mu_near * (t_s - t_0) + mu_far * (t_1 - t_s);
+        } else {
+            bool plus_side = (dp > 0.0f) ? (t_surf <= t_0) : (t_surf >= t_1);
+            contrib = (plus_side ? mu_p : mu_n) * delta_t;
+        }
+        projection += contrib;
+
+        if (point_contribution) atomicAdd(point_contribution + point_idx, delta_t);
+        if (point_hit_count)    atomicAdd(point_hit_count + point_idx, 1u);
+
+        return true;
+    };
+
+    uint32_t start_point = start_point_index[thread_idx];
+
+    uint32_t n = trace<block_size, 4>(ray,
+                                      points,
+                                      point_adjacency,
+                                      point_adjacency_offsets,
+                                      adjacent_diff,
+                                      start_point,
+                                      settings.max_intersections,
+                                      functor);
+
+    ray_projection[thread_idx] = projection;
+    if (num_intersections)
+        num_intersections[thread_idx] = n;
+}
+
+// ============================================================================
+// ct_independent_forward
+// ----------------------------------------------------------------------------
+// LC64 plan v3 Commit 2A -- CUDA-native independent-side FORWARD only.
+// Renders exactly two raw side tensors per cell:
+//
+//     mu_plus  = activation_scale * softplus(raw_plus,  beta=10)
+//     mu_minus = activation_scale * softplus(raw_minus, beta=10)
+//
+// The thin-surface geometry (quaternion + K texel sites + heights) and the
+// crossing / non-crossing / dp-sign semantics are REUSED UNCHANGED from
+// ct_thinsurface_forward: the upstream kernel computes the same two-sided
+// partition over the cell along the surface normal, and we only swap the
+// "mu_p / mu_n" constants for the independently-evaluated softplus values.
+// Legacy base `density` is not read (it is frozen in this mode at the
+// optimizer level; the binding rejects mixed inputs so the kernel never
+// sees a stale density pointer).
+//
+// Backward is NOT implemented in Commit 2A; the trace_backward binding
+// rejects independent-mode calls before any kernel launch.
+// ============================================================================
+
+template <int block_size>
+__global__ void ct_independent_forward(
+    TraceSettings settings,
+    const Vec3f *__restrict__ points,
+    const float *__restrict__ raw_plus,        // (N,1) raw logit, softplus’d to mu_plus
+    const float *__restrict__ raw_minus,       // (N,1) raw logit, softplus’d to mu_minus
+    const float *__restrict__ quaternions,     // (N, 4) [w,x,y,z]
+    const float *__restrict__ texel_sites_2d,  // (N, K, 2)
+    const float *__restrict__ texel_heights,   // (N, K)
+    const float *__restrict__ cell_radius,     // (N,)
+    const uint32_t *__restrict__ point_adjacency,
+    const uint32_t *__restrict__ point_adjacency_offsets,
+    const Vec4h *__restrict__ adjacent_diff,
+    const Ray *__restrict__ rays,
+    uint32_t num_rays,
+    const uint32_t *__restrict__ start_point_index,
+    float *__restrict__ ray_projection,
+    uint32_t *__restrict__ num_intersections,
+    float *__restrict__ point_contribution,
+    uint32_t *__restrict__ point_hit_count)
+{
+    uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (thread_idx >= num_rays)
+        return;
+
+    Ray ray = rays[thread_idx];
+    ray.direction /= ray.direction.norm();
+
+    float projection = 0.0f;
+    constexpr float sp_beta = 10.0f;
+    const int K = settings.thin_K;
+    const float thin_temp = settings.thin_temp;
+    const float thin_height_eps = settings.thin_height_eps;
+    const float activation_scale = settings.thin_surface_activation_scale;
+
+    auto functor = [&](uint32_t point_idx,
+                       float t_0,
+                       float t_1,
+                       const Vec3f &current_point,
+                       const Vec3f &next_point) {
+        float delta_t = fmaxf(t_1 - t_0, 0.0f);
+
+        // Independent-side per-side attenuation.
+        // activation_scale is applied AFTER softplus so the legacy
+        // identity mu=softplus(raw) is preserved when the scene sets
+        // activation_scale=1.0 (the default).
+        float raw_p = raw_plus[point_idx];
+        float mu_p = activation_scale * (
+            (sp_beta * raw_p > 20.0f) ? raw_p
+            : logf(1.0f + expf(sp_beta * raw_p)) / sp_beta);
+        float raw_m = raw_minus[point_idx];
+        float mu_n = activation_scale * (
+            (sp_beta * raw_m > 20.0f) ? raw_m
+            : logf(1.0f + expf(sp_beta * raw_m)) / sp_beta);
+        // mu_p / mu_n are already nonneg by construction of softplus;
+        // the legacy branches fmax(...,0) here is a no-op for the
+        // independent path but kept documented for readers.
+
+        // Tangent frame from quaternion (unchanged from thinsurface_forward).
+        const float *q = quaternions + point_idx * 4;
+        Vec3f n, tang, bita;
+        quat_to_frame(q, n, tang, bita);
+
+        float dp = n.dot(ray.direction);
+
+        // Grazing-ray fallback: when the surface is nearly parallel to
+        // the ray the crossing t is ill-conditioned; the legacy branch
+        // uses mu_bar * delta_t, but under independent mode there is no
+        // mu_bar -- use the side-averaged mean (which equals mu_bar when
+        // raw_plus == raw_minus, so the zero-split invariant below
+        // collapses to the scalar baseline).
+        if (fabsf(dp) < 1e-3f) {
+            float mu_bar = 0.5f * (mu_p + mu_n);
+            projection += mu_bar * delta_t;
+            if (point_contribution) atomicAdd(point_contribution + point_idx, delta_t);
+            if (point_hit_count)    atomicAdd(point_hit_count + point_idx, 1u);
+            return true;
+        }
+
+        float r = cell_radius[point_idx];
+
+        // Fixed-point step 1: query point on flat plane (unchanged).
+        float t_flat = (current_point - ray.origin).dot(n) / dp;
+        float t_q0 = (dp < 0.0f) ? fmaxf(t_0, t_flat) : t_0;
+        Vec3f x0 = ray.origin + t_q0 * ray.direction;
+
+        // Fixed-point step 2: soft-Voronoi height eval (unchanged).
+        float h_sum = 0.0f, w_sum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            const float *s2d = texel_sites_2d + (point_idx * K + k) * 2;
+            Vec3f site3 = current_point + r * (s2d[0] * tang + s2d[1] * bita);
+            float d2 = (x0 - site3).squaredNorm() / (r * r + 1e-20f);
+            float w = expf(-thin_temp * d2);
+            h_sum += w * (r * texel_heights[point_idx * K + k]);
+            w_sum += w;
+        }
+        float w_sum_safe = fmaxf(w_sum, 1e-20f);
+        float h_eval = h_sum / w_sum_safe;
+
+        // Fixed-point step 3: surface intersection (unchanged).
+        float t_surf = ((current_point - ray.origin).dot(n) + h_eval) / dp;
+
+        // Two-sided partition: near / far sides are DERIVED from the
+        // physical side constants, not a symmetric delta.  The dp-sign
+        // mapping is identical to the legacy branches:
+        //   dp > 0: ray origin is on the -n side; near=-n=mu_minus, far=+n=mu_plus
+        //   dp < 0: ray origin is on the +n side; near=+n=mu_plus,   far=-n=mu_minus
         float mu_near = (dp > 0.0f) ? mu_n : mu_p;
         float mu_far  = (dp > 0.0f) ? mu_p : mu_n;
 
@@ -3154,7 +3323,13 @@ class CUDADensityPipeline : public Pipeline {
                        const float *density_delta = nullptr,
                        const float *quaternions = nullptr,
                        const float *texel_sites_2d = nullptr,
-                       const float *texel_heights = nullptr) override {
+                       const float *texel_heights = nullptr,
+                       // LC64 plan v3 Commit 2A -- independent-side raw
+                       // logits.  Only read when
+                       // settings.thin_surface_independent_mode is true;
+                       // nullptr for legacy / absolute / relative.
+                       const float *raw_plus = nullptr,
+                       const float *raw_minus = nullptr) override {
 
         CUDAArray<Vec4h> adjacent_diff(point_adjacency_size + 32);
         prefetch_adjacent_diff(reinterpret_cast<const Vec3f *>(points),
@@ -3167,7 +3342,39 @@ class CUDADensityPipeline : public Pipeline {
                                nullptr);
 
         constexpr uint32_t block_size = 128;
-        if (settings.thin_surface_mode && density_delta && quaternions &&
+        // LC64 plan v3 Commit 2A -- independent mode takes precedence
+        // over the legacy thin-surface branch when the discriminator is
+        // on.  Both modes share the surface geometry (quaternion +
+        // texel sites + heights + cell_radius); only the per-side
+        // density parameterization differs.  The Python binding rejects
+        // mixed inputs before this point so raw_plus/raw_minus are
+        // guaranteed non-null under independent mode.
+        if (settings.thin_surface_mode && settings.thin_surface_independent_mode &&
+            raw_plus && raw_minus && quaternions &&
+            texel_sites_2d && texel_heights && cell_radius) {
+            launch_kernel_1d<block_size>(
+                ct_independent_forward<block_size>,
+                num_rays,
+                nullptr,
+                settings,
+                points,
+                raw_plus,
+                raw_minus,
+                quaternions,
+                texel_sites_2d,
+                texel_heights,
+                cell_radius,
+                point_adjacency,
+                point_adjacency_offsets,
+                adjacent_diff.begin(),
+                rays,
+                num_rays,
+                start_point_index,
+                ray_projection,
+                num_intersections,
+                point_contribution,
+                point_hit_count);
+        } else if (settings.thin_surface_mode && density_delta && quaternions &&
             texel_sites_2d && texel_heights && cell_radius) {
             launch_kernel_1d<block_size>(
                 ct_thinsurface_forward<block_size>,
@@ -3294,7 +3501,27 @@ class CUDADensityPipeline : public Pipeline {
                         float *density_delta_grad = nullptr,
                         float *quaternions_grad = nullptr,
                         float *texel_sites_2d_grad = nullptr,
-                        float *texel_heights_grad = nullptr) override {
+                        float *texel_heights_grad = nullptr,
+                        // LC64 plan v3 Commit 2A -- independent-side raw
+                        // logits.  Only read under forward; backward is
+                        // explicitly NOT implemented in this commit and the
+                        // binding raises before reaching this point.
+                        const float *raw_plus = nullptr,
+                        const float *raw_minus = nullptr) override {
+
+        // LC64 plan v3 Commit 2A -- backward under independent mode is
+        // explicitly out of scope.  The Python binding rejects this
+        // earlier with a NotImplementedError, but guard again here so a
+        // direct C++ caller (e.g. a custom test driver) cannot silently
+        // fall through to the legacy backward path and produce a
+        // silently-wrong gradient for raw_plus/raw_minus.
+        if (settings.thin_surface_independent_mode) {
+            throw std::runtime_error(
+                "CUDADensityPipeline::trace_backward: independent-side "
+                "backward is not implemented in LC64 plan v3 Commit 2A. "
+                "It will land in Commit 2B; until then, calling backward "
+                "under thin_surface_independent_mode is a hard error.");
+        }
 
         CUDAArray<Vec4h> adjacent_diff(point_adjacency_size + 32);
         prefetch_adjacent_diff(reinterpret_cast<const Vec3f *>(points),

@@ -28,6 +28,19 @@ struct TraceSettings {
     // is untouched.  See CH5-CH7 in specs/SPLIT-CELL-EXECUTION-LOG.md.
     bool  thin_surface_relative_delta = false;
     float thin_surface_delta_max_frac = 0.5f;   // rho in (0, 1]
+    // LC64 plan v3 Commit 2A -- independent-side density mode. When
+    // true, the kernel reads raw_plus / raw_minus (each (N,1)) and
+    // computes mu_plus = activation_scale * softplus(raw_plus, beta=10)
+    // and mu_minus = activation_scale * softplus(raw_minus, beta=10)
+    // independently (no mu_bar / delta).  The thin-surface geometry
+    // (quaternion, K texel sites, heights, cell_radius) and the
+    // crossing/non-crossing / dp-sign semantics are unchanged from
+    // the legacy absolute/relative branches -- only the per-side
+    // density parameterization is replaced.  Mutually exclusive with
+    // thin_surface_relative_delta at the scene level (enforced in
+    // Python); the kernel sees only the flag below.
+    bool  thin_surface_independent_mode = false;
+    float thin_surface_activation_scale = 1.0f;  // multiplies softplus; 1.0 = legacy
 };
 
 inline TraceSettings default_trace_settings() {
@@ -180,7 +193,13 @@ class Pipeline {
                                const float *density_delta = nullptr,
                                const float *quaternions = nullptr,
                                const float *texel_sites_2d = nullptr,
-                               const float *texel_heights = nullptr) = 0;
+                               const float *texel_heights = nullptr,
+                               // LC64 plan v3 Commit 2A -- independent-side
+                               // raw logits (each (N,1)).  Only read when
+                               // settings.thin_surface_independent_mode is
+                               // true; nullptr for legacy / absolute / relative.
+                               const float *raw_plus = nullptr,
+                               const float *raw_minus = nullptr) = 0;
 
     virtual void trace_backward(const TraceSettings &settings,
                                 uint32_t num_points,
@@ -214,7 +233,13 @@ class Pipeline {
                                 float *density_delta_grad = nullptr,
                                 float *quaternions_grad = nullptr,
                                 float *texel_sites_2d_grad = nullptr,
-                                float *texel_heights_grad = nullptr) = 0;
+                                float *texel_heights_grad = nullptr,
+                                // LC64 plan v3 Commit 2A -- independent-side
+                                // raw logits (FW shape only; backward is
+                                // Commit 2B and a backward call under
+                                // independent mode raises at the binding).
+                                const float *raw_plus = nullptr,
+                                const float *raw_minus = nullptr) = 0;
 
     // Stub for viewer compatibility — CT pipeline does not implement this
     virtual void trace_visualization(const TraceSettings &settings,

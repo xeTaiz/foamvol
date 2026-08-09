@@ -1654,20 +1654,14 @@ class CTScene(torch.nn.Module):
         start_point=None,
         return_contribution=False,
     ):
-        # LC64 plan v3 -- independent-side mode is not implemented in
-        # this commit (CUDA branch is gated on a later commit). Fail
-        # fast with a clear message rather than silently rendering the
-        # scalar baseline (which would produce misleading metrics).
+        # LC64 plan v3 -- independent-side mode is now implemented
+        # (Commit 2A: forward-only CUDA dispatch).  The discriminator
+        # drives the dispatch: when set to "independent" we activate
+        # the thin-surface path AND flip the independent-mode flag so
+        # the kernel reads raw_plus/raw_minus instead of density_delta.
+        # The legacy absolute / relative paths are unchanged.
         _mode = getattr(self, "_thin_surface_density_mode", "scalar")
-        if _mode == "independent":
-            raise NotImplementedError(
-                "Independent-side rendering is not implemented yet. "
-                "The CUDA kernel for raw_plus/raw_minus lands in a "
-                "later commit of the LC64 plan v3 E0 amendment. Until "
-                "then, calling forward() under _thin_surface_density_"
-                "mode='independent' is a hard error -- do not silently "
-                "render scalar/base/delta in this mode."
-            )
+        independent_mode = (_mode == "independent")
 
         (points, density, point_adjacency, point_adjacency_offsets,
          density_grad, gradient_max_slope,
@@ -1681,7 +1675,13 @@ class CTScene(torch.nn.Module):
         per_cell_sigma = getattr(self, "_per_cell_sigma", False)
         per_neighbor_sigma = getattr(self, "_per_neighbor_sigma", False)
         gaussian_mode = getattr(self, "_gaussian_active", False)
-        thin_surface_mode = getattr(self, "_thin_surface_active", False)
+        # Independent mode REQUIRES the thin-surface geometry
+        # (quaternion + K texel sites + heights + cell_radius), so the
+        # thin-surface master flag is forced on when independent mode
+        # is active.  The kernel dispatch in C++ keys on the union
+        # (thin_surface_mode && thin_surface_independent_mode).
+        thin_surface_mode = (getattr(self, "_thin_surface_active", False)
+                              or independent_mode)
 
         # Compute cell_radius on demand when adaptive sigma, gaussian, or thin-surface mode is active
         cell_radius = None
@@ -1690,6 +1690,26 @@ class CTScene(torch.nn.Module):
         if gaussian_mode and density_peak is not None:
             cell_radius = self._get_cell_radius()
         if thin_surface_mode and density_delta is not None:
+            cell_radius = self._get_cell_radius()
+        # Independent mode also needs cell_radius (the surface geometry
+        # uses it for the soft-Voronoi height eval).  The geometry
+        # tensors (quaternions / texel_sites_2d / texel_heights) are
+        # always present in independent mode because the user must
+        # have either initialized thin_surface or loaded a checkpoint
+        # -- initialize_independent_sides does not create them, so
+        # reach into the scene to verify they are wired.
+        if independent_mode:
+            if (quaternions is None or texel_sites_2d is None
+                    or texel_heights is None):
+                raise RuntimeError(
+                    "CTScene.forward: independent mode requires the "
+                    "thin-surface geometry (quaternions, texel_sites_2d, "
+                    "texel_heights) to be registered. Call "
+                    "initialize_thin_surface(args, K=4) first (it will "
+                    "route to initialize_independent_sides under "
+                    "thin_surface_density_mode='independent') or load a "
+                    "checkpoint that carries the geometry tensors."
+                )
             cell_radius = self._get_cell_radius()
 
         # When interpolation is active, suppress the linear gradient feature
@@ -1726,7 +1746,12 @@ class CTScene(torch.nn.Module):
             delta_raw,
             cov_raw,
             thin_surface_mode,
-            density_delta,
+            # LC64 plan v3 Commit 2A -- independent mode is mutually
+            # exclusive with density_delta (the legacy absolute/relative
+            # thin-surface path).  Pass None for density_delta under
+            # independent mode so the C++ binding rejects no-call-input
+            # before any kernel launch.
+            density_delta if not independent_mode else None,
             quaternions,
             texel_sites_2d,
             texel_heights,
@@ -1739,6 +1764,15 @@ class CTScene(torch.nn.Module):
             # so eval / resume use the same interpretation as training.
             getattr(self, "_thin_surface_relative_delta", False),
             float(getattr(self, "_thin_surface_delta_max_frac", 0.5)),
+            # LC64 plan v3 Commit 2A -- independent-side raw logits.
+            # When independent_mode is True, raw_plus / raw_minus are
+            # forwarded to the CUDA kernel (each (N,1)) and the kernel
+            # dispatches to ct_independent_forward.  When False, the
+            # legacy thin-surface / scalar paths are unchanged.
+            raw_plus if independent_mode else None,
+            raw_minus if independent_mode else None,
+            independent_mode,
+            float(self.activation_scale),
         )
 
     def declare_optimizer(self, args, warmup, max_iterations):
