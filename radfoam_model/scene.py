@@ -238,6 +238,16 @@ class CTScene(torch.nn.Module):
 
         self.pipeline = radfoam.create_ct_pipeline()
 
+        # LC64 plan v3 -- density-mode discriminator. Defaults to
+        # "scalar" (legacy behavior: density is the only degree and
+        # is trained; thin-surface remains inactive). Independent
+        # mode flips this to "independent" via
+        # initialize_independent_sides; absolute/relative modes flip
+        # to their respective labels via initialize_thin_surface.
+        # Used by save_pt / load_pt for round-trip and by forward()
+        # for the independent-mode fail-fast gate.
+        self._thin_surface_density_mode = "scalar"
+
     def regular_initialize(self):
         s = self.init_scale
         pt_per_axis = int(self.num_init_points ** (1.0 / 3.0))
@@ -728,7 +738,11 @@ class CTScene(torch.nn.Module):
 
         self.primal_points = optimizable_tensors["primal_points"]
         self._reapply_hard_freeze()  # Re-apply after primal-points replacement
-        self.density = optimizable_tensors["density"]
+        # LC64 plan v3 -- base density may have been frozen out of
+        # the optimizer (independent mode); restore the latest
+        # permuted tensor only if it was registered.
+        if "density" in optimizable_tensors:
+            self.density = optimizable_tensors["density"]
         if "density_grad" in optimizable_tensors:
             self.density_grad = optimizable_tensors["density_grad"]
         if "density_peak" in optimizable_tensors:
@@ -737,6 +751,14 @@ class CTScene(torch.nn.Module):
             self.delta_raw = optimizable_tensors["delta_raw"]
         if "cov_raw" in optimizable_tensors:
             self.cov_raw = optimizable_tensors["cov_raw"]
+        # LC64 plan v3 -- permute the independent raw sides in lock-step
+        # so they stay aligned with primal_points after a triangulation
+        # rebuild. The optimizer group identity is also rebuilt so a
+        # later optimizer.step still reaches the new tensor.
+        if "raw_plus" in optimizable_tensors:
+            self.raw_plus = optimizable_tensors["raw_plus"]
+        if "raw_minus" in optimizable_tensors:
+            self.raw_minus = optimizable_tensors["raw_minus"]
         if hasattr(self, '_frozen_mask'):
             self._frozen_mask = self._frozen_mask[permutation]
 
@@ -1545,11 +1567,17 @@ class CTScene(torch.nn.Module):
         quaternions = getattr(self, "quaternions", None)
         texel_sites_2d = getattr(self, "texel_sites_2d", None)
         texel_heights = getattr(self, "texel_heights", None)
+        # LC64 plan v3 -- independent-side raw logits. Always present in
+        # the tuple (None when not registered) so forward() can unpack
+        # unconditionally and the ABI is stable across modes.
+        raw_plus = getattr(self, "raw_plus", None)
+        raw_minus = getattr(self, "raw_minus", None)
 
         return (points, density, point_adjacency, point_adjacency_offsets,
                 density_grad, gradient_max_slope,
                 density_peak, delta_raw, cov_raw,
-                density_delta, quaternions, texel_sites_2d, texel_heights)
+                density_delta, quaternions, texel_sites_2d, texel_heights,
+                raw_plus, raw_minus)
 
     @torch.no_grad()
     def _get_cell_radius(self):
@@ -1626,10 +1654,26 @@ class CTScene(torch.nn.Module):
         start_point=None,
         return_contribution=False,
     ):
+        # LC64 plan v3 -- independent-side mode is not implemented in
+        # this commit (CUDA branch is gated on a later commit). Fail
+        # fast with a clear message rather than silently rendering the
+        # scalar baseline (which would produce misleading metrics).
+        _mode = getattr(self, "_thin_surface_density_mode", "scalar")
+        if _mode == "independent":
+            raise NotImplementedError(
+                "Independent-side rendering is not implemented yet. "
+                "The CUDA kernel for raw_plus/raw_minus lands in a "
+                "later commit of the LC64 plan v3 E0 amendment. Until "
+                "then, calling forward() under _thin_surface_density_"
+                "mode='independent' is a hard error -- do not silently "
+                "render scalar/base/delta in this mode."
+            )
+
         (points, density, point_adjacency, point_adjacency_offsets,
          density_grad, gradient_max_slope,
          density_peak, delta_raw, cov_raw,
-         density_delta, quaternions, texel_sites_2d, texel_heights) = self.get_trace_data()
+         density_delta, quaternions, texel_sites_2d, texel_heights,
+         raw_plus, raw_minus) = self.get_trace_data()
 
         interpolation_mode = getattr(self, "_interpolation_mode", False)
         idw_sigma = getattr(self, "_idw_sigma", 0.01)
@@ -1745,6 +1789,152 @@ class CTScene(torch.nn.Module):
         self._hard_freeze_active = False
         self._last_iteration = None
 
+    def initialize_independent_sides(self, args):
+        """Register the LC64 plan v3 independent-side raw logits.
+
+        Schema/setup only -- this commit does NOT touch rendering or
+        CUDA. The two raw side parameters (`raw_plus`, `raw_minus`,
+        each (N,1)) are initialized by cloning the existing scalar
+        raw `density`, so softplus(raw_plus) == softplus(raw_minus)
+        == softplus(density) at iteration 0 (physical-side equality
+        with the scalar baseline).
+
+        The base density is then FROZEN as a third density degree:
+        requires_grad=False and removed from the optimizer so it
+        cannot be stepped by Adam. The two raw side parameters
+        become separate ordinary Adam groups (`raw_plus`, `raw_minus`)
+        with identical native raw-side LR schedule (a single shared
+        cosine scheduler). No mean_raw is introduced and we do not
+        claim coordinate-matched Adam; the equal schedule is the
+        only claim.
+
+        Independent rendering is NOT implemented in this commit.
+        forward() fails fast with NotImplementedError whenever the
+        discriminator `_thin_surface_density_mode == "independent"`.
+        Mutually exclusive with the relative-delta path
+        (`thin_surface_relative_delta=True`).
+        """
+        # Mutually exclusive with the bounded relative-delta path.
+        # The E0 amendment (v3) chose either relative OR independent;
+        # a config that activates both is a misuse and we reject it
+        # rather than silently picking one.
+        if getattr(args, "thin_surface_relative_delta", False):
+            raise ValueError(
+                "initialize_independent_sides: mutually exclusive with "
+                "thin_surface_relative_delta=True (LC64 plan v3 E0 "
+                "amendment). Pick exactly one of relative or "
+                "independent -- they are alternative parameterizations "
+                "for the same comparison contract."
+            )
+
+        if not hasattr(self, "optimizer"):
+            raise RuntimeError(
+                "initialize_independent_sides: must be called AFTER "
+                "declare_optimizer(args, warmup, max_iterations) so "
+                "the optimizer is available to attach param groups to."
+            )
+
+        # Clone the existing scalar raw density into both raw sides
+        # so softplus(raw_plus) == softplus(raw_minus) == softplus(density)
+        # at init (physical sides equal scalar at iter 0). The clone
+        # is detached so the existing density parameter's Adam state
+        # is not perturbed by this re-allocation.
+        N = self.density.shape[0]
+        with torch.no_grad():
+            self.raw_plus = nn.Parameter(self.density.detach().clone())
+            self.raw_minus = nn.Parameter(self.density.detach().clone())
+        # Validate the freshly cloned tensors (rejects bad init data).
+        if not (torch.isfinite(self.raw_plus).all()
+                and torch.isfinite(self.raw_minus).all()):
+            raise RuntimeError(
+                "initialize_independent_sides: cloned raw_plus/raw_minus "
+                "contain non-finite values; refusing to register."
+            )
+        if tuple(self.raw_plus.shape) != (N, 1) or tuple(self.raw_minus.shape) != (N, 1):
+            raise RuntimeError(
+                f"initialize_independent_sides: cloned raw shape mismatch "
+                f"(raw_plus={tuple(self.raw_plus.shape)}, "
+                f"raw_minus={tuple(self.raw_minus.shape)}, expected "
+                f"(N,1) with N={N})."
+            )
+
+        # Freeze the base density as a third density degree. Adam
+        # state for density is dropped so a hypothetical later
+        # requires_grad_(True) cannot drag the base density through
+        # stale momentum; the group is removed from the optimizer
+        # entirely so update_learning_rate / step cannot touch it.
+        self.density.requires_grad_(False)
+        self.optimizer.state.pop(self.density, None)
+        self.optimizer.param_groups = [
+            g for g in self.optimizer.param_groups if g["name"] != "density"
+        ]
+        # Mark the (now-removed) density group on the scene so a
+        # subsequent re-registration (e.g. on a stale checkpoint)
+        # can detect the conflict.
+        self._density_frozen = True
+
+        # Attach raw_plus / raw_minus as ordinary Adam groups with
+        # an identical native raw-side LR schedule. Same LR init and
+        # same cosine schedule on both -> schedules are equal at
+        # every iteration by construction (single shared scheduler).
+        existing = {g["name"] for g in self.optimizer.param_groups}
+        if "raw_plus" in existing or "raw_minus" in existing:
+            raise RuntimeError(
+                "initialize_independent_sides: raw_plus/raw_minus are "
+                "already registered in the optimizer; idempotent re-init "
+                "is not supported (call only once per scene)."
+            )
+        raw_side_lr_init = float(getattr(
+            args, "thin_surface_raw_side_lr_init", args.density_lr_init))
+        raw_side_lr_final = float(getattr(
+            args, "thin_surface_raw_side_lr_final", args.density_lr_final))
+        for name, param in (("raw_plus", self.raw_plus),
+                            ("raw_minus", self.raw_minus)):
+            self.optimizer.add_param_group({
+                "params": param,
+                "lr": raw_side_lr_init,
+                "name": name,
+            })
+        # A single shared cosine scheduler; both groups evaluate it
+        # at the same iteration, so the per-group LRs are bit-equal.
+        # Use the legacy density schedule's max_iterations so the
+        # raw-side cosine decays on the same horizon as the rest of
+        # the model. Iteration offset 0 (no thin_surface_start gating
+        # for the raw-side schedule; raw-side is always-on once
+        # activated and the cosine uses the configured max_iter).
+        self.raw_side_scheduler_args = get_cosine_lr_func(
+            lr_init=raw_side_lr_init,
+            lr_final=raw_side_lr_final,
+            warmup_steps=getattr(args, "warmup_steps", 0),
+            max_steps=int(self._max_iterations),
+        )
+
+        # Discriminator + bookkeeping. Independent mode does NOT
+        # flip `_thin_surface_active` (rendering is not active), so
+        # the existing kernel dispatch is unaffected. The mode flag
+        # drives the fail-fast gate in forward().
+        self._thin_surface_density_mode = "independent"
+        self._thin_surface_active = False   # rendering is not implemented
+        # Activation iter (so a future commit can gate raw-side
+        # logging / freezing on this; the raw-side schedule itself
+        # uses the legacy max_iter horizon, not this offset).
+        self._thin_surface_start = int(
+            getattr(args, "thin_surface_start", -1))
+        # Persisted scheduler cfg (matches the bounded-delta
+        # convention so save_pt can round-trip it).
+        self._raw_side_scheduler_cfg = {
+            "lr_init": raw_side_lr_init,
+            "lr_final": raw_side_lr_final,
+            "max_steps": int(self._max_iterations),
+        }
+        print(f"Initialized independent-side raw logits: "
+              f"N={N}, raw_plus==raw_minus==density at init "
+              f"(max abs diff = "
+              f"{(self.raw_plus - self.raw_minus).abs().max().item():.2e}), "
+              f"raw_side_lr=[{raw_side_lr_init:.2e} -> "
+              f"{raw_side_lr_final:.2e}], base density frozen "
+              f"(excluded from optimizer as third degree).")
+
     def initialize_gradients(self, args):
         N = self.primal_points.shape[0]
         self.density_grad = nn.Parameter(
@@ -1834,7 +2024,35 @@ class CTScene(torch.nn.Module):
         Registers density_delta, quaternions, texel_sites_2d, texel_heights as
         learnable parameters and adds them to the optimizer with separate
         (lower) learning rates.
+
+        Mode dispatch (LC64 plan v3): when
+        ``args.thin_surface_density_mode == "independent"``, this method
+        short-circuits to ``initialize_independent_sides(args)`` and does
+        not register any of the four thin-surface tensors (which are not
+        part of the independent parameterization). Scalar / absolute /
+        relative modes take the legacy path.
         """
+        # LC64 plan v3 mode dispatch. Independent mode uses a different
+        # parameterization (raw_plus / raw_minus) and does not need the
+        # four thin-surface tensors; route the call accordingly and
+        # leave `_thin_surface_active` False (rendering is not
+        # implemented in this commit; forward() raises on this mode).
+        _mode = getattr(args, "thin_surface_density_mode", "scalar")
+        if _mode == "independent":
+            return self.initialize_independent_sides(args)
+        # Default / legacy path. Record the discriminator so save_pt /
+        # load_pt can round-trip it explicitly (legacy checkpoints
+        # without the discriminator will infer this on load). If the
+        # caller explicitly passed a non-scalar density_mode we
+        # respect it; otherwise infer from thin_surface_relative_delta
+        # (which is the legacy discriminator for the bounded-delta arm).
+        _explicit_mode = getattr(args, "thin_surface_density_mode", "scalar")
+        if _explicit_mode in ("absolute", "relative"):
+            self._thin_surface_density_mode = _explicit_mode
+        else:
+            self._thin_surface_density_mode = (
+                "relative" if getattr(args, "thin_surface_relative_delta", False)
+                else "absolute")
         assert_supported_thin_K(K)
         N = self.primal_points.shape[0]
         device = self.device
@@ -2070,6 +2288,58 @@ class CTScene(torch.nn.Module):
                 p.grad.clamp_(-c, c)
 
     @torch.no_grad()
+    def independent_side_diagnostics(self):
+        """Read-only diagnostics for the LC64 plan v3 independent-side
+        raw logits. Returns a dict of numeric stats (TensorBoard-safe)
+        or None when the mode is not active. Does NOT alter losses or
+        rendering -- a pure observability hook.
+
+        Reported keys:
+          - side_raw_plus_mean / p95 / max     raw logit stats
+          - side_raw_minus_mean / p95 / max    raw logit stats
+          - side_physical_plus_mean           softplus(raw_plus) mean
+          - side_physical_minus_mean          softplus(raw_minus) mean
+          - side_physical_contrast_mean       mean of physical
+                                              |mu_plus - mu_minus|
+          - side_physical_contrast_p95        p95 of same
+          - side_physical_contrast_max        max of same
+          - side_raw_diff_mean                raw |plus - minus| mean
+          - base_density_frozen               1 if the base density is
+                                              currently frozen (third
+                                              degree excluded from the
+                                              optimizer), else 0
+        """
+        if not self._raw_side_active():
+            return None
+        rp = self.raw_plus.detach().squeeze(-1)
+        rm = self.raw_minus.detach().squeeze(-1)
+        if not (torch.isfinite(rp).all() and torch.isfinite(rm).all()):
+            return {"raw_nonfinite": 1.0}
+        mu_p = torch.nn.functional.softplus(rp, beta=10.0)
+        mu_m = torch.nn.functional.softplus(rm, beta=10.0)
+        contrast = (mu_p - mu_m).abs()
+        raw_diff = (rp - rm).abs()
+        q = 0.95
+        return {
+            "side_raw_plus_mean": rp.mean().item(),
+            "side_raw_plus_p95": (rp.float().quantile(q).item()
+                                   if rp.numel() else 0.0),
+            "side_raw_plus_max": rp.abs().max().item(),
+            "side_raw_minus_mean": rm.mean().item(),
+            "side_raw_minus_p95": (rm.float().quantile(q).item()
+                                    if rm.numel() else 0.0),
+            "side_raw_minus_max": rm.abs().max().item(),
+            "side_physical_plus_mean": mu_p.mean().item(),
+            "side_physical_minus_mean": mu_m.mean().item(),
+            "side_physical_contrast_mean": contrast.mean().item(),
+            "side_physical_contrast_p95": (contrast.float().quantile(q).item()
+                                            if contrast.numel() else 0.0),
+            "side_physical_contrast_max": contrast.max().item(),
+            "side_raw_diff_mean": raw_diff.mean().item(),
+            "base_density_frozen": 1.0 if getattr(self, "_density_frozen",
+                                                    False) else 0.0,
+        }
+
     def thin_surface_diagnostics(self):
         """P0-F stats for TensorBoard. Returns dict or None if inactive.
 
@@ -2262,6 +2532,23 @@ class CTScene(torch.nn.Module):
         coh_sq = (dot * dot).mean().item()
         flip_frac = (dot < 0).float().mean().item()
         return coh_sq, flip_frac
+
+    def _raw_side_active(self):
+        """True iff the LC64 plan v3 independent-side raw logits are
+        registered on the scene. Used by replacement paths
+        (permute / prune / densify) to decide whether to align
+        raw_plus / raw_minus with primal_points, and by save_pt /
+        load_pt to decide whether to write the discriminator +
+        raw tensors into the checkpoint.
+
+        Independent mode is opt-in via
+        ``initialize_independent_sides``; until then this returns
+        False and the raw sides are silently absent from every
+        replacement / checkpoint path. Safe to call before
+        ``initialize_independent_sides`` (no AttributeError).
+        """
+        return (getattr(self, "_thin_surface_density_mode", "scalar")
+                == "independent")
 
     def _hard_freeze_threshold(self):
         """Safe getter for the hard-freeze threshold (default -1)."""
@@ -2459,6 +2746,16 @@ class CTScene(torch.nn.Module):
                     param_group["lr"] = self.thin_surface_scheduler_args(
                         iteration - self._thin_surface_start
                     )
+            elif param_group["name"] in ("raw_plus", "raw_minus"):
+                # LC64 plan v3 -- native raw-side Adam schedule. Both
+                # groups share a single scheduler (identical LR at
+                # every iteration by construction); the cosine LR is
+                # exactly the same value for raw_plus and raw_minus,
+                # so the per-group "equal schedule" contract holds
+                # without any per-group argmax/argmin claim.
+                _sched = getattr(self, "raw_side_scheduler_args", None)
+                if _sched is not None:
+                    param_group["lr"] = _sched(iteration)
 
     def prune_optimizer(self, mask):
         optimizable_tensors = {}
@@ -2486,7 +2783,12 @@ class CTScene(torch.nn.Module):
         valid_points_mask = ~prune_mask
         optimizable_tensors = self.prune_optimizer(valid_points_mask)
         self.primal_points = optimizable_tensors["primal_points"]
-        self.density = optimizable_tensors["density"]
+        # LC64 plan v3 -- density is only present in the optimizer
+        # when not in independent mode (initialize_independent_sides
+        # drops it). Guard the assignment to keep scalar / relative /
+        # absolute paths unchanged.
+        if "density" in optimizable_tensors:
+            self.density = optimizable_tensors["density"]
         if "density_grad" in optimizable_tensors:
             self.density_grad = optimizable_tensors["density_grad"]
         if "density_peak" in optimizable_tensors:
@@ -2503,6 +2805,12 @@ class CTScene(torch.nn.Module):
             self.texel_sites_2d = optimizable_tensors["texel_sites_2d"]
         if "texel_heights" in optimizable_tensors:
             self.texel_heights = optimizable_tensors["texel_heights"]
+        # LC64 plan v3 -- prune the independent raw sides in lock-step
+        # so they stay aligned with the surviving primal_points rows.
+        if "raw_plus" in optimizable_tensors:
+            self.raw_plus = optimizable_tensors["raw_plus"]
+        if "raw_minus" in optimizable_tensors:
+            self.raw_minus = optimizable_tensors["raw_minus"]
         if hasattr(self, '_starvation_count'):
             self._starvation_count = self._starvation_count[valid_points_mask]
         if hasattr(self, '_frozen_mask'):
@@ -2592,7 +2900,12 @@ class CTScene(torch.nn.Module):
         n_new = new_params["primal_points"].shape[0]
         optimizable_tensors = self.cat_tensors_to_optimizer(new_params)
         self.primal_points = optimizable_tensors["primal_points"]
-        self.density = optimizable_tensors["density"]
+        # LC64 plan v3 -- density is absent from the optimizer under
+        # independent mode; new_params never contains "density" in
+        # that case (initialize_independent_sides dropped it). Guard
+        # so legacy / absolute / relative paths are unaffected.
+        if "density" in optimizable_tensors:
+            self.density = optimizable_tensors["density"]
         if "density_grad" in optimizable_tensors:
             self.density_grad = optimizable_tensors["density_grad"]
         if "density_peak" in optimizable_tensors:
@@ -2609,6 +2922,33 @@ class CTScene(torch.nn.Module):
             self.texel_sites_2d = optimizable_tensors["texel_sites_2d"]
         if "texel_heights" in optimizable_tensors:
             self.texel_heights = optimizable_tensors["texel_heights"]
+        # LC64 plan v3 -- densify the independent raw sides. New
+        # cells get fresh raw_plus/raw_minus = 0 (matching the
+        # legacy IDW-init pattern for `density`: a new cell starts
+        # at the densify init value rather than inheriting a
+        # parent's value, so the optimizer learns it from scratch).
+        if ("raw_plus" in optimizable_tensors
+                and "raw_minus" in optimizable_tensors):
+            self.raw_plus = optimizable_tensors["raw_plus"]
+            self.raw_minus = optimizable_tensors["raw_minus"]
+        elif self._raw_side_active():
+            # Densification fires while independent mode is active:
+            # neither raw_plus nor raw_minus was in the densify
+            # payload, so allocate zero-initialised extensions in
+            # lock-step with the new primal_points rows. Without
+            # this, the optimizer's cat_tensors_to_optimizer would
+            # skip the raw sides and the next step would crash on
+            # a shape mismatch with the Adam state.
+            dev = self.primal_points.device
+            new_raw_plus = torch.zeros(n_new, 1, device=dev)
+            new_raw_minus = torch.zeros(n_new, 1, device=dev)
+            if "raw_plus" not in optimizable_tensors:
+                optimizable_tensors.update(self.cat_tensors_to_optimizer({
+                    "raw_plus": new_raw_plus,
+                    "raw_minus": new_raw_minus,
+                }))
+                self.raw_plus = optimizable_tensors["raw_plus"]
+                self.raw_minus = optimizable_tensors["raw_minus"]
         if hasattr(self, '_starvation_count'):
             self._starvation_count = torch.cat([
                 self._starvation_count,
@@ -3003,6 +3343,17 @@ class CTScene(torch.nn.Module):
                 new_params["density_peak"] = sampled_peak
                 new_params["delta_raw"] = sampled_dr
                 new_params["cov_raw"] = sampled_cov
+            # LC64 plan v3 -- densify independent raw sides in lock-step
+            # with primal_points. New cells get fresh zero-initialised
+            # raw_plus/raw_minus (zero activation via softplus), so a
+            # densified cell starts as a transparent air cell rather
+            # than inheriting a parent's value. The optimizer learns
+            # both sides from scratch.
+            if self._raw_side_active():
+                n_s = sampled_points.shape[0]
+                dev = sampled_points.device
+                new_params["raw_plus"] = torch.zeros(n_s, 1, device=dev)
+                new_params["raw_minus"] = torch.zeros(n_s, 1, device=dev)
             if getattr(self, "_thin_surface_active", False):
                 n_s = sampled_points.shape[0]
                 K = getattr(self, "_thin_K", 4)
@@ -3211,6 +3562,61 @@ class CTScene(torch.nn.Module):
                 "delta_max_frac": float(
                     getattr(self, "_thin_surface_delta_max_frac", 0.5)),
             }
+        # LC64 plan v3 -- independent-side raw logits + discriminator.
+        # The discriminator is stored alongside the bounded-delta
+        # metadata (under the `thin_surface` key for backward-compat
+        # layout) so a single `thin_surface` block carries the full
+        # density-mode state. A mixed-state checkpoint (relative_delta
+        # and density_mode="independent") is rejected at save time so
+        # the discriminator never observes a contradiction.
+        if self._raw_side_active():
+            # Mutually exclusive with the bounded relative-delta path.
+            if getattr(self, "_thin_surface_relative_delta", False):
+                raise RuntimeError(
+                    "save_pt: _thin_surface_density_mode='independent' is "
+                    "active but _thin_surface_relative_delta is also True; "
+                    "this is a mutually-exclusive mixed state and the "
+                    "checkpoint would be malformed. Pick exactly one."
+                )
+            rp = self.raw_plus.detach().float().cpu()
+            rm = self.raw_minus.detach().float().cpu()
+            # Shape / finite validation: independent tensors must be
+            # (N, 1) and finite. A regression here would silently
+            # round-trip a NaN into the next training run.
+            if not (torch.isfinite(rp).all() and torch.isfinite(rm).all()):
+                raise RuntimeError(
+                    "save_pt: raw_plus / raw_minus contain non-finite "
+                    "values; refusing to write a malformed checkpoint."
+                )
+            N_pp = self.primal_points.shape[0]
+            if tuple(rp.shape) != (N_pp, 1) or tuple(rm.shape) != (N_pp, 1):
+                raise RuntimeError(
+                    f"save_pt: raw shape mismatch (raw_plus={tuple(rp.shape)}, "
+                    f"raw_minus={tuple(rm.shape)}, expected (N,1) with "
+                    f"N={N_pp})."
+                )
+            scene_data["raw_plus"] = rp
+            scene_data["raw_minus"] = rm
+            # Merge into (or create) the `thin_surface` metadata block.
+            # Keep `active=False` for the rendering gate (independent
+            # mode's CUDA path is not implemented in this commit) but
+            # record `density_mode='independent'` so load_pt restores
+            # the discriminator verbatim. The legacy `relative_delta`
+            # field stays False here -- the mutually exclusive check
+            # above would have raised otherwise.
+            ts_meta = scene_data.get("thin_surface", None)
+            if not isinstance(ts_meta, dict):
+                ts_meta = {}
+            ts_meta.update({
+                "active": False,   # rendering not implemented yet
+                "density_mode": "independent",
+                "relative_delta": False,  # forced by mutual exclusion
+                "raw_side_scheduler_cfg": getattr(
+                    self, "_raw_side_scheduler_cfg", None),
+                "raw_side_start": int(
+                    getattr(self, "_thin_surface_start", -1)),
+            })
+            scene_data["thin_surface"] = ts_meta
         torch.save(scene_data, pt_path)
 
     def load_pt(self, pt_path):
@@ -3273,6 +3679,103 @@ class CTScene(torch.nn.Module):
                   f"N={self.primal_points.shape[0]}, "
                   f"relative_delta={self._thin_surface_relative_delta}, "
                   f"rho={self._thin_surface_delta_max_frac}")
+
+        # LC64 plan v3 -- independent-side raw logits + discriminator.
+        # The discriminator (`density_mode`) lives inside the
+        # `thin_surface` metadata block; when set to "independent" the
+        # load path restores raw_plus / raw_minus as Parameters and
+        # wires the scheduler cfg. Mixed-state rejection (relative_delta
+        # AND density_mode='independent') is enforced here so a
+        # malformed checkpoint fails loudly on resume instead of
+        # silently picking one parameterization. Legacy checkpoints
+        # without a density_mode key infer the existing mode from the
+        # pre-existing thin_surface fields -- "scalar" when the
+        # bounded-delta block is inactive, "absolute" / "relative" when
+        # it's active and the relative flag is set accordingly.
+        if "thin_surface" in scene_data and isinstance(
+                scene_data["thin_surface"], dict):
+            meta = scene_data["thin_surface"]
+            loaded_mode = meta.get("density_mode", None)
+            if loaded_mode is None:
+                # Legacy inference -- never expose "independent" for a
+                # checkpoint that didn't carry the discriminator.
+                if meta.get("active", False):
+                    self._thin_surface_density_mode = (
+                        "relative" if meta.get("relative_delta", False)
+                        else "absolute")
+                else:
+                    self._thin_surface_density_mode = "scalar"
+            else:
+                # Explicit discriminator. Mixed state is a malformed
+                # checkpoint -- reject with a clear error.
+                if loaded_mode == "independent":
+                    if meta.get("relative_delta", False):
+                        raise RuntimeError(
+                            "load_pt: malformed checkpoint -- "
+                            "thin_surface.density_mode='independent' "
+                            "but relative_delta is also True. The two "
+                            "modes are mutually exclusive (LC64 plan "
+                            "v3); this checkpoint cannot be resumed."
+                        )
+                    if "raw_plus" not in scene_data or "raw_minus" not in scene_data:
+                        raise RuntimeError(
+                            "load_pt: malformed checkpoint -- "
+                            "density_mode='independent' requires raw_plus "
+                            "and raw_minus tensors; missing one or both."
+                        )
+                    rp = scene_data["raw_plus"].to(self.device)
+                    rm = scene_data["raw_minus"].to(self.device)
+                    N_pp = self.primal_points.shape[0]
+                    if (tuple(rp.shape) != (N_pp, 1)
+                            or tuple(rm.shape) != (N_pp, 1)):
+                        raise RuntimeError(
+                            f"load_pt: malformed checkpoint -- raw shape "
+                            f"mismatch (raw_plus={tuple(rp.shape)}, "
+                            f"raw_minus={tuple(rm.shape)}, expected "
+                            f"(N,1) with N={N_pp})."
+                        )
+                    if not (torch.isfinite(rp).all()
+                            and torch.isfinite(rm).all()):
+                        raise RuntimeError(
+                            "load_pt: malformed checkpoint -- raw_plus / "
+                            "raw_minus contain non-finite values."
+                        )
+                    self.raw_plus = nn.Parameter(rp)
+                    self.raw_minus = nn.Parameter(rm)
+                    self._thin_surface_density_mode = "independent"
+                    # Rendering gate stays False: forward() raises on
+                    # this mode until the CUDA branch lands.
+                    self._thin_surface_active = False
+                    self._raw_side_scheduler_cfg = meta.get(
+                        "raw_side_scheduler_cfg", None)
+                    self._thin_surface_start = int(meta.get(
+                        "raw_side_start",
+                        meta.get("start", -1)))
+                    # Force the legacy relative flag off (mixed state
+                    # was already rejected above; this is the safe
+                    # secondary guard).
+                    self._thin_surface_relative_delta = False
+                    print(f"[load_pt] restored independent-side state: "
+                          f"N={N_pp}, raw_side_lr_cfg="
+                          f"{self._raw_side_scheduler_cfg}")
+                else:
+                    # Explicit non-independent discriminator -- only
+                    # safe values are "scalar", "absolute", "relative".
+                    if loaded_mode not in ("scalar", "absolute", "relative"):
+                        raise RuntimeError(
+                            f"load_pt: unknown thin_surface.density_mode="
+                            f"{loaded_mode!r}; expected one of "
+                            f"'scalar', 'absolute', 'relative', "
+                            f"'independent'."
+                        )
+                    self._thin_surface_density_mode = loaded_mode
+        else:
+            # No thin_surface metadata at all -- definitely legacy.
+            # Don't override the __init__ default ("scalar") unless a
+            # legacy thin-surface block was loaded above, in which case
+            # the legacy inference already set the discriminator.
+            if not hasattr(self, "_thin_surface_density_mode"):
+                self._thin_surface_density_mode = "scalar"
 
         self.point_adjacency = scene_data["adjacency"].to(self.device).to(
             torch.uint32)

@@ -438,29 +438,37 @@ def test_get_trace_data_unchanged():
     """The freeze must not change get_trace_data's tuple length (which is
     part of the forward() signature).  This is the production correctness
     contract from the prior emergency-restore note.
+
+    LC64 plan v3 (Commit 1): the tuple is now 15 elements --
+    raw_plus / raw_minus are appended after the four thin-surface
+    tensors so forward() can unpack unconditionally across scalar /
+    absolute / relative / independent modes. The new fields are
+    None when the independent-side mode is not active, so legacy
+    callers that key on the original 13 entries are unaffected.
     """
     print("\n--- Test 7: get_trace_data unchanged ---")
     scene = _make_scene(threshold=500)
     # Pre-freeze.
     td = scene.get_trace_data()
     pre_len = len(td)
-    check(pre_len == 13,
-          f"pre-freeze get_trace_data length == 13 (got {pre_len})")
+    check(pre_len == 15,
+          f"pre-freeze get_trace_data length == 15 (got {pre_len})")
     # Post-freeze.
     scene.enforce_hard_point_freeze(500)
     td2 = scene.get_trace_data()
     post_len = len(td2)
-    check(post_len == 13,
-          f"post-freeze get_trace_data length == 13 (got {post_len})")
+    check(post_len == 15,
+          f"post-freeze get_trace_data length == 15 (got {post_len})")
 
 
 # ===========================================================================
 # Test 8: forward() contract intact when thin-surface is disabled.
 # ===========================================================================
 def test_forward_signature_intact():
-    """forward() unpacks get_trace_data as a 13-tuple.  This smoke uses
-    the legacy scalar-mode (thin_surface_active=False) and verifies the
-    tuple shape survives the freeze.
+    """forward() unpacks get_trace_data as a 15-tuple (LC64 plan v3
+    Commit 1: raw_plus / raw_minus appended at the end).  This smoke
+    uses the legacy scalar-mode (thin_surface_active=False) and
+    verifies the tuple shape survives the freeze.
     """
     print("\n--- Test 8: forward signature intact (legacy scalar) ---")
     scene = _make_scene(threshold=500)
@@ -478,9 +486,10 @@ def test_forward_signature_intact():
         5.0,             # gradient_max_slope default
         None, None, None,  # density_peak, delta_raw, cov_raw
         None, None, None, None,  # thin-surface tensors (not initialized)
+        None, None,  # raw_plus, raw_minus (LC64 plan v3)
     )
-    check(len(td) == len(expected) == 13,
-          f"get_trace_data returns 13-tuple (got {len(td)})")
+    check(len(td) == len(expected) == 15,
+          f"get_trace_data returns 15-tuple (got {len(td)})")
 
 
 # ===========================================================================
