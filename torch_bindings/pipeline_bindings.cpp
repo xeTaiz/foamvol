@@ -499,8 +499,7 @@ py::object trace_backward(Pipeline &self,
                           bool thin_surface_relative_delta,
                           float thin_surface_delta_max_frac,
                           // LC64 plan v3 Commit 2A -- independent-side raw
-                          // logits (FW shape only; backward under this mode
-                          // is explicitly rejected below).
+                          // logits consumed by the CUDA-native forward/backward paths.
                           std::optional<torch::Tensor> raw_plus_in,
                           std::optional<torch::Tensor> raw_minus_in,
                           bool thin_surface_independent_mode,
@@ -554,6 +553,61 @@ py::object trace_backward(Pipeline &self,
     uint32_t num_points = points.size(0);
     uint32_t point_adjacency_size = point_adjacency.size(0);
     uint32_t num_rays = rays.numel() / 6;
+
+    // LC64 plan v3 Commit 2B -- independent-side raw logits are read
+    // by the new ct_independent_backward kernel under the same
+    // discriminator as the forward.  Validate before any kernel launch
+    // so mixed / missing inputs are caught at the binding, mirroring
+    // the trace_forward contract.
+    bool has_raw_plus_b  = raw_plus_in.has_value();
+    bool has_raw_minus_b = raw_minus_in.has_value();
+    torch::Tensor raw_plus_t_b;
+    torch::Tensor raw_minus_t_b;
+    if (has_raw_plus_b)  raw_plus_t_b  = raw_plus_in.value().contiguous();
+    if (has_raw_minus_b) raw_minus_t_b = raw_minus_in.value().contiguous();
+    if (thin_surface_independent_mode) {
+        if (!thin_surface_mode) {
+            throw std::runtime_error(
+                "trace_backward: thin_surface_independent_mode=True "
+                "requires thin_surface_mode=True.");
+        }
+        if (!has_raw_plus_b || !has_raw_minus_b) {
+            throw std::runtime_error(
+                "trace_backward: thin_surface_independent_mode=True "
+                "requires both raw_plus and raw_minus tensors (each "
+                "(N,1)). Missing: "
+                + std::string(has_raw_plus_b ? "" : "raw_plus ")
+                + std::string(has_raw_minus_b ? "" : "raw_minus"));
+        }
+        if (raw_plus_t_b.scalar_type() != at::kFloat ||
+            raw_minus_t_b.scalar_type() != at::kFloat) {
+            throw std::runtime_error(
+                "trace_backward: raw_plus / raw_minus must have "
+                "float32 dtype under thin_surface_independent_mode.");
+        }
+        if (raw_plus_t_b.device().type() != at::kCUDA ||
+            raw_minus_t_b.device().type() != at::kCUDA) {
+            throw std::runtime_error(
+                "trace_backward: raw_plus / raw_minus must be on a "
+                "CUDA device under thin_surface_independent_mode.");
+        }
+        if (raw_plus_t_b.size(0) != num_points ||
+            raw_minus_t_b.size(0) != num_points) {
+            throw std::runtime_error(
+                "trace_backward: raw_plus / raw_minus must have "
+                "num_points rows under thin_surface_independent_mode "
+                "(got " + std::to_string(raw_plus_t_b.size(0)) +
+                " vs " + std::to_string(num_points) + ").");
+        }
+    } else {
+        if (has_raw_plus_b || has_raw_minus_b) {
+            throw std::runtime_error(
+                "trace_backward: raw_plus / raw_minus must be None "
+                "when thin_surface_independent_mode is False (legacy "
+                "/ absolute / relative thin-surface path). Mixed "
+                "inputs are rejected before kernel launch.");
+        }
+    }
 
     if (rays.size(-1) != 6) {
         throw std::runtime_error("rays must have 6 as the last dimension");
@@ -640,22 +694,6 @@ py::object trace_backward(Pipeline &self,
             std::to_string(thin_K) + "); CUDA backward w_arr[8] hard cap.");
     }
 
-    // LC64 plan v3 Commit 2A -- independent-side backward is NOT
-    // implemented in this commit.  Reject at the binding so a backward
-    // call under independent mode fails fast with a clear error
-    // (Python's TraceRays.backward also raises NotImplementedError;
-    // this guard catches direct C++ callers and a future regression
-    // where the Python check is dropped).
-    if (thin_surface_independent_mode) {
-        throw std::runtime_error(
-            "trace_backward: independent-side backward is not "
-            "implemented in LC64 plan v3 Commit 2A. The forward "
-            "path renders raw_plus / raw_minus via "
-            "ct_independent_forward (Commit 2A); the backward "
-            "path lands in Commit 2B. Until then, calling backward "
-            "under thin_surface_independent_mode is a hard error.");
-    }
-
     bool has_density_delta = density_delta_in.has_value();
     torch::Tensor density_delta_t;
     if (has_density_delta) density_delta_t = density_delta_in.value().contiguous();
@@ -717,6 +755,10 @@ py::object trace_backward(Pipeline &self,
         density_delta_grad_t = torch::zeros(
             {(int64_t)num_points, 1},
             torch::dtype(torch::kFloat32).device(rays.device()));
+    }
+    // Geometry gradients are required by both legacy delta and independent
+    // side-density modes. Independent mode intentionally has no density_delta.
+    if (thin_surface_mode && (has_density_delta || thin_surface_independent_mode)) {
         quaternions_grad_t = torch::zeros(
             {(int64_t)num_points, 4},
             torch::dtype(torch::kFloat32).device(rays.device()));
@@ -728,7 +770,81 @@ py::object trace_backward(Pipeline &self,
             torch::dtype(torch::kFloat32).device(rays.device()));
     }
 
+    // LC64 plan v3 Commit 2B -- independent-side raw logits get
+    // (N, 1) gradient tensors that the kernel atomicAdd's into.  The
+    // legacy base density gradient (attr_grad) is left as a zero
+    // tensor: under independent mode the optimizer does not step the
+    // frozen base density, and the Python TraceRays.backward returns
+    // None in the corresponding autograd slot.
+    torch::Tensor raw_plus_grad_t, raw_minus_grad_t;
+    if (thin_surface_independent_mode) {
+        raw_plus_grad_t = torch::zeros(
+            {(int64_t)num_points, 1},
+            torch::dtype(torch::kFloat32).device(rays.device()));
+        raw_minus_grad_t = torch::zeros(
+            {(int64_t)num_points, 1},
+            torch::dtype(torch::kFloat32).device(rays.device()));
+    }
+
     set_default_stream();
+
+    // LC64 plan v3 Commit 2B -- C++ ternary does NOT short-circuit,
+    // so we cannot write
+    //     (cond) ? tensor.data_ptr() : nullptr
+    // for an uninitialized tensor (data_ptr() throws).  Build every
+    // pointer into a local via explicit if/else so the read is
+    // guarded by the same condition that allocated the tensor.
+    const float *p_density_delta_in = nullptr;
+    const float *p_quaternions_in = nullptr;
+    const float *p_texel_sites_2d_in = nullptr;
+    const float *p_texel_heights_in = nullptr;
+    float *p_density_delta_grad_out = nullptr;
+    float *p_quaternions_grad_out = nullptr;
+    float *p_texel_sites_2d_grad_out = nullptr;
+    float *p_texel_heights_grad_out = nullptr;
+    const float *p_raw_plus_in = nullptr;
+    const float *p_raw_minus_in = nullptr;
+    float *p_raw_plus_grad_out = nullptr;
+    float *p_raw_minus_grad_out = nullptr;
+    float *p_density_peak_grad_out = nullptr;
+    float *p_delta_raw_grad_out = nullptr;
+    float *p_cov_raw_grad_out = nullptr;
+
+    if (thin_surface_mode && has_density_delta) {
+        p_density_delta_in = reinterpret_cast<const float *>(density_delta_t.data_ptr());
+        p_density_delta_grad_out = reinterpret_cast<float *>(density_delta_grad_t.data_ptr());
+    }
+    if (thin_surface_mode && has_quaternions) {
+        p_quaternions_in = reinterpret_cast<const float *>(quaternions_t.data_ptr());
+        p_quaternions_grad_out = reinterpret_cast<float *>(quaternions_grad_t.data_ptr());
+    }
+    if (thin_surface_mode && has_texel_sites) {
+        p_texel_sites_2d_in = reinterpret_cast<const float *>(texel_sites_t.data_ptr());
+        p_texel_sites_2d_grad_out = reinterpret_cast<float *>(texel_sites_grad_t.data_ptr());
+    }
+    if (thin_surface_mode && has_texel_heights) {
+        p_texel_heights_in = reinterpret_cast<const float *>(texel_heights_t.data_ptr());
+        p_texel_heights_grad_out = reinterpret_cast<float *>(texel_heights_grad_t.data_ptr());
+    }
+    if (thin_surface_independent_mode && has_raw_plus_b) {
+        p_raw_plus_in = reinterpret_cast<const float *>(raw_plus_t_b.data_ptr());
+    }
+    if (thin_surface_independent_mode && has_raw_minus_b) {
+        p_raw_minus_in = reinterpret_cast<const float *>(raw_minus_t_b.data_ptr());
+    }
+    if (thin_surface_independent_mode) {
+        p_raw_plus_grad_out = reinterpret_cast<float *>(raw_plus_grad_t.data_ptr());
+        p_raw_minus_grad_out = reinterpret_cast<float *>(raw_minus_grad_t.data_ptr());
+    }
+    if (gaussian_mode && has_density_peak) {
+        p_density_peak_grad_out = reinterpret_cast<float *>(density_peak_grad_t.data_ptr());
+    }
+    if (gaussian_mode && has_delta_raw) {
+        p_delta_raw_grad_out = reinterpret_cast<float *>(delta_raw_grad_t.data_ptr());
+    }
+    if (gaussian_mode && has_cov_raw) {
+        p_cov_raw_grad_out = reinterpret_cast<float *>(cov_raw_grad_t.data_ptr());
+    }
 
     self.trace_backward(
         settings,
@@ -766,49 +882,28 @@ py::object trace_backward(Pipeline &self,
         has_cov_raw
             ? reinterpret_cast<const float *>(cov_raw_t.data_ptr())
             : nullptr,
-        (gaussian_mode && has_density_peak)
-            ? reinterpret_cast<float *>(density_peak_grad_t.data_ptr())
-            : nullptr,
-        (gaussian_mode && has_delta_raw)
-            ? reinterpret_cast<float *>(delta_raw_grad_t.data_ptr())
-            : nullptr,
-        (gaussian_mode && has_cov_raw)
-            ? reinterpret_cast<float *>(cov_raw_grad_t.data_ptr())
-            : nullptr,
-        (thin_surface_mode && has_density_delta)
-            ? reinterpret_cast<const float *>(density_delta_t.data_ptr())
-            : nullptr,
-        (thin_surface_mode && has_quaternions)
-            ? reinterpret_cast<const float *>(quaternions_t.data_ptr())
-            : nullptr,
-        (thin_surface_mode && has_texel_sites)
-            ? reinterpret_cast<const float *>(texel_sites_t.data_ptr())
-            : nullptr,
-        (thin_surface_mode && has_texel_heights)
-            ? reinterpret_cast<const float *>(texel_heights_t.data_ptr())
-            : nullptr,
-        (thin_surface_mode && has_density_delta)
-            ? reinterpret_cast<float *>(density_delta_grad_t.data_ptr())
-            : nullptr,
-        (thin_surface_mode && has_quaternions)
-            ? reinterpret_cast<float *>(quaternions_grad_t.data_ptr())
-            : nullptr,
-        (thin_surface_mode && has_texel_sites)
-            ? reinterpret_cast<float *>(texel_sites_grad_t.data_ptr())
-            : nullptr,
-        (thin_surface_mode && has_texel_heights)
-            ? reinterpret_cast<float *>(texel_heights_grad_t.data_ptr())
-            : nullptr,
-        // LC64 plan v3 Commit 2A -- independent-side raw logits.  The
-        // C++ binding rejects independent-mode backward above before
-        // any kernel launch, so the data pointers here are only used
-        // in the legacy code paths (None when independent_mode=False).
-        thin_surface_independent_mode && raw_plus_in.has_value()
-            ? reinterpret_cast<const float *>(raw_plus_in.value().data_ptr())
-            : nullptr,
-        thin_surface_independent_mode && raw_minus_in.has_value()
-            ? reinterpret_cast<const float *>(raw_minus_in.value().data_ptr())
-            : nullptr);
+        p_density_peak_grad_out,
+        p_delta_raw_grad_out,
+        p_cov_raw_grad_out,
+        p_density_delta_in,
+        p_quaternions_in,
+        p_texel_sites_2d_in,
+        p_texel_heights_in,
+        p_density_delta_grad_out,
+        p_quaternions_grad_out,
+        p_texel_sites_2d_grad_out,
+        p_texel_heights_grad_out,
+        // LC64 plan v3 Commit 2B -- independent-side raw logits +
+        // per-cell raw gradients.  The forward pointers and the
+        // output pointers are both non-null only when
+        // thin_surface_independent_mode is True; otherwise both are
+        // nullptr and the legacy / absolute / relative branch is
+        // taken.  Raw gradient tensors are allocated above and
+        // atomicAdd'd by ct_independent_backward.
+        p_raw_plus_in,
+        p_raw_minus_in,
+        p_raw_plus_grad_out,
+        p_raw_minus_grad_out);
 
     py::dict output_dict;
 
@@ -824,9 +919,15 @@ py::object trace_backward(Pipeline &self,
     }
     if (thin_surface_mode && has_density_delta) {
         output_dict["density_delta_grad"] = density_delta_grad_t;
+    }
+    if (thin_surface_mode && (has_density_delta || thin_surface_independent_mode)) {
         output_dict["quaternions_grad"] = quaternions_grad_t;
         output_dict["texel_sites_2d_grad"] = texel_sites_grad_t;
         output_dict["texel_heights_grad"] = texel_heights_grad_t;
+    }
+    if (thin_surface_independent_mode) {
+        output_dict["raw_plus_grad"] = raw_plus_grad_t;
+        output_dict["raw_minus_grad"] = raw_minus_grad_t;
     }
     if (return_error) {
         output_dict["point_error"] = point_error;

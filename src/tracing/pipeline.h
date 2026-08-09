@@ -234,12 +234,19 @@ class Pipeline {
                                 float *quaternions_grad = nullptr,
                                 float *texel_sites_2d_grad = nullptr,
                                 float *texel_heights_grad = nullptr,
-                                // LC64 plan v3 Commit 2A -- independent-side
-                                // raw logits (FW shape only; backward is
-                                // Commit 2B and a backward call under
-                                // independent mode raises at the binding).
+                                // LC64 plan v3 Commit 2B -- independent-side
+                                // raw logits + their per-cell gradients.
+                                // raw_plus / raw_minus are read when
+                                // settings.thin_surface_independent_mode is
+                                // true; raw_plus_grad / raw_minus_grad
+                                // accumulate dL/draw_p, dL/draw_n via the
+                                // chain rule  dmu_side / draw_side =
+                                // activation_scale * sigmoid(beta * raw_side).
+                                // nullptr in legacy / absolute / relative mode.
                                 const float *raw_plus = nullptr,
-                                const float *raw_minus = nullptr) = 0;
+                                const float *raw_minus = nullptr,
+                                float *raw_plus_grad = nullptr,
+                                float *raw_minus_grad = nullptr) = 0;
 
     // Stub for viewer compatibility — CT pipeline does not implement this
     virtual void trace_visualization(const TraceSettings &settings,
