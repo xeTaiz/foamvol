@@ -347,35 +347,50 @@ def test_trace_data_appends_raw_sides():
 
 
 # ---------------------------------------------------------------------------
-# Test 6: forward() raises NotImplementedError under independent mode.
+# Test 6: forward() under independent mode dispatches to CUDA (Commit 2A).
 # ---------------------------------------------------------------------------
-def test_forward_fail_fast_under_independent_mode():
-    """forward() must raise NotImplementedError when the discriminator
-    `_thin_surface_density_mode == "independent"`.  A silent fallback to
-    the scalar baseline is explicitly forbidden by the spec."""
-    print("\n--- Test 6: forward() fail-fast under independent mode ---")
+def test_forward_dispatches_to_cuda_under_independent_mode():
+    """Commit 2A: the Commit-1 NotImplementedError has been replaced with
+    a CUDA dispatch.  The CPU-only radfoam stub cannot run the kernel;
+    it must NOT raise the (now-removed) NotImplementedError -- the
+    failure must come from the CUDA path itself (or from the
+    pre-dispatch cell_radius check, which runs before any CUDA call).
+
+    This is a structural test of the dispatcher, not a CUDA-correctness
+    test (the GPU correctness tests live in test_thin_surface_independent_forward_cuda.py).
+    """
+    print("\n--- Test 6: forward() dispatches to CUDA under independent mode ---")
     scene = _make_scene(n_points=8, device="cpu")
     args = _args(thin_surface_density_mode="independent")
     scene.declare_optimizer(args, warmup=0, max_iterations=1000)
     scene.initialize_independent_sides(args)
     rays = torch.zeros(1, 6)
-    raised = False
+    raised_removed_nie = False
+    raised_other = False
+    raised = None
     try:
         scene(rays)
     except NotImplementedError as e:
-        raised = True
-        check("Independent-side rendering" in str(e)
-              or "independent" in str(e).lower(),
-              f"NotImplementedError mentions independent rendering "
-              f"(got {str(e)[:80]}...)")
-    check(raised,
-          "forward() raised NotImplementedError under independent mode "
-          "(no silent scalar fallback)")
+        # The Commit-1 fail-fast specifically said "Independent-side rendering
+        # is not implemented yet". If that message surfaces, the dispatcher
+        # was NOT reached and the commit regressed.
+        if "Independent-side rendering is not implemented" in str(e):
+            raised_removed_nie = True
+        raised = e
+    except Exception as e:
+        # Any other exception (AttributeError from the CPU radfoam stub,
+        # or the cell_radius check that runs pre-launch) is acceptable:
+        # the dispatcher was reached.
+        raised_other = True
+        raised = e
+    check(not raised_removed_nie,
+          "Commit-1 NotImplementedError is removed; forward() reaches "
+          "the CUDA dispatch path (Commit 2A) instead of failing fast")
+    check(raised_other or raised_removed_nie,
+          f"forward() reaches a CUDA-path failure (got: "
+          f"{type(raised).__name__ if raised is not None else 'no exception'})")
 
-    # Sanity: scalar / absolute modes still go through the forward
-    # path without raising.  We can't actually invoke the CUDA
-    # kernel from CPU, but we can verify the fail-fast gate does
-    # NOT fire (i.e., the error path is gated on the discriminator).
+    # Sanity: scalar mode must NOT trigger any independent-side error.
     scene2 = _make_scene(n_points=8, device="cpu")
     args2 = _args(thin_surface_density_mode="scalar")
     scene2.declare_optimizer(args2, warmup=0, max_iterations=1000)
@@ -383,15 +398,11 @@ def test_forward_fail_fast_under_independent_mode():
           "scalar mode discriminator preserved (no regression)")
     raised_unwanted = False
     try:
-        # We expect a non-NotImplementedError failure (radfoam stub
-        # raises on .nn(...) etc.); the discriminator-specific
-        # NotImplementedError must NOT fire.
         scene2(rays)
     except NotImplementedError as e:
         if "Independent-side" in str(e):
             raised_unwanted = True
     except Exception:
-        # Any other exception type is fine (CUDA stub-related).
         raised_unwanted = False
     check(not raised_unwanted,
           "scalar mode does NOT trigger the independent-mode NotImplementedError")
@@ -825,7 +836,7 @@ def main():
     test_independent_freezes_base_density()
     test_raw_side_optimizer_groups_and_equal_schedule()
     test_trace_data_appends_raw_sides()
-    test_forward_fail_fast_under_independent_mode()
+    test_forward_dispatches_to_cuda_under_independent_mode()
     test_checkpoint_roundtrip_independent_sides()
     test_checkpoint_mixed_state_rejection()
     test_legacy_checkpoint_inference_unchanged()

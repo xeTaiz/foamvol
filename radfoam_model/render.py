@@ -44,6 +44,18 @@ class TraceRays(torch.autograd.Function):
         # density_delta as a raw additive offset.  Bounded and nonneg-safe.
         _thin_surface_relative_delta=False,
         _thin_surface_delta_max_frac=0.5,
+        # LC64 plan v3 Commit 2A -- independent-side raw logits
+        # (each (N,1)).  When _thin_surface_independent_mode is True
+        # the kernel reads raw_plus/raw_minus and computes
+        # mu_plus = activation_scale * softplus(raw_plus, beta=10),
+        # mu_minus = activation_scale * softplus(raw_minus, beta=10)
+        # independently.  Geometry / crossing / dp-sign semantics are
+        # reused from the legacy thin-surface branch.  Backward is NOT
+        # implemented in this commit; TraceRays.backward raises.
+        _raw_plus=None,
+        _raw_minus=None,
+        _thin_surface_independent_mode=False,
+        _thin_surface_activation_scale=1.0,
     ):
         ctx.rays = rays
         ctx.start_point = start_point
@@ -69,6 +81,17 @@ class TraceRays(torch.autograd.Function):
         ctx.thin_height_eps = _thin_height_eps
         ctx.thin_surface_relative_delta = _thin_surface_relative_delta
         ctx.thin_surface_delta_max_frac = _thin_surface_delta_max_frac
+        # LC64 plan v3 Commit 2A -- independent-side raw logits.
+        # Saved verbatim across the autograd context so backward can
+        # gate on the discriminator and raise if the user calls
+        # backward() under independent mode before Commit 2B.
+        ctx.thin_surface_independent_mode = _thin_surface_independent_mode
+        ctx.thin_surface_activation_scale = _thin_surface_activation_scale
+        ctx.has_raw_plus = _raw_plus is not None
+        ctx.has_raw_minus = _raw_minus is not None
+        if _thin_surface_independent_mode:
+            ctx.raw_plus = _raw_plus
+            ctx.raw_minus = _raw_minus
         if ctx.has_density_grad:
             ctx.density_grad = _density_grad
         if ctx.has_gaussian:
@@ -111,6 +134,10 @@ class TraceRays(torch.autograd.Function):
             thin_height_eps=_thin_height_eps,
             thin_surface_relative_delta=_thin_surface_relative_delta,
             thin_surface_delta_max_frac=_thin_surface_delta_max_frac,
+            raw_plus=_raw_plus,
+            raw_minus=_raw_minus,
+            thin_surface_independent_mode=_thin_surface_independent_mode,
+            thin_surface_activation_scale=_thin_surface_activation_scale,
         )
 
         errbox = ErrorBox()
@@ -137,6 +164,24 @@ class TraceRays(torch.autograd.Function):
         del grad_hit_count
         del grad_num_intersections
         del errbox_grad
+
+        # LC64 plan v3 Commit 2A -- independent-side backward is NOT
+        # implemented in this commit.  Fail fast with a clear error
+        # before any kernel launch (the C++ binding also rejects this
+        # as a defensive second guard).  Calling backward under
+        # independent mode is a configuration error, not a runtime
+        # regression; the forward contract is the only supported path
+        # until Commit 2B.
+        if getattr(ctx, "thin_surface_independent_mode", False):
+            raise NotImplementedError(
+                "Independent-side backward is not implemented in "
+                "LC64 plan v3 Commit 2A. The forward path renders "
+                "raw_plus / raw_minus via the CUDA dispatch in "
+                "ct_independent_forward, but the backward path lands "
+                "in Commit 2B. Until then, calling backward() under "
+                "thin_surface_independent_mode=True is a hard error "
+                "(no silent scalar / legacy-delta fallback)."
+            )
 
         rays = ctx.rays
         start_point = ctx.start_point
@@ -170,6 +215,13 @@ class TraceRays(torch.autograd.Function):
         _quaternions = ctx.quaternions if has_thin_surface else None
         _texel_sites_2d = ctx.texel_sites_2d if has_thin_surface else None
         _texel_heights = ctx.texel_heights if has_thin_surface else None
+        # LC64 plan v3 Commit 2A -- independent-side raw logits are
+        # NOT read by backward (the binding rejects independent-mode
+        # backward above).  Pass None for legacy arg ordering.
+        _raw_plus = None
+        _raw_minus = None
+        thin_surface_independent_mode = False
+        thin_surface_activation_scale = 1.0
 
         results = pipeline.trace_backward(
             _points,
@@ -202,6 +254,10 @@ class TraceRays(torch.autograd.Function):
             thin_height_eps=thin_height_eps,
             thin_surface_relative_delta=thin_surface_relative_delta,
             thin_surface_delta_max_frac=thin_surface_delta_max_frac,
+            raw_plus=_raw_plus,
+            raw_minus=_raw_minus,
+            thin_surface_independent_mode=thin_surface_independent_mode,
+            thin_surface_activation_scale=thin_surface_activation_scale,
         )
         points_grad = results["points_grad"]
         attr_grad = results["attr_grad"]
@@ -278,6 +334,10 @@ class TraceRays(torch.autograd.Function):
             ctx.thin_height_eps,
             ctx.thin_surface_relative_delta,
             ctx.thin_surface_delta_max_frac,
+            ctx.thin_surface_independent_mode,
+            ctx.thin_surface_activation_scale,
+            ctx.has_raw_plus,
+            ctx.has_raw_minus,
         )
         if has_density_grad:
             del ctx.density_grad
@@ -285,6 +345,11 @@ class TraceRays(torch.autograd.Function):
             del ctx.density_peak, ctx.delta_raw, ctx.cov_raw
         if has_thin_surface:
             del ctx.density_delta, ctx.quaternions, ctx.texel_sites_2d, ctx.texel_heights
+        # LC64 plan v3 Commit 2A -- independent-side raw logits saved
+        # on ctx during forward; release here so the autograd context
+        # does not hold Parameter references past the backward call.
+        if getattr(ctx, "thin_surface_independent_mode", False):
+            del ctx.raw_plus, ctx.raw_minus
 
         return (
             None,               # pipeline
@@ -317,4 +382,8 @@ class TraceRays(torch.autograd.Function):
             None,               # _thin_height_eps
             None,               # _thin_surface_relative_delta (M5)
             None,               # _thin_surface_delta_max_frac (M5)
+            None,               # _raw_plus (Commit 2A)
+            None,               # _raw_minus (Commit 2A)
+            None,               # _thin_surface_independent_mode (Commit 2A)
+            None,               # _thin_surface_activation_scale (Commit 2A)
         )
