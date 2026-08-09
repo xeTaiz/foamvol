@@ -78,6 +78,18 @@ def main():
     m = activate(adv._build_scalar_or_thin_scene("cuda", True), -.5, -.5)
     require_fd("near-air crossing", m, rays, tol=.03)
 
+    # Symmetric grazing fixture: the fallback weights both equal raw sides by
+    # exactly one half, so their complete gradient tensors must match.
+    m = activate(adv._build_scalar_or_thin_scene("cuda", True), -.2, -.2)
+    dirs = torch.tensor([[0., 1., 0.]] * 3, device="cuda")
+    grazing_rays = torch.cat([-1.5 * dirs, dirs], dim=-1)
+    for p in (m.raw_plus, m.raw_minus):
+        p.grad = None
+    render_loss(m, grazing_rays).backward()
+    assert torch.allclose(m.raw_plus.grad, m.raw_minus.grad,
+                          atol=1e-7, rtol=1e-7)
+    print("symmetric grazing raw-side gradients: PASS")
+
     # Base density is excluded from independent rendering/autograd.
     assert m.density.grad is None
     print("\nSUMMARY: ALL INDEPENDENT-SIDE BACKWARD CUDA GRADCHECKS PASSED")
