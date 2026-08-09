@@ -94,6 +94,9 @@ class PipelineParams(ParamGroup):
         self.diag_percent = 10        # log diagnostics/slices every N% of iterations
         self.diag = False             # enable mid-training diag logs (always logs once after training)
         self.corr_diag = True         # log per-cell field vs 3D-error spatial correlations at diag cadence
+        # Optional comma-separated optimizer-step checkpoints, e.g.
+        # "500,1500,2500,6000,10000". Empty disables intermediate saves.
+        self.checkpoint_steps = ""
         # Volume-supervised training (train_vol.py)
         self.n_query_per_step = 1_000_000      # random query points per training step
         self.n_query_error_map = 4_000_000     # random points for densification error-map pass
@@ -243,9 +246,8 @@ class OptimizationParams(ParamGroup):
         # the scalar `density` in the optimization: each is an ordinary
         # Adam group with the same native raw-side LR schedule below. The
         # base density is frozen as a third degree (not in the optimizer).
-        # Independent rendering is NOT implemented in this commit; the
-        # forward path raises NotImplementedError under independent mode
-        # until the CUDA branch lands.
+        # Independent rendering and backward use the CUDA-native thin-surface
+        # path; the legacy base density is neither rendered nor optimized.
         #
         # Mutually exclusive with `thin_surface_relative_delta=True`
         # (the bounded-delta path) -- the relative / independent arms

@@ -49,9 +49,9 @@ class TraceRays(torch.autograd.Function):
         # the kernel reads raw_plus/raw_minus and computes
         # mu_plus = activation_scale * softplus(raw_plus, beta=10),
         # mu_minus = activation_scale * softplus(raw_minus, beta=10)
-        # independently.  Geometry / crossing / dp-sign semantics are
-        # reused from the legacy thin-surface branch.  Backward is NOT
-        # implemented in this commit; TraceRays.backward raises.
+        # independently. Geometry / crossing / dp-sign semantics are
+        # reused from the legacy thin-surface branch; backward applies the
+        # corresponding softplus chain rule to both raw-side logits.
         _raw_plus=None,
         _raw_minus=None,
         _thin_surface_independent_mode=False,

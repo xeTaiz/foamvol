@@ -487,6 +487,24 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         max_iterations=pipeline_args.iterations,
     )
 
+    # Iteration-zero split state must exist before initial diagnostics and the
+    # first forward/backward. Activating at the end of loop iteration 0 would
+    # give scalar/relative/independent controls different first optimizer steps.
+    _thin_start = int(getattr(optimizer_args, "thin_surface_start", -1))
+    if _thin_start == 0:
+        model._thin_surface_gate_tau = float(
+            getattr(optimizer_args, "thin_surface_gate_tau", 0.01))
+        # Geometry registration samples site jitter. Preserve global RNG state
+        # so scalar and split arms see the same subsequent ray batches.
+        _cpu_rng_state = torch.random.get_rng_state()
+        _cuda_rng_state = torch.cuda.get_rng_state_all()
+        model.initialize_thin_surface(
+            optimizer_args,
+            K=int(getattr(optimizer_args, "thin_surface_K", 4)),
+        )
+        torch.random.set_rng_state(_cpu_rng_state)
+        torch.cuda.set_rng_state_all(_cuda_rng_state)
+
     # Store IDW interpolation params on model early so vvar and idw_voxelize can use them
     # throughout training (not just after interpolation_start).
     # For the global (non-per-cell) path, resolve to an absolute physical sigma now so that
@@ -982,6 +1000,25 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
         log_interval = max(1, pipeline_args.iterations * pipeline_args.log_percent // 100)
         diag_interval = max(1, pipeline_args.iterations * pipeline_args.diag_percent // 100)
+        _checkpoint_spec = str(getattr(pipeline_args, "checkpoint_steps", "")).strip()
+        checkpoint_steps = set()
+        if _checkpoint_spec:
+            try:
+                checkpoint_steps = {
+                    int(x.strip()) for x in _checkpoint_spec.split(",") if x.strip()
+                }
+            except ValueError as exc:
+                raise ValueError(
+                    f"checkpoint_steps must be comma-separated integers, got "
+                    f"{_checkpoint_spec!r}") from exc
+            invalid = sorted(s for s in checkpoint_steps
+                             if s <= 0 or s > pipeline_args.iterations)
+            if invalid:
+                raise ValueError(
+                    f"checkpoint_steps outside [1,{pipeline_args.iterations}]: "
+                    f"{invalid}")
+            if not pipeline_args.debug:
+                os.makedirs(f"{out_dir}/checkpoints", exist_ok=True)
 
         torch.cuda.synchronize()
 
@@ -1240,6 +1277,15 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                 model.update_learning_rate(i)
 
+                completed_step = i + 1
+                if (completed_step in checkpoint_steps
+                        and not pipeline_args.debug):
+                    checkpoint_path = (
+                        f"{out_dir}/checkpoints/step_{completed_step:05d}.pt")
+                    model.save_pt(checkpoint_path)
+                    print(f"Saved checkpoint at optimizer step {completed_step}: "
+                          f"{checkpoint_path}")
+
                 # Activate high-error sampling (one-time switch)
                 if (not _he_active
                         and pipeline_args.high_error_fraction > 0
@@ -1332,6 +1378,17 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                                       f"mu_plus_max={_ts_diag['mu_plus_max']:.3f} "
                                       f"delta_abs_max={_ts_diag['delta_abs_max']:.3f} "
                                       f"active_frac={_ts_diag['active_frac']:.3f}")
+                    if getattr(model, '_thin_surface_density_mode', 'scalar') == 'independent':
+                        _side_diag = model.independent_side_diagnostics()
+                        if _side_diag is not None:
+                            for _k, _v in _side_diag.items():
+                                _log_diag_kv(writer, _k, _v, i)
+                            for _g in model.optimizer.param_groups:
+                                if _g["name"] in ("raw_plus", "raw_minus"):
+                                    writer.add_scalar(f"lr/{_g['name']}", _g["lr"], i)
+                            if _side_diag.get("raw_nonfinite", 0.0):
+                                raise FloatingPointError(
+                                    f"independent raw-side logits became non-finite at iter {i}")
                     _rv_until = getattr(optimizer_args, "ref_volume_until", -1)
                     if (getattr(optimizer_args, "ref_volume_weight", 0.0) > 0
                             and hasattr(model, "_ref_volume")
@@ -1504,7 +1561,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                 # Thin-surface activation
                 thin_start = getattr(optimizer_args, 'thin_surface_start', -1)
-                if thin_start >= 0 and i == thin_start:
+                if (thin_start > 0 and i == thin_start
+                        and not getattr(model, '_thin_surface_active', False)):
                     K = getattr(optimizer_args, 'thin_surface_K', 4)
                     tau = getattr(optimizer_args, 'thin_surface_gate_tau', 0.01)
                     model._thin_surface_gate_tau = tau
@@ -1531,7 +1589,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     iters = pipeline_args.iterations
     _train_duration = time.time() - _train_start_time
     print(f"Training time: {_train_duration:.1f}s ({_train_duration / 60:.2f}min)")
-    writer.add_scalar("train/training_time_seconds", _train_duration, iters)
+    if not pipeline_args.debug:
+        writer.add_scalar("train/training_time_seconds", _train_duration, iters)
  
     if not pipeline_args.debug:
         # Final basic + diag logging

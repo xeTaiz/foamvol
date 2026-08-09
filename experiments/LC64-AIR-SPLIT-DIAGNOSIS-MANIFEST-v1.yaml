@@ -1,0 +1,178 @@
+# Machine-actionable manifest. Authority: specs/LC64-AIR-SPLIT-DIAGNOSIS-PLAN-v1.md
+# Do not submit an arm until its stage gate is recorded pass in the evidence CSV.
+version: 1
+name: LC64-air-split-diagnosis-v1
+status: stage_a_running
+command_template: >-
+  micromamba run -n radfoam python train.py -c experiments/lc64_air/configs/{tag}.yaml
+  --experiment_name lc64_air_v1/{tag}
+base_config: configs/lc64_air_base.yaml
+config_materialization: >-
+  Before submission, materialize base_config plus each arm's overrides into the
+  listed immutable YAML path; record sha256 in evidence CSV. Do not substitute CLI
+  overrides after config hashing.
+constants:
+  dataset: r2_gaussian
+  data_path: r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone
+  seed_screen: 42
+  seed_replicates: [43, 44]
+  iterations: 10000
+  init_points: 64000
+  final_points: 64000
+  # init_points==final_points blocks densification; -1 prevents prune_only.
+  densify_from: 0
+  densify_until: -1
+  densify_factor: 1.0
+  redundancy_cap: 0.0
+  redundancy_cap_init: 0.0
+  redundancy_cap_final: 0.0
+  prune_variance_criterion: false
+  thin_surface_start: 0
+  thin_surface_K: 4
+  top_eig_align_weight: 0.0
+  scheduler_horizon_freeze_points: 9500
+  hard_eval:
+    command_template: >-
+      micromamba run -n radfoam python split_voxelize.py --model output/lc64_air_v1/{tag}/model.pt
+      --gt r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone/vol_gt.npy
+      --resolution 256 --supersample 4 --blend_eps 0
+      --side_map output/lc64_air_v1/{tag}/side_map_hard_ss4.npy
+      --output output/lc64_air_v1/{tag}/volume_hard_ss4.npy
+  fixed_factors:
+    geometry_sites_lr_scale: 0.0
+    # Stages A-D freeze q/heights too. Stage E overrides only q/heights.
+    geometry_quat_lr_scale: 0.0
+    geometry_heights_lr_scale: 0.0
+    relative_rho: 0.5
+    interpolation_start: -1
+    web_root: output/web-results/LC64-air-v1
+  yaml_override_mapping:
+    scalar:
+      thin_surface_start: -1
+      thin_surface_relative_delta: false
+      thin_surface_delta_lr_scale: 0.0
+    relative:
+      thin_surface_start: 0
+      thin_surface_relative_delta: true
+      thin_surface_delta_max_frac: 0.5
+      thin_surface_delta_lr_scale: '<arm.split_lr_scale>'
+      thin_surface_quat_lr_scale: 0.0
+      thin_surface_sites_lr_scale: 0.0
+      thin_surface_heights_lr_scale: 0.0
+    independent:
+      thin_surface_start: 0
+      thin_surface_density_mode: independent
+      # Native raw-side Adam contract from plan v2; both sides use the same LR.
+      thin_surface_raw_side_lr_init: '<arm.split_difference_lr>'
+      thin_surface_raw_side_lr_final: '<arm.split_difference_lr>'
+      thin_surface_quat_lr_scale: 0.0
+      thin_surface_sites_lr_scale: 0.0
+      thin_surface_heights_lr_scale: 0.0
+    point_freeze:
+      # True stationary freeze; keep freeze_points=9500 as scheduler horizon.
+      points_hard_freeze_at: '<arm.points_freeze_at>'
+    geometry_E:
+      thin_surface_quat_lr_scale: '<arm.qh_lr_scale>'
+      thin_surface_heights_lr_scale: '<arm.qh_lr_scale>'
+      thin_surface_sites_lr_scale: 0.0
+      thin_surface_geometry_unfreeze_step: '<arm.qh_unfreeze_step>'
+
+dependencies:
+  E0_independent_sides:
+    status: passed
+    required_before: [A2, B_I_005, B_I_020, B_I_050]
+    requirements:
+      - Independent raw_plus/raw_minus nonnegative side-density storage.
+      - Mean coordinate uses base-density scheduler; difference coordinate uses swept split scheduler.
+      - Zero-split scalar equality, crossing/noncrossing GPU FD, zero-air edge, checkpoint round-trip, hard-side query.
+  F0_real_point_freeze:
+    status: passed
+    required_before: [A0, A1, A2, B_R_005, B_R_020, B_R_050, B_I_005, B_I_020, B_I_050, C_R, C_I, D_F0_scalar, D_F0_split, D_F500_scalar, D_F500_split, E1, E2, E3]
+    requirements:
+      - Add explicit points_freeze_at, separate from freeze_points scheduler horizon.
+      - At t >= points_freeze_at set primal-point optimizer LR=0; assert max point displacement <=1e-7 afterward.
+      - Semantics: points_freeze_at=0 freezes before first optimizer step; 500/1500 freeze immediately before that numbered step.
+  AIR_eval:
+    status: passed
+    required_before: [A0]
+    requirements:
+      - GT fixed air ROI: gt <= 0.01*p99(gt); false-positive threshold 0.05*p99(gt); 1-voxel halo.
+      - Emit MAE/P95/P99/FPR for air, object/air/full PSNR, hard-side metrics and checkpoint-step metrics.
+  WEB:
+    status: passed
+    required_before: [A0]
+    requirements:
+      - Browser-accessible output/web-results/LC64-air-v1/ status page verified before Stage A.
+      - Manifest, fixed-window slices, air error/halo, side map, curves, metrics visible for completed and pruned arms.
+
+gates:
+  immediate_stop:
+    - nonfinite values
+    - negative side density
+    - invalid checkpoint
+    - invalid hard-side evaluator
+  checkpoint_prune:
+    checkpoints: [500, 1500, 2500, 6000, 10000]
+    rules:
+      - heldout_projection_psnr < matched_scalar - 2.0_dB
+      - air_fpr > 2.0 * matched_scalar_air_fpr
+      - air_mae > 1.5 * matched_scalar_air_mae
+  advance:
+    - air_fpr_or_air_mae_improvement_vs_matched_scalar >= 0.15
+    - hard_volume_psnr >= matched_scalar - 0.30_dB
+    - hard_sobel_psnr >= matched_scalar - 0.30_dB
+  replication:
+    - final winner and scalar control repeat at seeds 43 and 44
+    - direction holds in at_least_2_of_3_seeds
+    - aggregate advance gate passes
+
+stages:
+  A:
+    submit_mode: sequential
+    gate: zero_split equivalence + air evaluator + website pass
+    arms:
+      - {tag: LC64A_scalar_F1500, mode: scalar, points_freeze_at: 1500, matched_scalar: self, requires: [F0_real_point_freeze, AIR_eval, WEB]}
+      - {tag: LC64A_relative0_F1500, mode: relative, split_difference_lr: 0.0, points_freeze_at: 1500, matched_scalar: LC64A_scalar_F1500, requires: [F0_real_point_freeze, AIR_eval, WEB]}
+      - {tag: LC64A_independent0_F1500, mode: independent, split_difference_lr: 0.0, points_freeze_at: 1500, matched_scalar: LC64A_scalar_F1500, requires: [E0_independent_sides, F0_real_point_freeze, AIR_eval, WEB]}
+  B:
+    submit_mode: parallel_after_A_gate
+    gate: retain at_most_one representation winner per mode; stop if no advance winner
+    arms:
+      - {tag: LC64B_relative_LR5e-5_F1500, mode: relative, split_lr_scale: 0.01, split_difference_lr: 5e-5, points_freeze_at: 1500, matched_scalar: LC64A_scalar_F1500}
+      - {tag: LC64B_relative_LR2e-4_F1500, mode: relative, split_lr_scale: 0.04, split_difference_lr: 2e-4, points_freeze_at: 1500, matched_scalar: LC64A_scalar_F1500}
+      - {tag: LC64B_relative_LR5e-4_F1500, mode: relative, split_lr_scale: 0.10, split_difference_lr: 5e-4, points_freeze_at: 1500, matched_scalar: LC64A_scalar_F1500}
+      - {tag: LC64B_independent_LR5e-5_F1500, mode: independent, split_lr_scale: 0.01, split_difference_lr: 5e-5, points_freeze_at: 1500, matched_scalar: LC64A_scalar_F1500, requires: E0_independent_sides}
+      - {tag: LC64B_independent_LR2e-4_F1500, mode: independent, split_lr_scale: 0.04, split_difference_lr: 2e-4, points_freeze_at: 1500, matched_scalar: LC64A_scalar_F1500, requires: E0_independent_sides}
+      - {tag: LC64B_independent_LR5e-4_F1500, mode: independent, split_lr_scale: 0.10, split_difference_lr: 5e-4, points_freeze_at: 1500, matched_scalar: LC64A_scalar_F1500, requires: E0_independent_sides}
+  C:
+    submit_mode: conditional_max_two
+    gate: choose lower LR unless LR2e-3 improves air metric >= 5 percentage points vs same-mode LR5e-4 and passes advance gate
+    arms:
+      - {tag: LC64C_relative_LR2e-3_F1500, mode: relative, split_lr_scale: 0.40, split_difference_lr: 2e-3, points_freeze_at: 1500, matched_scalar: LC64A_scalar_F1500, requires: B_relative_winner}
+      - {tag: LC64C_independent_LR2e-3_F1500, mode: independent, split_lr_scale: 0.40, split_difference_lr: 2e-3, points_freeze_at: 1500, matched_scalar: LC64A_scalar_F1500, requires: B_independent_winner}
+  D:
+    submit_mode: sequential_by_freeze_schedule
+    gate: select one split candidate with best air metric subject to advance gate; D_F0/F500 require F0_real_point_freeze
+    # F1500 pair is reused from the winning B/C arm and LC64A_scalar_F1500.
+    arms:
+      - {tag: LC64D_scalar_F1500, reuse: LC64A_scalar_F1500, mode: scalar, points_freeze_at: 1500, matched_scalar: self}
+      - {tag: LC64D_split_F1500, reuse: '<winning_B_or_C_tag>', mode: '<winner_mode>', points_freeze_at: 1500, matched_scalar: LC64D_scalar_F1500}
+      - {tag: LC64D_scalar_F500, mode: scalar, points_freeze_at: 500, matched_scalar: self}
+      - {tag: LC64D_split_F500, mode: '<winner_mode>', points_freeze_at: 500, matched_scalar: LC64D_scalar_F500, same_as: '<winner_except_points_freeze_at>'}
+      - {tag: LC64D_scalar_F0, mode: scalar, points_freeze_at: 0, matched_scalar: self}
+      - {tag: LC64D_split_F0, mode: '<winner_mode>', points_freeze_at: 0, matched_scalar: LC64D_scalar_F0, same_as: '<winner_except_points_freeze_at>'}
+  E:
+    submit_mode: strictly_sequential
+    gate: geometry arm must pass advance gate vs its geometry-frozen D parent; failure stops E
+    # q/heights only; texel sites remain zero. Absolute LR maps to .04/.10 scale given thin base LR .005.
+    arms:
+      - {tag: LC64E1_qh_at0_LR2e-4, qh_registration_step: 0, qh_unfreeze_step: 0, qh_lr_scale: 0.04, qh_absolute_lr: 2e-4, sites_lr_scale: 0, parent: '<D_winner_geometry_frozen>', requires: [D_winner, F0_real_point_freeze]}
+      - {tag: LC64E2_qh_at500_LR2e-4, qh_registration_step: 0, qh_unfreeze_step: 500, qh_lr_scale: 0.04, qh_absolute_lr: 2e-4, sites_lr_scale: 0, parent: '<D_winner_geometry_frozen>', requires: [E1_pass, geometry_unfreeze_scheduler]}
+      - {tag: LC64E3_qh_at500_LR5e-4, qh_registration_step: 0, qh_unfreeze_step: 500, qh_lr_scale: 0.10, qh_absolute_lr: 5e-4, sites_lr_scale: 0, parent: '<D_winner_geometry_frozen>', requires: [E2_pass, geometry_unfreeze_scheduler]}
+
+runtime:
+  pilot: A0 first; replace provisional estimate with observed wall time
+  per_training_run_cap_gpu_hours: 0.75
+  screen_run_count: {min: 13, max: 17}
+  screen_gpu_hour_cap: {min: 9.75, max: 12.75}
+  replication_gpu_hour_cap: 3.0

@@ -158,7 +158,7 @@ def check(cond, msg):
     print(f"  [{'PASS' if cond else 'FAIL'}] {msg}")
     global _any_failed
     if not cond:
-        _any_failed = False
+        _any_failed = True
 
 
 def test_zero_split_equals_scalar():
@@ -202,6 +202,43 @@ def test_zero_split_equals_scalar():
           f"both renders finite (max diff={diff:.2e})")
     check(diff < 1e-4,
           f"zero-split independent == scalar at fp tol (max diff={diff:.2e}, tol 1e-4)")
+
+
+def test_zero_split_loss_and_point_grad_equals_scalar():
+    """E0 binding: equal projections imply equal loss and point gradients."""
+    print("\n--- Test 1b: zero-split loss/point-gradient equivalence ---")
+    model = _activate_independent(
+        _make_scene(device="cuda"), K=4, raw_plus_val=0.3,
+        raw_minus_val=0.3, density_val=0.3, activation_scale=1.0)
+    rays = _make_test_rays(model)
+    start = model.get_starting_point(rays, model.primal_points, model.aabb_tree)
+    target = torch.linspace(0.1, 0.4, rays.shape[0], device="cuda").unsqueeze(-1)
+
+    model._thin_surface_density_mode = "scalar"
+    model._thin_surface_active = False
+    saved_delta = model.density_delta
+    model.density_delta = None
+    model.primal_points.grad = None
+    scalar_out = model(rays, start)[0]
+    scalar_loss = ((scalar_out - target) ** 2).mean()
+    scalar_loss.backward()
+    scalar_pg = model.primal_points.grad.detach().clone()
+
+    model.density_delta = saved_delta
+    model._thin_surface_density_mode = "independent"
+    model._thin_surface_active = True
+    model.primal_points.grad = None
+    independent_out = model(rays, start)[0]
+    independent_loss = ((independent_out - target) ** 2).mean()
+    independent_loss.backward()
+    independent_pg = model.primal_points.grad.detach().clone()
+
+    out_diff = (scalar_out - independent_out).abs().max().item()
+    loss_diff = abs(scalar_loss.item() - independent_loss.item())
+    point_diff = (scalar_pg - independent_pg).abs().max().item()
+    check(out_diff < 1e-4, f"projection max diff={out_diff:.3e}")
+    check(loss_diff < 1e-6, f"loss abs diff={loss_diff:.3e}")
+    check(point_diff < 2e-6, f"point-gradient max diff={point_diff:.3e}")
 
 
 def test_density_invariance():
@@ -535,6 +572,7 @@ def main():
         sys.exit(0)
 
     test_zero_split_equals_scalar()
+    test_zero_split_loss_and_point_grad_equals_scalar()
     test_density_invariance()
     test_plus_minus_independence()
     test_activation_scale_scales_side_attenuation()

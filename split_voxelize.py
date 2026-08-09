@@ -33,6 +33,7 @@ CLI mirrors voxelize.py:
 """
 
 import argparse
+import json
 import os
 
 import numpy as np
@@ -44,10 +45,43 @@ from radfoam_model.scene import assert_supported_thin_K
 # Reuse the existing volume-eval helpers so metrics/slices/NIfTI match voxelize.
 from voxelize import (
     compute_volume_psnr,
-    compute_volume_ssim,
     gaussian_blur_3d,
     save_slices,
 )
+from air_metrics import compute_air_masks, compute_air_metrics, save_masks_npz, write_metrics_json
+
+
+def _volume_ssim(pred, gt):
+    """Return mean 2D and native 3D SSIM with an explicit data range."""
+    from skimage.metrics import structural_similarity
+    data_range = float(gt.max() - gt.min())
+    if data_range <= 0:
+        return 1.0, 1.0
+    min_dim = min(gt.shape)
+    win = min(11, min_dim if min_dim % 2 else min_dim - 1)
+    win = max(3, win)
+    ssim3d = float(structural_similarity(
+        gt, pred, data_range=data_range, win_size=win))
+    ssim2d = float(np.mean([
+        structural_similarity(gt[i], pred[i], data_range=data_range,
+                              win_size=win)
+        for i in range(gt.shape[0])
+    ]))
+    return ssim2d, ssim3d
+
+
+def _sobel_magnitude(volume):
+    from scipy import ndimage
+    grads = [ndimage.sobel(volume, axis=ax, mode="reflect")
+             for ax in range(3)]
+    return np.sqrt(sum(g * g for g in grads))
+
+
+def _dice(pred, gt, threshold):
+    p = pred > threshold
+    g = gt > threshold
+    denom = int(p.sum()) + int(g.sum())
+    return 1.0 if denom == 0 else float(2 * np.logical_and(p, g).sum() / denom)
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +135,10 @@ def split_cell_query(
     thin_temp: float = 10.0,
     activation_scale: float = 1.0,
     blend_eps: float = 0.0,
+    density_mode: str = "absolute",
+    raw_plus=None,
+    raw_minus=None,
+    delta_max_frac: float = 0.5,
 ):
     """Evaluate the two-sided thin-surface density at a batch of query points.
 
@@ -133,10 +171,24 @@ def split_cell_query(
     """
     if density.dim() == 2:
         density = density.squeeze(-1)
-    if density_delta.dim() == 2:
-        delta = density_delta.squeeze(-1)        # (N,)
+    if density_mode not in ("absolute", "relative", "independent"):
+        raise ValueError(f"unsupported density_mode={density_mode!r}")
+    if density_mode == "independent":
+        if raw_plus is None or raw_minus is None:
+            raise ValueError(
+                "independent split query requires raw_plus and raw_minus")
+        raw_plus = raw_plus.squeeze(-1) if raw_plus.dim() == 2 else raw_plus
+        raw_minus = raw_minus.squeeze(-1) if raw_minus.dim() == 2 else raw_minus
+        if raw_plus.shape != density.shape or raw_minus.shape != density.shape:
+            raise ValueError(
+                f"independent raw-side shapes {raw_plus.shape}/{raw_minus.shape} "
+                f"must match density shape {density.shape}")
+        delta = None
     else:
-        delta = density_delta
+        if density_delta is None:
+            raise ValueError(f"{density_mode} split query requires density_delta")
+        delta = (density_delta.squeeze(-1)
+                 if density_delta.dim() == 2 else density_delta)
     cr = cell_radius.reshape(-1).clamp_min(1e-12)  # (N,)
 
     cp = points[nn_idx]                           # (B, 3)
@@ -166,9 +218,15 @@ def split_cell_query(
     # Densities
     raw = density[nn_idx]                         # (B,)
     mu_bar = F.softplus(raw, beta=10.0) * activation_scale
-    d_val = delta[nn_idx]                         # (B,)
-    mu_p = torch.clamp(mu_bar + d_val, min=0.0)
-    mu_n = torch.clamp(mu_bar - d_val, min=0.0)
+    if density_mode == "independent":
+        mu_p = F.softplus(raw_plus[nn_idx], beta=10.0) * activation_scale
+        mu_n = F.softplus(raw_minus[nn_idx], beta=10.0) * activation_scale
+    else:
+        d_val = delta[nn_idx]
+        if density_mode == "relative":
+            d_val = delta_max_frac * mu_bar * torch.tanh(d_val)
+        mu_p = torch.clamp(mu_bar + d_val, min=0.0)
+        mu_n = torch.clamp(mu_bar - d_val, min=0.0)
 
     # Side selection. +n side (s > 0) -> mu_plus ; -n side (s < 0) -> mu_minus.
     # blend_eps == 0 (default): HARD side -- each sample takes one side's
@@ -225,15 +283,38 @@ def voxelize_split(
     _, cell_radius = radfoam.farthest_neighbor(points, adjacency, adjacency_offsets)
 
     ts_meta = scene_data.get("thin_surface")
-    has_ts = ts_meta is not None and ts_meta.get("active", False)
+    has_ts = isinstance(ts_meta, dict) and ts_meta.get("active", False)
+    density_mode = "scalar"
+    delta_max_frac = 0.5
+    raw_plus = raw_minus = None
     if has_ts:
         K = int(ts_meta.get("K", 4))
         assert_supported_thin_K(K)
-        density_delta = scene_data["density_delta"].to(device)
+        density_mode = ts_meta.get("density_mode")
+        if density_mode is None:
+            density_mode = ("relative" if ts_meta.get("relative_delta", False)
+                            else "absolute")
+        if density_mode not in ("absolute", "relative", "independent"):
+            raise RuntimeError(
+                f"unsupported checkpoint thin_surface density_mode={density_mode!r}")
+        delta_max_frac = float(ts_meta.get("delta_max_frac", 0.5))
+        if density_mode == "independent":
+            if "raw_plus" not in scene_data or "raw_minus" not in scene_data:
+                raise RuntimeError(
+                    "independent checkpoint is missing raw_plus/raw_minus")
+            raw_plus = scene_data["raw_plus"].to(device)
+            raw_minus = scene_data["raw_minus"].to(device)
+            density_delta = None
+        else:
+            if "density_delta" not in scene_data:
+                raise RuntimeError(
+                    f"{density_mode} checkpoint is missing density_delta")
+            density_delta = scene_data["density_delta"].to(device)
         quaternions = scene_data["quaternions"].to(device)
         texel_sites_2d = scene_data["texel_sites_2d"].to(device)
         texel_heights = scene_data["texel_heights"].to(device)
-        print(f"[split-voxelize] thin-surface ON, K={K}, N={points.shape[0]}")
+        print(f"[split-voxelize] thin-surface ON, mode={density_mode}, "
+              f"K={K}, N={points.shape[0]}")
     else:
         K = 0
         density_delta = quaternions = texel_sites_2d = texel_heights = None
@@ -258,7 +339,9 @@ def voxelize_split(
                 query_pts, points, nn_idx, density_flat, density_delta,
                 quaternions, texel_sites_2d, texel_heights, cell_radius,
                 thin_temp=thin_temp, activation_scale=activation_scale,
-                blend_eps=blend_eps,
+                blend_eps=blend_eps, density_mode=density_mode,
+                raw_plus=raw_plus, raw_minus=raw_minus,
+                delta_max_frac=delta_max_frac,
             )
             return torch.nan_to_num(val), _side
         else:
@@ -314,9 +397,43 @@ def voxelize_split(
     gt_volume = None
     if gt_path is not None and os.path.exists(gt_path):
         gt_volume = np.load(gt_path).astype(np.float32)
-        psnr = compute_volume_psnr(volume_np, gt_volume)
-        ssim = compute_volume_ssim(volume_np, gt_volume)
-        print(f"  PSNR={psnr:.2f} dB  SSIM={ssim:.4f}")
+        if gt_volume.shape != volume_np.shape:
+            raise ValueError(
+                f"GT shape {gt_volume.shape} != prediction {volume_np.shape}")
+        psnr = float(compute_volume_psnr(volume_np, gt_volume))
+        ssim2d, ssim3d = _volume_ssim(volume_np, gt_volume)
+        pred_sobel = _sobel_magnitude(volume_np)
+        gt_sobel = _sobel_magnitude(gt_volume)
+        sobel_psnr = float(compute_volume_psnr(pred_sobel, gt_sobel))
+        sobel_ssim2d, sobel_ssim3d = _volume_ssim(pred_sobel, gt_sobel)
+        p99_gt = float(np.percentile(gt_volume, 99))
+        dice_threshold = 0.1 * p99_gt
+        hard_metrics = {
+            "density_mode": density_mode,
+            "resolution": int(resolution),
+            "supersample": int(supersample),
+            "blend_eps": float(blend_eps),
+            "volume_psnr": psnr,
+            "volume_ssim_2d": ssim2d,
+            "volume_ssim_3d": ssim3d,
+            "sobel_psnr": sobel_psnr,
+            "sobel_ssim_2d": sobel_ssim2d,
+            "sobel_ssim_3d": sobel_ssim3d,
+            "dice_threshold": dice_threshold,
+            "dice": _dice(volume_np, gt_volume, dice_threshold),
+        }
+        masks = compute_air_masks(gt_volume)
+        hard_metrics["air"] = compute_air_metrics(
+            volume_np, gt_volume, masks=masks)
+        stem = output_path[:-4] if output_path.endswith(".npy") else output_path
+        metrics_path = stem + "_metrics.json"
+        masks_path = stem + "_air_masks.npz"
+        write_metrics_json(hard_metrics, metrics_path)
+        save_masks_npz(masks, masks_path)
+        print(f"  PSNR={psnr:.2f} dB  SSIM3D={ssim3d:.4f}  "
+              f"Sobel PSNR={sobel_psnr:.2f} dB  "
+              f"Air MAE={hard_metrics['air']['mae']['strict_air']}")
+        print(f"Saved metrics to {metrics_path}")
 
     save_slices(volume_np, gt_volume, output_path, extent)
 
