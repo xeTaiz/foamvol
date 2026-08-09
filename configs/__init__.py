@@ -233,6 +233,32 @@ class OptimizationParams(ParamGroup):
         # Default OFF: opt-in per config so existing checkpoints stay valid.
         self.thin_surface_relative_delta = False
         self.thin_surface_delta_max_frac = 0.5   # rho; only read when above is True
+        # ----------------------------------------------------------------
+        # LC64 plan v3 — explicit independent-side density mode (Commit 1).
+        # See specs/LC64-AIR-SPLIT-DIAGNOSIS-PLAN-v2.md ("Resolved E0
+        # comparison contract") and the v3 E0 amendment.
+        #
+        # When `thin_surface_density_mode == "independent"`, two separate
+        # raw side parameters (raw_plus, raw_minus, each (N,1)) replace
+        # the scalar `density` in the optimization: each is an ordinary
+        # Adam group with the same native raw-side LR schedule below. The
+        # base density is frozen as a third degree (not in the optimizer).
+        # Independent rendering is NOT implemented in this commit; the
+        # forward path raises NotImplementedError under independent mode
+        # until the CUDA branch lands.
+        #
+        # Mutually exclusive with `thin_surface_relative_delta=True`
+        # (the bounded-delta path) -- the relative / independent arms
+        # were both candidates for the same E0 comparison and must not
+        # be active simultaneously. Defaults to "scalar" so every
+        # existing config / checkpoint keeps its current behavior.
+        # ----------------------------------------------------------------
+        self.thin_surface_density_mode = "scalar"
+        # Native raw-side LR schedule (used only when density_mode ==
+        # "independent"). Same default as the legacy density schedule
+        # so naive mirroring of the failed recipe is one field flip.
+        self.thin_surface_raw_side_lr_init = 5e-2
+        self.thin_surface_raw_side_lr_final = 1e-3
         super().__init__(parser, "Setting Optimization parameters")
 
 
