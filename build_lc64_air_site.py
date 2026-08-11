@@ -84,6 +84,7 @@ table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #555;padding
 .complete{{color:#8f8}}code{{background:#222;padding:.15rem}}</style></head><body>
 <h1>LC64 air-artifact split-cell diagnosis</h1>
 <p>Commit <code>{html.escape(status['commit'])}</code>. This page includes queued, running, completed, failed, and pruned arms.</p>
+<p><strong>Queued (gated)</strong> means planned but intentionally not launched until the preceding stage passes; it does not mean completed. Results accumulate here as each staged gate advances.</p>
 <p><a href='manifest.yaml'>Manifest</a> · <a href='status.json'>Machine-readable status</a> · <a href='configs/'>Resolved configs</a></p>
 <table><thead><tr><th>Stage</th><th>Arm</th><th>Mode</th><th>Status</th><th>Config SHA-256</th><th>Metrics</th></tr></thead>
 <tbody>{row_html}</tbody></table></body></html>"""
