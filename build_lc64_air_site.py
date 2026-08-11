@@ -42,12 +42,21 @@ def main():
                 shutil.copy2(config_path, web_root / "configs" / config_path.name)
             model = arm_dir / "model.pt"
             metrics_candidates = sorted(arm_dir.glob("*_metrics.json")) + sorted(arm_dir.glob("metrics.json"))
+            marker_path = arm_dir / "remote_job.json"
+            marker = None
+            if marker_path.exists():
+                try:
+                    marker = json.loads(marker_path.read_text())
+                except Exception:
+                    marker = None
             if model.exists() and metrics_candidates:
                 state = "complete"
             elif model.exists():
                 state = "training-complete / evaluation-pending"
+            elif marker and marker.get("state") == "running":
+                state = f"running on {marker.get('worker', 'remote worker')}"
             elif arm_dir.exists():
-                state = "running-or-interrupted"
+                state = "interrupted / awaiting recovery"
             else:
                 state = "queued (gated)"
             metrics = None
