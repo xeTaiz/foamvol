@@ -42,7 +42,14 @@ def main():
                 shutil.copy2(config_path, web_root / "configs" / config_path.name)
             model = arm_dir / "model.pt"
             metrics_candidates = sorted(arm_dir.glob("*_metrics.json")) + sorted(arm_dir.glob("metrics.json"))
-            state = "complete" if model.exists() else ("running" if arm_dir.exists() else "queued")
+            if model.exists() and metrics_candidates:
+                state = "complete"
+            elif model.exists():
+                state = "training-complete / evaluation-pending"
+            elif arm_dir.exists():
+                state = "running-or-interrupted"
+            else:
+                state = "queued (gated)"
             metrics = None
             if metrics_candidates:
                 try:
