@@ -55,6 +55,8 @@ def main():
                 state = "training-complete / evaluation-pending"
             elif marker and marker.get("state") == "running":
                 state = f"running on {marker.get('worker', 'remote worker')}"
+                if marker.get("phase"):
+                    state += f" ({marker['phase']})"
             elif arm_dir.exists():
                 state = "interrupted / awaiting recovery"
             else:
