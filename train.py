@@ -1596,11 +1596,19 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         # Final basic + diag logging
         test_metrics, train_metrics = log_basic(iters)
         slice_metrics = log_diag(iters, test_images=test_metrics)
-        point_error_final, _ = model.collect_error_map(
-            train_data_handler,
-            contrast_alpha=pipeline_args.contrast_alpha,
-        )
-        _log_grad_distribution(writer, iters, point_error_final)
+        # collect_error_map differentiates w.r.t. primal points. A true hard
+        # freeze deliberately makes that leaf non-trainable; skip this optional
+        # final point-gradient histogram rather than violating the freeze or
+        # crashing after valid checkpoints/model artifacts were already saved.
+        if model.primal_points.requires_grad:
+            point_error_final, _ = model.collect_error_map(
+                train_data_handler,
+                contrast_alpha=pipeline_args.contrast_alpha,
+            )
+            _log_grad_distribution(writer, iters, point_error_final)
+        else:
+            print("Skipping final point-gradient distribution: primal points "
+                  "are hard-frozen")
 
         with open(f"{out_dir}/metrics.txt", "w") as f:
             f.write(f"Test  RMSE: {test_metrics['rmse']:.6f}\n")
