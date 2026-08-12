@@ -93,3 +93,16 @@ Artifacts: each arm has `volume_split_hard_ss4.npy` and `volume_split_hard_ss4_m
   Initial gradients point toward the oracle normal for 64–72% of active cells, degrading with perturbation size. The basin is useful but local rather than globally reliable.
 - Against measured synthetic projections from the GT volume, optimization reduces projection MSE (`24–37%`) but does not reliably recover the independently fitted GT plane normals: 5° worsens to median `13.11°`, 15° to `16.01°`, 30° improves only to `24.34°`, and 60° to `52.98°`. This is not evidence of a broken backward; it shows that the independently per-cell GT plane fit is not the projection objective's joint optimum when all other cell values are frozen, and/or that orientation is weakly/non-uniquely identified by the 75-view line integrals.
 - During harness validation, independent-mode oracle rendering showed extreme projection outliers even with equal sides. The final controlled experiment therefore uses the stable absolute mean+delta renderer with frozen nonnegative side values. That independent-mode behavior remains a separate implementation/representation concern and was not allowed to confound the orientation-gradient conclusion.
+
+# Milestone 11 — Rays-per-cell orientation supervision
+
+- Added `experiments/orientation_targeted_rays.py` (`400fb0e`) to directly vary distinct rays through each target cell. Selected the same 64 highest-scoring GT-oracle boundary cells, perturbed each normal by 15°, froze every other parameter, and optimized for 1,000 quaternion-only Adam steps at LR `2e-3` with constant 32,768 samples/step. Exact continuous cone rays pass through rejection-sampled points whose nearest Voronoi owner is verified to be the requested cell (`exact_owner_fraction=1.0`); measured projection values use matched continuous detector coordinates. Pools use nested angular coverage.
+- Exact-renderer teacher targets confirm that focused rays provide strong local supervision even at very small counts:
+  - 2 rays/cell (2 views): median `2.60°`, p90 `14.61°`, 65.6% within 5°;
+  - 8 rays/cell (8 views): median approximately `0°`, p90 `5.35°`, 89.1% within 5°;
+  - 32 rays/cell: median `1.26°`, p90 `12.58°`, 70.3% within 5°;
+  - 128 rays/cell (all 75 views represented): median `.73°`, p90 `13.86°`, 68.8% within 5°.
+  The non-monotonic p90/fraction reflects a fixed-step Adam optimization comparison and per-cell conditioning, but the main causal result is clear: guaranteeing just 8 angularly diverse hits per cell is dramatically stronger than sparse global random supervision.
+- Measured CT targets do **not** recover the independently fitted GT plane merely by adding focused rays:
+  - 2 rays/cell → median `41.19°`; 8 → `27.75°`; 32 → `18.57°`; 128 → `21.47°` (all from 15° initial perturbation).
+  More coverage improves the measured result up to 32 rays/cell but does not reach the oracle and remains non-monotonic. This reinforces that the measured line-integral optimum conflicts with the independently per-cell GT plane when all neighboring values are frozen; targeted sampling fixes starvation/gradient strength, not joint-model mismatch or non-identifiability.
