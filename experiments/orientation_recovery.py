@@ -344,14 +344,24 @@ def _gradient_alignment(q: torch.Tensor, loss_grad: torch.Tensor,
     qs = F.normalize(q.detach()[selected], dim=-1)
     lg = lg - (lg * qs).sum(-1, keepdim=True) * qs
     ag = ag - (ag * qs).sum(-1, keepdim=True) * qs
-    cosine = F.cosine_similarity(lg, ag, dim=-1)
+    grad_norm = lg.norm(dim=-1)
+    active = torch.isfinite(grad_norm) & (grad_norm > 1e-12)
+    cosine = F.cosine_similarity(lg[active], ag[active], dim=-1)
     finite = torch.isfinite(cosine)
     cosine = cosine[finite]
+    if cosine.numel() == 0:
+        return {
+            "mean_cosine": float("nan"), "median_cosine": float("nan"),
+            "fraction_aligned": float("nan"), "active_cells": 0,
+            "selected_cells": int(selected.sum().item()), "active_fraction": 0.0,
+        }
     return {
         "mean_cosine": float(cosine.mean().item()),
         "median_cosine": float(cosine.median().item()),
         "fraction_aligned": float((cosine > 0).float().mean().item()),
-        "cells": int(cosine.numel()),
+        "active_cells": int(cosine.numel()),
+        "selected_cells": int(selected.sum().item()),
+        "active_fraction": float(cosine.numel() / selected.sum().item()),
     }
 
 
@@ -413,15 +423,28 @@ def recover(args):
 
     evaluate(0)
 
-    # Realistic directional FD check of independent-mode quaternion backward.
+    # Initial MSE gradient alignment toward the oracle orientation.
     fd_count = min(args.fd_rays, eval_rays.shape[0])
     fd_rays = eval_rays[:fd_count]
     fd_target = eval_target[:fd_count]
     optimizer.zero_grad(set_to_none=True)
+    alignment_loss = F.mse_loss(_render(scene, fd_rays), fd_target)
+    alignment_loss.backward()
+    loss_grad = scene.quaternions.grad.detach().clone()
+    alignment = _gradient_alignment(scene.quaternions, loss_grad, oracle_n, selected)
+
+    # Realistic directional FD check of the independent-mode quaternion
+    # rendering Jacobian. Use a signed projection objective rather than MSE:
+    # near the teacher target MSE derivatives are tiny enough that subtracting
+    # two float32 losses obscures the central difference.
+    optimizer.zero_grad(set_to_none=True)
     fd_pred = _render(scene, fd_rays)
-    fd_loss = F.mse_loss(fd_pred, fd_target)
-    fd_loss.backward()
-    analytic_grad = scene.quaternions.grad.detach().clone()
+    weight_gen = torch.Generator(device=args.device).manual_seed(args.seed + 991)
+    fd_weights = torch.randn(fd_pred.shape, generator=weight_gen, device=args.device)
+    fd_weights = fd_weights / math.sqrt(fd_pred.numel())
+    fd_objective = (fd_pred * fd_weights).sum()
+    fd_objective.backward()
+    jacobian_grad = scene.quaternions.grad.detach().clone()
     direction = torch.zeros_like(scene.quaternions)
     sel_ids = selected.nonzero(as_tuple=False).flatten()
     probe_ids = sel_ids[:min(args.fd_cells, sel_ids.numel())]
@@ -429,17 +452,16 @@ def recover(args):
     qn = F.normalize(scene.quaternions.detach(), dim=-1)
     direction = direction - (direction * qn).sum(-1, keepdim=True) * qn
     direction = direction / direction.norm().clamp_min(1e-12)
-    analytic_dir = float((analytic_grad * direction).sum().item())
+    analytic_dir = float((jacobian_grad * direction).sum().item())
     q_base = scene.quaternions.detach().clone()
     fd_losses = []
     with torch.no_grad():
         for sign in (1.0, -1.0):
             scene.quaternions.copy_(F.normalize(q_base + sign * args.fd_eps * direction, dim=-1))
-            fd_losses.append(float(F.mse_loss(_render(scene, fd_rays), fd_target).item()))
+            fd_losses.append(float((_render(scene, fd_rays) * fd_weights).sum().item()))
         scene.quaternions.copy_(q_base)
     finite_dir = (fd_losses[0] - fd_losses[1]) / (2.0 * args.fd_eps)
     fd_rel = abs(analytic_dir - finite_dir) / max(abs(finite_dir), abs(analytic_dir), 1e-12)
-    alignment = _gradient_alignment(scene.quaternions, analytic_grad, oracle_n, selected)
     fd_summary = {
         "analytic_directional_derivative": analytic_dir,
         "finite_difference_directional_derivative": finite_dir,
