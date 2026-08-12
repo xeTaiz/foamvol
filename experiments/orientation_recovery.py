@@ -511,7 +511,9 @@ def recover(args):
         "gradient_alignment": alignment,
         "directional_fd": fd_summary,
     }
-    stem = f"recover_{args.target}_angle{args.angle:g}_seed{args.seed}"
+    lr_tag = f"{args.lr:.0e}".replace("+", "")
+    stem = (f"recover_{args.target}_angle{args.angle:g}_lr{lr_tag}"
+            f"_steps{args.steps}_seed{args.seed}")
     _json_dump(out / f"{stem}.json", summary)
     _json_dump(out / f"{stem}_history.json", history)
     torch.save({
