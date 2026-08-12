@@ -102,25 +102,37 @@ def _load_scene(checkpoint: str, device: str) -> CTScene:
     return scene
 
 
-def _configure_independent_scene(scene: CTScene, raw_plus: torch.Tensor,
-                                 raw_minus: torch.Tensor, quaternions: torch.Tensor,
-                                 heights: torch.Tensor):
+def _configure_absolute_scene(scene: CTScene, mu_plus: torch.Tensor,
+                              mu_minus: torch.Tensor, quaternions: torch.Tensor,
+                              heights: torch.Tensor):
+    """Configure the stable legacy absolute mean+delta renderer.
+
+    Independent-side rendering is intentionally not used here: its production
+    chest checkpoint exhibited huge projection outliers even with equal sides,
+    which would confound an orientation diagnostic. With frozen densities the
+    absolute representation exactly realizes any nonnegative (mu+, mu-) pair.
+    """
     n_cells = scene.primal_points.shape[0]
     k = heights.shape[1]
     angles = torch.linspace(0, 2 * math.pi, k + 1, device=scene.device)[:-1]
     sites = torch.stack([torch.cos(angles) * 0.4, torch.sin(angles) * 0.4], dim=-1)
     sites = sites.unsqueeze(0).expand(n_cells, -1, -1).clone()
+    mu_plus = mu_plus.to(scene.device).reshape(-1)
+    mu_minus = mu_minus.to(scene.device).reshape(-1)
+    mu_bar = 0.5 * (mu_plus + mu_minus)
+    delta = 0.5 * (mu_plus - mu_minus)
 
-    scene.raw_plus = nn.Parameter(raw_plus.to(scene.device), requires_grad=False)
-    scene.raw_minus = nn.Parameter(raw_minus.to(scene.device), requires_grad=False)
+    scene.density = nn.Parameter(
+        _inverse_softplus_beta10(mu_bar).unsqueeze(-1), requires_grad=False)
+    scene.density_delta = nn.Parameter(delta.unsqueeze(-1), requires_grad=False)
     scene.quaternions = nn.Parameter(quaternions.to(scene.device), requires_grad=True)
     scene.texel_sites_2d = nn.Parameter(sites, requires_grad=False)
     scene.texel_heights = nn.Parameter(heights.to(scene.device), requires_grad=False)
-    scene.density.requires_grad_(False)
     scene.primal_points.requires_grad_(False)
-    scene._thin_surface_density_mode = "independent"
+    scene._thin_surface_density_mode = "absolute"
     scene._thin_surface_active = True
     scene._thin_surface_relative_delta = False
+    scene._thin_surface_delta_max_frac = 0.5
     scene._thin_surface_start = 0
     scene._thin_K = k
     scene._thin_temp = 10.0
@@ -276,9 +288,8 @@ def prepare(args):
     heights = torch.zeros(points.shape[0], 4)
     heights[selected] = torch.from_numpy(
         offsets[selected] / np.maximum(radius[selected], 1e-8)).unsqueeze(-1).expand(-1, 4)
-    raw_plus = _inverse_softplus_beta10(torch.from_numpy(mu_plus)).unsqueeze(-1)
-    raw_minus = _inverse_softplus_beta10(torch.from_numpy(mu_minus)).unsqueeze(-1)
-    _configure_independent_scene(scene, raw_plus, raw_minus, quats, heights)
+    _configure_absolute_scene(
+        scene, torch.from_numpy(mu_plus), torch.from_numpy(mu_minus), quats, heights)
     oracle_path = out / "oracle_model.pt"
     scene.save_pt(str(oracle_path))
     meta = {
@@ -402,9 +413,11 @@ def recover(args):
     with torch.no_grad():
         scene.quaternions.copy_(_normal_to_quaternion(perturbed_n))
     initial_q = scene.quaternions.detach().clone()
-    for name in ("primal_points", "density", "raw_plus", "raw_minus",
-                 "texel_sites_2d", "texel_heights"):
-        getattr(scene, name).requires_grad_(False)
+    for name in ("primal_points", "density", "density_delta", "raw_plus",
+                 "raw_minus", "texel_sites_2d", "texel_heights"):
+        value = getattr(scene, name, None)
+        if value is not None:
+            value.requires_grad_(False)
     scene.quaternions.requires_grad_(True)
     optimizer = torch.optim.Adam([scene.quaternions], lr=args.lr, eps=1e-8)
 
