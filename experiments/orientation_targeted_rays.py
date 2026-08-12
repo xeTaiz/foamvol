@@ -75,7 +75,7 @@ def _sample_points_in_cells(scene, cells: torch.Tensor, max_rays: int,
         tried = 0
         while sum(x.shape[0] for x in chunks) < max_rays:
             need = max_rays - sum(x.shape[0] for x in chunks)
-            n = max(need * 3, 256)
+            n = min(max(need * 3, 256), 16384)
             # Uniform ball sampling, then exact Voronoi-owner verification.
             direction = torch.randn((n, 3), generator=gen, device=device)
             direction = F.normalize(direction, dim=-1)
@@ -85,7 +85,7 @@ def _sample_points_in_cells(scene, cells: torch.Tensor, max_rays: int,
             valid = (owner == cell) & (query.abs() <= 1.0).all(dim=-1)
             chunks.append(query[valid][:need])
             tried += n
-            if tried > max_rays * 200:
+            if tried > max_rays * 500:
                 raise RuntimeError(f"could not sample {max_rays} interior points for cell {int(cell)}")
         points = torch.cat(chunks, dim=0)[:max_rays]
         accepted.append(points.cpu())
