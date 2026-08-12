@@ -220,7 +220,11 @@ def _fit_oracle(points: np.ndarray, radius: np.ndarray, xyz: np.ndarray,
             normal = -normal
             threshold = -threshold
             mu_p, mu_m = mu_m, mu_p
-        if not np.isfinite(threshold) or abs(threshold) > max(2.0 * radius[cell], 1e-5):
+        # Keep the flat plane safely inside the cell scale. Large offsets near
+        # a Voronoi face make the iterative height intersection ill-conditioned
+        # for nearly tangent rays and are not a clean orientation diagnostic.
+        if (not np.isfinite(threshold)
+                or abs(threshold) > max(0.75 * radius[cell], 1e-5)):
             continue
         candidates.append((score, cell, normal.astype(np.float32), threshold,
                            mu_p, mu_m, improvement, contrast, count))
