@@ -94,11 +94,26 @@ def _sample_points_in_cells(scene, cells: torch.Tensor, max_rays: int,
 
 
 def _view_sequence(num_views: int, max_rays: int, cell_rank: int):
-    """Nested, angularly spread deterministic view sequence."""
-    golden = (math.sqrt(5.0) - 1.0) / 2.0
-    i = np.arange(max_rays, dtype=np.float64)
-    phase = (cell_rank * 0.3819660112501051) % 1.0
-    return np.floor(((i * golden + phase) % 1.0) * num_views).astype(np.int64)
+    """Nested, angularly spread sequence; repeats views after full coverage."""
+    # Bit-reversal ordering gives useful nested prefixes across the 75-view
+    # circle. Each cycle contains every acquisition view exactly once, then a
+    # cell-dependent offset changes which detector samples repeat that view.
+    bits = max(1, int(math.ceil(math.log2(num_views))))
+    ordered = []
+    for i in range(1 << bits):
+        rev = int(f"{i:0{bits}b}"[::-1], 2)
+        if rev < num_views:
+            ordered.append(rev)
+    ordered = np.asarray(ordered, dtype=np.int64)
+    cycles = []
+    needed = max_rays
+    cycle = 0
+    while needed > 0:
+        seq = (ordered + cell_rank * 7 + cycle * 13) % num_views
+        cycles.append(seq[:needed])
+        needed -= min(needed, num_views)
+        cycle += 1
+    return np.concatenate(cycles)
 
 
 def _build_ray_pool(scene, dataset, cells: torch.Tensor, points: torch.Tensor,
