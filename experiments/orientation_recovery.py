@@ -280,6 +280,15 @@ def prepare(args):
         args.max_cells, args.min_samples,
         args.min_contrast_frac * float(np.percentile(gt, 99)), args.min_improvement)
     scalar_mu, selected, normals, offsets, mu_plus, mu_minus, rows = fit
+    # Non-selected cells are not part of the orientation experiment. Preserve
+    # the trained scalar attenuation exactly instead of replacing it with a
+    # sparse-grid GT average (which can create severe ray outliers in tiny or
+    # poorly sampled cells).
+    base_mu = (F.softplus(scene.density.detach().cpu().reshape(-1), beta=10.0)
+               * float(scene.activation_scale)).numpy()
+    scalar_mu[~selected] = base_mu[~selected]
+    mu_plus[~selected] = base_mu[~selected]
+    mu_minus[~selected] = base_mu[~selected]
     if int(selected.sum()) < args.min_selected:
         raise RuntimeError(f"only {selected.sum()} informative cells selected; need {args.min_selected}")
 
