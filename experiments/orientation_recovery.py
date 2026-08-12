@@ -442,7 +442,11 @@ def recover(args):
     weight_gen = torch.Generator(device=args.device).manual_seed(args.seed + 991)
     fd_weights = torch.randn(fd_pred.shape, generator=weight_gen, device=args.device)
     fd_weights = fd_weights / math.sqrt(fd_pred.numel())
-    fd_objective = (fd_pred * fd_weights).sum()
+    # Center the objective at the unperturbed prediction for FD evaluation.
+    # Without centering, summing O(1) projections in float32 makes the tiny
+    # O(eps) difference fall below the accumulator ULP.
+    fd_base_pred = fd_pred.detach().clone()
+    fd_objective = ((fd_pred - fd_base_pred) * fd_weights).sum()
     fd_objective.backward()
     jacobian_grad = scene.quaternions.grad.detach().clone()
     direction = torch.zeros_like(scene.quaternions)
@@ -458,7 +462,7 @@ def recover(args):
     with torch.no_grad():
         for sign in (1.0, -1.0):
             scene.quaternions.copy_(F.normalize(q_base + sign * args.fd_eps * direction, dim=-1))
-            fd_losses.append(float((_render(scene, fd_rays) * fd_weights).sum().item()))
+            fd_losses.append(float(((_render(scene, fd_rays) - fd_base_pred) * fd_weights).sum().item()))
         scene.quaternions.copy_(q_base)
     finite_dir = (fd_losses[0] - fd_losses[1]) / (2.0 * args.fd_eps)
     fd_rel = abs(analytic_dir - finite_dir) / max(abs(finite_dir), abs(analytic_dir), 1e-12)
