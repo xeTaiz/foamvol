@@ -40,30 +40,13 @@ from vis_foam import (load_density_field, field_from_model, query_density,
                       sample_gt_slice, render_volume_drr,
                       voxelize_volumes, log_density_histogram,
                       log_volume_slices, visualize_cells_vs_gradient,
-                      log_thin_surface_zoom_panels)
+                      log_thin_surface_zoom_panels, select_gt_sobel_anchors)
 import radfoam
 
 
 seed = 42
 torch.random.manual_seed(seed)
 np.random.seed(seed)
-
-
-def parse_thin_surface_zoom_cells(value):
-    """Parse a config comma-list into immutable TensorBoard row IDs."""
-    if value is None:
-        return []
-    tokens = value if isinstance(value, (list, tuple)) else str(value).split(",")
-    parsed, seen = [], set()
-    for token in tokens:
-        try:
-            cell = int(str(token).strip())
-        except (TypeError, ValueError):
-            continue
-        if cell >= 0 and cell not in seen:
-            seen.add(cell)
-            parsed.append(cell)
-    return parsed
 
 
 def compute_psnr(pred, gt):
@@ -542,6 +525,21 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     gt_volume = load_gt_volume(dataset_args.data_path, dataset_args.dataset, dataset_args=dataset_args)
     if gt_volume is not None:
         print(f"Loaded GT volume: shape={gt_volume.shape}")
+    zoom_anchors = select_gt_sobel_anchors(
+        gt_volume,
+        count=int(getattr(optimizer_args, "thin_surface_zoom_anchor_count", 6)),
+        seed=int(getattr(optimizer_args, "thin_surface_zoom_anchor_seed", 42)),
+        center_fraction=float(getattr(
+            optimizer_args, "thin_surface_zoom_center_fraction", 0.6)),
+        min_separation=float(getattr(
+            optimizer_args, "thin_surface_zoom_min_separation", 0.16)),
+    )
+    if len(zoom_anchors):
+        anchor_text = "; ".join(
+            f"{idx}: ({x:.4f}, {y:.4f}, {z:.4f})"
+            for idx, (x, y, z) in enumerate(zoom_anchors))
+        writer.add_text("thin_surface_zoom/gt_sobel_anchors", anchor_text, 0)
+        print(f"TensorBoard thin-surface GT-Sobel anchors: {anchor_text}")
 
     r2_volume = load_r2_volume(dataset_args.data_path)
     if r2_volume is not None:
@@ -715,14 +713,12 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         tag = f"slice_{parts[-1]}/{'_'.join(parts[:-1])}"
                     writer.add_scalar(tag, val, step)
 
-            # The configured row IDs remain fixed throughout a stationary run,
-            # so TensorBoard shows a true cell-by-cell evolution rather than a
-            # different high-contrast selection at every diagnostic event.
-            zoom_cells = parse_thin_surface_zoom_cells(
-                getattr(optimizer_args, "thin_surface_zoom_cells", ""))
-            if zoom_cells:
+            # Fixed GT-space anchors are selected once before training from
+            # central high-Sobel locations; only their current owner is
+            # reassociated, so every TensorBoard event shows the same anatomy.
+            if len(zoom_anchors):
                 log_thin_surface_zoom_panels(
-                    model, gt_volume, writer, step, zoom_cells,
+                    model, gt_volume, writer, step, zoom_anchors,
                     resolution=int(getattr(
                         optimizer_args, "thin_surface_zoom_resolution", 192)),
                     extent_scale=float(getattr(
