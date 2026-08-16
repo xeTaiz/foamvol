@@ -58,6 +58,18 @@
 ## Important configuration caveat
 The generator set `densify_from` to the number of steps corresponding to a 1B-ray point-LR warmup (1000/250/125 steps for ref/4M/8M). Historical LC64 configs used `densify_from: 0`, so the `ref` arms are not exact reproductions of the earlier LC64 baselines; for example, the new 64k scalar reference is 1.86 dB below the prior Stage-A scalar. This warmup was exposure-matched across the new matrix, so within-matrix batch comparisons remain interpretable, but absolute comparisons to prior LC64 studies are confounded. A corrected no-warmup replication is required before treating the split-reference gain as a definitive replacement for earlier results.
 
+## Active split-cell audit and closeups
+`experiments/analyze_split_cells.py` (`88516b9`) samples a 192³ grid, assigns each point to its exact nearest Voronoi owner, and checks whether the learned implicit field has both signs inside each sampled cell. A primary meaningful split additionally requires at least 8 finite samples, base density ≥5% of GT p99, absolute side difference ≥1% of GT p99, and relative side difference ≥10%.
+
+| 64k split run | Surface crosses sampled cell | Meaningfully active | Fraction all cells |
+|---|---:|---:|---:|
+| ref | 51,282 | 12,432 | 19.4% |
+| 4m_lr1 | 53,056 | 17,517 | 27.4% |
+| 4m_lr2 | 53,097 | 15,771 | 24.6% |
+| 8m_lr3 | 54,895 | 13,119 | 20.5% |
+
+The reference conclusion is robust to stricter thresholds: 6,581 cells (10.3%) cross with relative contrast ≥20% and absolute difference ≥2% of GT p99; 1,961 (3.1%) cross with relative contrast ≥50% and absolute difference ≥5% of GT p99. Thus the split parameters are not universally dormant. They are difficult to identify in full-volume TensorBoard views because each 64k cell occupies only a few output pixels and no Voronoi/surface overlay is shown. Closeups render neighboring borders in white, the selected cell border in yellow, and the learned `s=0` surface in ultra-thin magenta. Artifacts are under `output/ray_batch_split_closeups/` locally and the browser gallery is served separately.
+
 ## Decision
 - Do not promote 4M/8M fewer-step schedules.
 - Do not launch hit-confidence update arms on these failed high-batch schedules.
