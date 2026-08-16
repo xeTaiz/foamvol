@@ -257,6 +257,14 @@ def _make_figure(path, selected, primary, points, density, delta, quat, sites,
     cols = min(3, len(selected))
     rows = math.ceil(len(selected) / cols)
     fig, axes = plt.subplots(rows, cols, figsize=(5.2 * cols, 5.0 * rows), squeeze=False)
+    # Do not clip the selected sides at GT p99.  That was misleading for e.g.
+    # mu-/mu+=0.795/0.472 when p99=0.473: both sides appeared white despite a
+    # 0.323 physical density difference.  This remains one shared physical
+    # scale across the figure, but includes every selected side value.
+    display_max = max(
+        float(p99),
+        1.02 * float(np.max(np.concatenate((mu_plus[selected], mu_minus[selected])))),
+    )
     device = points.device
     uv = torch.linspace(-1.0, 1.0, 320, device=device)
     uu, vv = torch.meshgrid(uv, uv, indexing="xy")
@@ -283,7 +291,7 @@ def _make_figure(path, selected, primary, points, density, delta, quat, sites,
             signed_np = signed.reshape(320, 320).cpu().numpy()
 
         ax.imshow(value_np, origin="lower", extent=(-1, 1, -1, 1), cmap="gray",
-                  vmin=0.0, vmax=max(float(p99), np.finfo(float).eps), interpolation="nearest")
+                  vmin=0.0, vmax=max(display_max, np.finfo(float).eps), interpolation="nearest")
         all_border = _pixel_boundaries(owner_np)
         ax.imshow(np.ma.masked_where(~all_border, all_border), origin="lower",
                   extent=(-1, 1, -1, 1), cmap=ListedColormap(["0.85"]),
@@ -311,7 +319,9 @@ def _make_figure(path, selected, primary, points, density, delta, quat, sites,
 
     for ax in axes.flat[len(selected):]:
         ax.axis("off")
-    fig.suptitle(f"Hard split density (global range [0, GT p99={p99:.4g}])", fontsize=13)
+    fig.suptitle(
+        f"Hard split density (shared non-clipping range [0, {display_max:.4g}]; "
+        f"GT p99={p99:.4g})", fontsize=13)
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
