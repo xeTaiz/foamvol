@@ -12,3 +12,11 @@ arms:
 - tag: FC64_w3e-4
   weight: 0.0003
   config: experiments/face_continuity_v1/configs/FC64_w3e-4.yaml
+- tag: FC64_w3e-5_geom
+  weight: 3.0e-05
+  density_weight: 0.0
+  config: experiments/face_continuity_v1/configs/FC64_w3e-5_geom.yaml
+- tag: FC64_w3e-5_d1
+  weight: 3.0e-05
+  density_weight: 1.0
+  config: experiments/face_continuity_v1/configs/FC64_w3e-5_d1.yaml
