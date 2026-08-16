@@ -292,10 +292,21 @@ def _make_figure(path, web_dir, gt, selected, primary, points, density, delta,
         ax.imshow(np.ma.masked_where(~target_border, target_border), origin="lower",
                   extent=(-1, 1, -1, 1), cmap=ListedColormap(["yellow"]),
                   interpolation="nearest")
-        masked_s = np.ma.masked_where(~target_mask, signed_np)
-        if target_mask.any() and masked_s.min() < 0 < masked_s.max():
-            ax.contour(np.linspace(-1, 1, 320), np.linspace(-1, 1, 320), masked_s,
-                       levels=[0.0], colors=["magenta"], linewidths=0.35)
+        # `signed_np` is evaluated with each pixel's actual Voronoi owner.
+        # Contour each owner's field only inside its own region: contouring the
+        # whole piecewise field would create false zero-lines across owner seams.
+        coords = np.linspace(-1, 1, 320)
+        for owner_id in np.unique(owner_np):
+            owner_mask = owner_np == owner_id
+            owner_signed = signed_np[owner_mask]
+            if owner_signed.size < 4 or not np.isfinite(owner_signed).all():
+                continue
+            if owner_signed.min() < 0 < owner_signed.max():
+                masked_s = np.ma.masked_where(~owner_mask, signed_np)
+                ax.contour(
+                    coords, coords, masked_s, levels=[0.0], colors=["magenta"],
+                    linewidths=(0.55 if owner_id == cell else 0.25), alpha=0.9,
+                )
         ax.plot(0, 0, marker="+", color="cyan", markersize=7,
                 markeredgewidth=0.8)
 
