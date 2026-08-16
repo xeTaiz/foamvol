@@ -248,7 +248,8 @@ class OptimizationParams(ParamGroup):
         # Shared-Voronoi-face split-surface continuity (frozen geometry only).
         self.thin_surface_face_weight = 0.0
         self.thin_surface_face_start = -1
-        self.thin_surface_face_batch = 8192
+        self.thin_surface_face_batch = 1024
+        self.thin_surface_face_candidate_refresh = 50
         self.thin_surface_face_samples = 12
         self.thin_surface_face_max_vertices = 32
         self.thin_surface_face_zero_weight = 1.0
