@@ -4,8 +4,9 @@
 The analysis assigns a uniform grid of in-volume voxel centers to their
 Voronoi owners, checks whether each sampled cell region contains both signs of
 its learned implicit surface, and combines that geometric test with absolute
-and relative density-contrast tests.  It writes ``summary.json``, ``cells.csv``
-and an inspectable ``examples.png`` to ``--output``.
+and relative density-contrast tests.  It writes ``summary.json``, ``cells.csv``,
+an inspectable ``examples.png``, and per-cell PNGs under ``web_panels`` to
+``--output``.
 """
 from __future__ import annotations
 
@@ -235,14 +236,16 @@ def _pixel_boundaries(owner):
     return boundary
 
 
-def _make_figure(path, selected, primary, points, density, delta, quat, sites,
-                 heights, tree, radius, rho, activation_scale, thin_temp, p99,
-                 mu_plus, mu_minus, abs_diff, rel_diff, sample_count, min_s, max_s):
+def _make_figure(path, web_dir, gt, selected, primary, points, density, delta,
+                 quat, sites, heights, tree, radius, rho, activation_scale,
+                 thin_temp, p99, mu_plus, mu_minus, abs_diff, rel_diff,
+                 sample_count, min_s, max_s):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import ListedColormap
 
+    web_dir.mkdir(parents=True, exist_ok=True)
     if len(selected) == 0:
         fig, ax = plt.subplots(figsize=(9, 3.5))
         ax.axis("off")
@@ -260,14 +263,49 @@ def _make_figure(path, selected, primary, points, density, delta, quat, sites,
     # Do not clip the selected sides at GT p99.  That was misleading for e.g.
     # mu-/mu+=0.795/0.472 when p99=0.473: both sides appeared white despite a
     # 0.323 physical density difference.  This remains one shared physical
-    # scale across the figure, but includes every selected side value.
+    # scale across the figure and web panels, but includes every selected side
+    # value.  GT is intentionally allowed to clip above this learned-data cap.
     display_max = max(
         float(p99),
         1.02 * float(np.max(np.concatenate((mu_plus[selected], mu_minus[selected])))),
     )
+    display_max = max(display_max, np.finfo(float).eps)
     device = points.device
-    uv = torch.linspace(-1.0, 1.0, 320, device=device)
+    uv = torch.linspace(-1.0, 1.0, 320, device=device, dtype=points.dtype)
     uu, vv = torch.meshgrid(uv, uv, indexing="xy")
+
+    # NumPy volumes are (x,y,z), while 5-D grid_sample sources are (z,y,x).
+    # Copying also handles read-only memmaps and non-native NumPy storage safely.
+    gt_xyz = np.array(gt, dtype=np.float32, order="C", copy=True)
+    gt_zyx = torch.from_numpy(gt_xyz).permute(2, 1, 0).contiguous()
+    gt_source = gt_zyx[None, None].to(device=device)
+
+    def draw_oblique(ax, image, owner_np, signed_np, cell):
+        ax.imshow(image, origin="lower", extent=(-1, 1, -1, 1), cmap="gray",
+                  vmin=0.0, vmax=display_max, interpolation="nearest")
+        all_border = _pixel_boundaries(owner_np)
+        ax.imshow(np.ma.masked_where(~all_border, all_border), origin="lower",
+                  extent=(-1, 1, -1, 1), cmap=ListedColormap(["0.85"]),
+                  interpolation="nearest", alpha=0.75)
+        target_mask = owner_np == cell
+        target_border = _pixel_boundaries(target_mask.astype(np.int8))
+        ax.imshow(np.ma.masked_where(~target_border, target_border), origin="lower",
+                  extent=(-1, 1, -1, 1), cmap=ListedColormap(["yellow"]),
+                  interpolation="nearest")
+        masked_s = np.ma.masked_where(~target_mask, signed_np)
+        if target_mask.any() and masked_s.min() < 0 < masked_s.max():
+            ax.contour(np.linspace(-1, 1, 320), np.linspace(-1, 1, 320), masked_s,
+                       levels=[0.0], colors=["magenta"], linewidths=0.35)
+        ax.plot(0, 0, marker="+", color="cyan", markersize=7,
+                markeredgewidth=0.8)
+
+    def save_square_panel(panel_path, image, owner_np, signed_np, cell):
+        panel_fig = plt.figure(figsize=(3.2, 3.2), dpi=100)
+        panel_ax = panel_fig.add_axes((0, 0, 1, 1))
+        draw_oblique(panel_ax, image, owner_np, signed_np, cell)
+        panel_ax.set_axis_off()
+        panel_fig.savefig(panel_path, dpi=100)
+        plt.close(panel_fig)
 
     for ax, cell in zip(axes.flat, selected):
         with torch.inference_mode():
@@ -286,26 +324,56 @@ def _make_figure(path, selected, primary, points, density, delta, quat, sites,
                 q, points, owner, density, delta, quat, sites, heights, radius,
                 thin_temp=thin_temp, activation_scale=activation_scale,
                 blend_eps=0.0, density_mode="relative", delta_max_frac=rho)
-            owner_np = owner.reshape(320, 320).cpu().numpy()
-            value_np = torch.nan_to_num(value).reshape(320, 320).cpu().numpy()
-            signed_np = signed.reshape(320, 320).cpu().numpy()
+            # q is reused verbatim as the grid_sample grid. align_corners=True
+            # maps normalized -1/+1 to the first/last GT voxel centers.
+            gt_grid = q.to(dtype=gt_source.dtype).reshape(1, 1, 320, 320, 3)
+            gt_value = F.grid_sample(
+                gt_source, gt_grid, mode="bilinear", padding_mode="zeros",
+                align_corners=True).reshape(320, 320)
+            owner_np = owner.reshape(320, 320).detach().cpu().numpy()
+            value_np = torch.nan_to_num(value).reshape(320, 320).detach().cpu().numpy()
+            gt_value_np = torch.nan_to_num(gt_value).detach().cpu().numpy()
+            signed_np = signed.reshape(320, 320).detach().cpu().numpy()
+            center_np = center.detach().cpu().numpy()
+            corners = torch.stack([
+                center + extent * (-tangent - normal),
+                center + extent * (tangent - normal),
+                center + extent * (tangent + normal),
+                center + extent * (-tangent + normal),
+            ]).detach().cpu().numpy()
 
-        ax.imshow(value_np, origin="lower", extent=(-1, 1, -1, 1), cmap="gray",
-                  vmin=0.0, vmax=max(display_max, np.finfo(float).eps), interpolation="nearest")
-        all_border = _pixel_boundaries(owner_np)
-        ax.imshow(np.ma.masked_where(~all_border, all_border), origin="lower",
-                  extent=(-1, 1, -1, 1), cmap=ListedColormap(["0.85"]),
-                  interpolation="nearest", alpha=0.75)
-        target_mask = owner_np == cell
-        target_border = _pixel_boundaries(target_mask.astype(np.int8))
-        ax.imshow(np.ma.masked_where(~target_border, target_border), origin="lower",
-                  extent=(-1, 1, -1, 1), cmap=ListedColormap(["yellow"]),
-                  interpolation="nearest")
-        masked_s = np.ma.masked_where(~target_mask, signed_np)
-        if target_mask.any() and masked_s.min() < 0 < masked_s.max():
-            ax.contour(np.linspace(-1, 1, 320), np.linspace(-1, 1, 320), masked_s,
-                       levels=[0.0], colors=["magenta"], linewidths=0.35)
-        ax.plot(0, 0, marker="+", color="cyan", markersize=7, markeredgewidth=0.8)
+        draw_oblique(ax, value_np, owner_np, signed_np, cell)
+        save_square_panel(web_dir / f"cell_{cell}_learned.png", value_np,
+                          owner_np, signed_np, cell)
+        save_square_panel(web_dir / f"cell_{cell}_gt.png", gt_value_np,
+                          owner_np, signed_np, cell)
+
+        z_axis = np.linspace(-1.0, 1.0, gt_xyz.shape[2])
+        z_index = int(np.argmin(np.abs(z_axis - center_np[2])))
+        axial_z = float(z_axis[z_index])
+        axial_xy = gt_xyz[:, :, z_index].T
+        locator_fig, locator_ax = plt.subplots(figsize=(3.2, 3.2), dpi=100)
+        locator_ax.imshow(axial_xy, origin="lower", extent=(-1, 1, -1, 1),
+                          cmap="gray", vmin=0.0, vmax=display_max,
+                          interpolation="nearest")
+        closed = np.concatenate((corners[:, :2], corners[:1, :2]), axis=0)
+        locator_ax.plot(closed[:, 0], closed[:, 1], color="yellow",
+                        linewidth=1.0, label="Oblique q plane")
+        locator_ax.plot(center_np[0], center_np[1], marker="+", color="cyan",
+                        markersize=7, markeredgewidth=1.0, linestyle="none",
+                        label="Cell center")
+        locator_ax.set_xlim(-1, 1)
+        locator_ax.set_ylim(-1, 1)
+        locator_ax.set_aspect("equal")
+        locator_ax.set_title(f"GT axial slice: z={axial_z:.4g} (index {z_index})",
+                             fontsize=8)
+        locator_ax.legend(loc="lower right", fontsize=6, framealpha=0.7)
+        locator_ax.set_xticks([])
+        locator_ax.set_yticks([])
+        locator_fig.tight_layout(pad=0.25)
+        locator_fig.savefig(web_dir / f"cell_{cell}_locator.png", dpi=100)
+        plt.close(locator_fig)
+
         label = "PRIMARY" if primary[cell] else "FILL / NON-PRIMARY"
         ax.set_title(
             f"cell {cell} — {label}\n"
@@ -333,8 +401,9 @@ def analyze(args):
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     gt = np.load(args.gt, mmap_mode="r")
-    if not np.issubdtype(gt.dtype, np.number) or gt.size == 0:
-        raise RuntimeError("GT must be a nonempty numeric NumPy array")
+    if (not np.issubdtype(gt.dtype, np.number) or np.iscomplexobj(gt)
+            or gt.size == 0 or gt.ndim != 3):
+        raise RuntimeError("GT must be a nonempty real numeric 3-D NumPy array")
     p99 = float(np.percentile(np.asarray(gt), 99))
     if not np.isfinite(p99) or p99 <= 0:
         raise RuntimeError(f"GT p99 must be finite and positive, got {p99}")
@@ -419,12 +488,27 @@ def analyze(args):
         fill = fill[np.argsort(score[fill])[::-1]]
         selected.extend(fill[:args.num_examples - len(selected)].tolist())
     summary["visualized_cell_ids"] = [int(i) for i in selected]
+    summary["web_panels"] = [
+        {
+            "id": int(i),
+            "learned": f"web_panels/cell_{int(i)}_learned.png",
+            "gt": f"web_panels/cell_{int(i)}_gt.png",
+            "locator": f"web_panels/cell_{int(i)}_locator.png",
+            "mu_bar": float(mu_bar[i]),
+            "mu_plus": float(mu_plus[i]),
+            "mu_minus": float(mu_minus[i]),
+            "absolute_contrast": float(abs_diff[i]),
+            "relative_contrast": float(rel_diff[i]),
+            "center": [float(v) for v in points_np[i]],
+        }
+        for i in selected
+    ]
+    _make_figure(output / "examples.png", output / "web_panels", gt,
+                 selected, primary, points, density, delta, quat, sites, heights,
+                 tree, radius, rho, activation_scale, thin_temp, p99, mu_plus,
+                 mu_minus, abs_diff, rel_diff, sample_count, min_s, max_s)
     (output / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n")
-    _make_figure(output / "examples.png", selected, primary, points, density,
-                 delta, quat, sites, heights, tree, radius, rho, activation_scale,
-                 thin_temp, p99, mu_plus, mu_minus, abs_diff, rel_diff,
-                 sample_count, min_s, max_s)
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 
@@ -438,7 +522,8 @@ def parser():
     p.add_argument("--gt", required=True,
                    help="Path to the ground-truth NumPy volume used to obtain p99GT.")
     p.add_argument("--output", required=True,
-                   help="Output directory for summary.json, cells.csv, and examples.png.")
+                   help=("Output directory for summary.json, cells.csv, examples.png, "
+                         "and web_panels/."))
     p.add_argument("--resolution", type=int, default=192,
                    help="Uniform voxel-center samples per axis over [-1,1]^3.")
     p.add_argument("--chunk", type=int, default=1_000_000,
