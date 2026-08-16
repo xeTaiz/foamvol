@@ -39,13 +39,31 @@ from vis_foam import (load_density_field, field_from_model, query_density,
                       visualize_slices, load_gt_volume, load_r2_volume,
                       sample_gt_slice, render_volume_drr,
                       voxelize_volumes, log_density_histogram,
-                      log_volume_slices, visualize_cells_vs_gradient)
+                      log_volume_slices, visualize_cells_vs_gradient,
+                      log_thin_surface_zoom_panels)
 import radfoam
 
 
 seed = 42
 torch.random.manual_seed(seed)
 np.random.seed(seed)
+
+
+def parse_thin_surface_zoom_cells(value):
+    """Parse a config comma-list into immutable TensorBoard row IDs."""
+    if value is None:
+        return []
+    tokens = value if isinstance(value, (list, tuple)) else str(value).split(",")
+    parsed, seen = [], set()
+    for token in tokens:
+        try:
+            cell = int(str(token).strip())
+        except (TypeError, ValueError):
+            continue
+        if cell >= 0 and cell not in seen:
+            seen.add(cell)
+            parsed.append(cell)
+    return parsed
 
 
 def compute_psnr(pred, gt):
@@ -696,6 +714,20 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     else:
                         tag = f"slice_{parts[-1]}/{'_'.join(parts[:-1])}"
                     writer.add_scalar(tag, val, step)
+
+            # The configured row IDs remain fixed throughout a stationary run,
+            # so TensorBoard shows a true cell-by-cell evolution rather than a
+            # different high-contrast selection at every diagnostic event.
+            zoom_cells = parse_thin_surface_zoom_cells(
+                getattr(optimizer_args, "thin_surface_zoom_cells", ""))
+            if zoom_cells:
+                log_thin_surface_zoom_panels(
+                    model, gt_volume, writer, step, zoom_cells,
+                    resolution=int(getattr(
+                        optimizer_args, "thin_surface_zoom_resolution", 192)),
+                    extent_scale=float(getattr(
+                        optimizer_args, "thin_surface_zoom_extent_scale", 2.2)),
+                )
 
             # Cell heatmap
             log_fig_hm = partial(writer.add_figure, f"cell_heatmap/{experiment_name}", global_step=step)

@@ -110,6 +110,68 @@ def _topology_from_live_triangulation(tri, num_points, device):
     }
 
 
+def _thin_surface_query_config(field):
+    """Return validated split-query state, or None for scalar fallback."""
+    try:
+        active = field.get("thin_surface_active", False)
+        mode = field.get("thin_surface_density_mode")
+        relative = field.get("thin_surface_relative_delta")
+        if (not isinstance(active, (bool, np.bool_)) or not bool(active)
+                or mode not in ("absolute", "relative", "independent")
+                or not isinstance(relative, (bool, np.bool_))
+                or bool(relative) != (mode == "relative")):
+            return None
+
+        points = field["points"]
+        density = field["density_flat"]
+        cell_radius = field["cell_radius"]
+        quaternions = field["quaternions"]
+        texel_sites_2d = field["texel_sites_2d"]
+        texel_heights = field["texel_heights"]
+        tensors = (points, density, cell_radius, quaternions,
+                   texel_sites_2d, texel_heights)
+        if mode == "independent":
+            raw_plus = field["raw_plus"]
+            raw_minus = field["raw_minus"]
+            side_tensors = (raw_plus, raw_minus)
+        else:
+            density_delta = field["density_delta"]
+            side_tensors = (density_delta,)
+        tensors += side_tensors
+        if not all(isinstance(value, torch.Tensor) for value in tensors):
+            return None
+
+        n_cells = points.shape[0] if points.ndim == 2 else 0
+        valid_side_shapes = all(
+            tuple(value.shape) in ((n_cells,), (n_cells, 1))
+            for value in side_tensors
+        )
+        if (points.shape != (n_cells, 3)
+                or density.ndim not in (1, 2) or density.numel() != n_cells
+                or density.shape[0] != n_cells
+                or cell_radius.numel() != n_cells
+                or not valid_side_shapes
+                or quaternions.shape != (n_cells, 4)
+                or texel_sites_2d.ndim != 3
+                or texel_sites_2d.shape[0] != n_cells
+                or texel_sites_2d.shape[1] < 1
+                or texel_sites_2d.shape[2] != 2
+                or texel_heights.shape != texel_sites_2d.shape[:2]
+                or not all(value.is_floating_point() for value in tensors)
+                or any(value.device != points.device for value in tensors)):
+            return None
+
+        activation_scale = float(field["activation_scale"])
+        delta_max_frac = float(field["thin_surface_delta_max_frac"])
+        if (not np.isfinite(activation_scale) or activation_scale < 0.0
+                or not np.isfinite(delta_max_frac) or delta_max_frac < 0.0):
+            return None
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+    return mode, activation_scale, delta_max_frac
+
+
 def field_from_model(model):
     """Build a field dict from a live CTScene (no checkpoint save/load)."""
     with torch.no_grad():
@@ -127,7 +189,15 @@ def field_from_model(model):
             # Retain the standalone/test fallback when no compatible live
             # triangulation is available.
             topology = _build_tet_topology(model.primal_points)
-        return {
+
+        try:
+            activation_scale = float(getattr(model, "activation_scale", 1.0))
+        except (TypeError, ValueError, OverflowError):
+            activation_scale = 1.0
+        if not np.isfinite(activation_scale):
+            activation_scale = 1.0
+
+        field = {
             "points": model.primal_points,
             "density_flat": model.density.squeeze(-1),
             "gradients": getattr(model, "density_grad", None),
@@ -137,8 +207,40 @@ def field_from_model(model):
             "aabb_tree": model.aabb_tree,
             "cell_radius": cell_radius,
             "device": model.primal_points.device,
+            "activation_scale": activation_scale,
             **topology,
         }
+
+        thin_names = (
+            "quaternions", "texel_sites_2d", "texel_heights",
+            "_thin_surface_density_mode", "_thin_surface_relative_delta",
+            "_thin_surface_delta_max_frac",
+        )
+        if (getattr(model, "_thin_surface_active", False)
+                and all(hasattr(model, name) for name in thin_names)):
+            density_mode = model._thin_surface_density_mode
+            thin_field = {
+                "thin_surface_active": True,
+                "thin_surface_density_mode": density_mode,
+                "thin_surface_relative_delta": model._thin_surface_relative_delta,
+                "thin_surface_delta_max_frac": model._thin_surface_delta_max_frac,
+                "quaternions": model.quaternions,
+                "texel_sites_2d": model.texel_sites_2d,
+                "texel_heights": model.texel_heights,
+            }
+            if density_mode == "independent":
+                thin_field.update({
+                    "raw_plus": getattr(model, "raw_plus", None),
+                    "raw_minus": getattr(model, "raw_minus", None),
+                })
+            else:
+                thin_field["density_delta"] = getattr(
+                    model, "density_delta", None)
+            candidate = {**field, **thin_field}
+            if _thin_surface_query_config(candidate) is not None:
+                field.update(thin_field)
+
+        return field
 
 
 def load_density_field(model_path, device="cuda"):
@@ -200,14 +302,45 @@ def query_density(field, coordinates):
         query = coords_flat[start:end]
         nn_indices = radfoam.nn(field["points"], field["aabb_tree"], query).long()
 
-        if field["gradients"] is not None:
+        thin_config = _thin_surface_query_config(field)
+        if thin_config is not None:
+            # Keep the split dependency local to live thin-surface slices.
+            from split_voxelize import split_cell_query
+            density_mode, activation_scale, delta_max_frac = thin_config
+            if density_mode == "independent":
+                value, _, _ = split_cell_query(
+                    query, field["points"], nn_indices, field["density_flat"],
+                    None, field["quaternions"], field["texel_sites_2d"],
+                    field["texel_heights"], field["cell_radius"],
+                    thin_temp=10.0, activation_scale=activation_scale,
+                    blend_eps=0.0, density_mode="independent",
+                    raw_plus=field["raw_plus"], raw_minus=field["raw_minus"],
+                    delta_max_frac=delta_max_frac,
+                )
+            else:
+                value, _, _ = split_cell_query(
+                    query, field["points"], nn_indices, field["density_flat"],
+                    field["density_delta"], field["quaternions"],
+                    field["texel_sites_2d"], field["texel_heights"],
+                    field["cell_radius"], thin_temp=10.0,
+                    activation_scale=activation_scale, blend_eps=0.0,
+                    density_mode=density_mode, delta_max_frac=delta_max_frac,
+                )
+            result[start:end] = value
+        elif field["gradients"] is not None:
             result[start:end] = sample_interpolated(
                 query, nn_indices,
                 field["points"], field["density_flat"],
                 field["gradients"], field["grad_max_slope"],
             )
         else:
-            result[start:end] = F.softplus(
+            try:
+                activation_scale = float(field.get("activation_scale", 1.0))
+            except (TypeError, ValueError, OverflowError):
+                activation_scale = 1.0
+            if not np.isfinite(activation_scale):
+                activation_scale = 1.0
+            result[start:end] = activation_scale * F.softplus(
                 field["density_flat"][nn_indices], beta=10
             )
 
@@ -1769,6 +1902,249 @@ def visualize_slices(density_slices, idw_slices, cell_density_slices,
             metrics["sobel_blend_ssim"] = np.mean(sobel_blend_ssims)
         return metrics
     return None
+
+
+def log_thin_surface_zoom_panels(
+        model, gt_volume, writer, step, cell_ids, resolution=192,
+        extent_scale=2.2, tag="thin_surface_zoom"):
+    """Log learned/GT oblique zooms for fixed thin-surface cell rows.
+
+    This is a read-only training diagnostic.  Unsupported or incomplete model
+    states, invalid GT volumes, and invalid cell IDs are skipped silently.
+    """
+    # Keep this helper safe to call unconditionally from train.py.  In
+    # particular, independent-side checkpoints are intentionally not handled.
+    if not getattr(model, "_thin_surface_active", False):
+        return
+    density_mode = getattr(model, "_thin_surface_density_mode", None)
+    if density_mode not in ("absolute", "relative"):
+        return
+    # The bool is the legacy renderer discriminator; honor it if an older live
+    # model labels the same state as absolute.
+    relative_delta = bool(getattr(model, "_thin_surface_relative_delta", False))
+    if relative_delta:
+        density_mode = "relative"
+
+    required = (
+        "primal_points", "density", "density_delta", "quaternions",
+        "texel_sites_2d", "texel_heights", "point_adjacency",
+        "point_adjacency_offsets", "aabb_tree",
+    )
+    if any(getattr(model, name, None) is None for name in required):
+        return
+    if writer is None or gt_volume is None:
+        return
+    if (not isinstance(resolution, (int, np.integer)) or isinstance(resolution, bool)
+            or resolution < 2 or not np.isfinite(extent_scale)
+            or extent_scale <= 0):
+        return
+
+    points = model.primal_points.detach()
+    density = model.density.detach()
+    density_delta = model.density_delta.detach()
+    quaternions = model.quaternions.detach()
+    texel_sites_2d = model.texel_sites_2d.detach()
+    texel_heights = model.texel_heights.detach()
+    adjacency = model.point_adjacency.detach()
+    adjacency_offsets = model.point_adjacency_offsets.detach()
+    n_cells = points.shape[0] if points.ndim == 2 else 0
+
+    # Validate all row-indexed state before invoking RadFoam.  A partially
+    # initialized thin-surface model should remain a clean no-op.
+    if (points.shape != (n_cells, 3)
+            or density.ndim not in (1, 2) or density.shape[0] != n_cells
+            or density.numel() != n_cells
+            or density_delta.ndim not in (1, 2)
+            or density_delta.shape[0] != n_cells
+            or density_delta.numel() != n_cells
+            or quaternions.shape != (n_cells, 4)
+            or texel_sites_2d.ndim != 3
+            or texel_sites_2d.shape[0] != n_cells
+            or texel_sites_2d.shape[-1] != 2
+            or texel_heights.shape != texel_sites_2d.shape[:2]
+            or adjacency.ndim != 1
+            or adjacency_offsets.shape != (n_cells + 1,)):
+        return
+
+    # A fixed row ID is deliberately not coerced from floats or strings.
+    selected = []
+    seen = set()
+    try:
+        candidates = iter(cell_ids)
+    except TypeError:
+        return
+    for value in candidates:
+        if isinstance(value, torch.Tensor):
+            if value.ndim != 0 or value.dtype == torch.bool or value.dtype.is_floating_point:
+                continue
+            value = value.item()
+        if not isinstance(value, (int, np.integer)) or isinstance(value, (bool, np.bool_)):
+            continue
+        cell = int(value)
+        if 0 <= cell < n_cells and cell not in seen:
+            seen.add(cell)
+            selected.append(cell)
+    if not selected:
+        return
+
+    if isinstance(gt_volume, torch.Tensor):
+        gt_xyz = gt_volume.detach()
+        if gt_xyz.ndim != 3 or gt_xyz.numel() == 0 or gt_xyz.is_complex():
+            return
+        gt_xyz = gt_xyz.to(device=points.device, dtype=torch.float32)
+    else:
+        try:
+            gt_np = np.array(gt_volume, dtype=np.float32, order="C", copy=True)
+        except (TypeError, ValueError):
+            return
+        if gt_np.ndim != 3 or gt_np.size == 0:
+            return
+        gt_xyz = torch.from_numpy(gt_np).to(device=points.device)
+    if not torch.isfinite(gt_xyz).all():
+        return
+
+    # NumPy/torch GT is logically (x,y,z); grid_sample's source is (z,y,x),
+    # while its grid coordinates remain q=(x,y,z).
+    gt_source = gt_xyz.permute(2, 1, 0).contiguous()[None, None]
+    gt_p99 = float(torch.quantile(gt_xyz.float().reshape(-1), 0.99).item())
+    if not np.isfinite(gt_p99):
+        return
+
+    # Safe local imports keep normal vis_foam users independent of the split
+    # diagnostics and Matplotlib backend setup.
+    from split_voxelize import quat_to_frame, split_cell_query
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    def pixel_boundaries(labels):
+        border = np.zeros(labels.shape, dtype=bool)
+        changed = labels[1:, :] != labels[:-1, :]
+        border[1:, :] |= changed
+        border[:-1, :] |= changed
+        changed = labels[:, 1:] != labels[:, :-1]
+        border[:, 1:] |= changed
+        border[:, :-1] |= changed
+        return border
+
+    def draw_panel(ax, image, owner_np, signed_np, focus, vmax, title):
+        ax.imshow(image, origin="lower", extent=(-1, 1, -1, 1), cmap="gray",
+                  vmin=0.0, vmax=vmax, interpolation="nearest")
+
+        borders = pixel_boundaries(owner_np)
+        border_rgba = np.zeros((*borders.shape, 4), dtype=np.float32)
+        border_rgba[borders] = (0.7, 0.7, 0.7, 0.8)
+        ax.imshow(border_rgba, origin="lower", extent=(-1, 1, -1, 1),
+                  interpolation="nearest")
+
+        focus_border = pixel_boundaries((owner_np == focus).astype(np.int8))
+        focus_rgba = np.zeros((*focus_border.shape, 4), dtype=np.float32)
+        focus_rgba[focus_border] = (1.0, 1.0, 0.0, 1.0)
+        ax.imshow(focus_rgba, origin="lower", extent=(-1, 1, -1, 1),
+                  interpolation="nearest")
+
+        # Contour each owner's signed field only where that owner is exact.
+        # This prevents discontinuities at owner seams from becoming false
+        # magenta zero contours.
+        coords = np.linspace(-1.0, 1.0, resolution)
+        for owner_id in np.unique(owner_np):
+            owner_mask = owner_np == owner_id
+            values = signed_np[owner_mask]
+            if (values.size < 4 or not np.isfinite(values).all()
+                    or values.min() >= 0.0 or values.max() <= 0.0):
+                continue
+            ax.contour(coords, coords,
+                       np.ma.masked_where(~owner_mask, signed_np),
+                       levels=[0.0], colors=["magenta"], linewidths=0.45)
+        ax.plot(0.0, 0.0, marker="+", color="cyan", markersize=7,
+                markeredgewidth=1.0, linestyle="none")
+        ax.set_title(title, fontsize=10)
+        ax.set_xlim(-1, 1)
+        ax.set_ylim(-1, 1)
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    activation_scale = float(getattr(model, "activation_scale", 1.0))
+    delta_max_frac = float(getattr(model, "_thin_surface_delta_max_frac", 0.5))
+    if (not np.isfinite(activation_scale) or not np.isfinite(delta_max_frac)):
+        return
+
+    with torch.inference_mode():
+        _, cell_radius = radfoam.farthest_neighbor(
+            points, adjacency.to(torch.int32), adjacency_offsets.to(torch.int32))
+        cell_radius = cell_radius.reshape(-1)
+        if cell_radius.shape != (n_cells,):
+            return
+
+        uv = torch.linspace(-1.0, 1.0, resolution, device=points.device,
+                            dtype=points.dtype)
+        uu, vv = torch.meshgrid(uv, uv, indexing="xy")
+        density_flat = density.reshape(-1)
+        delta_flat = density_delta.reshape(-1)
+        mu_bar = activation_scale * F.softplus(density_flat, beta=10.0)
+        if density_mode == "relative":
+            effective_delta = (delta_max_frac * mu_bar
+                               * torch.tanh(delta_flat))
+        else:
+            effective_delta = delta_flat
+        mu_plus = torch.clamp(mu_bar + effective_delta, min=0.0)
+        mu_minus = torch.clamp(mu_bar - effective_delta, min=0.0)
+
+        for cell in selected:
+            radius = cell_radius[cell]
+            if not torch.isfinite(radius) or radius <= 0:
+                continue
+            center = points[cell]
+            normal = quat_to_frame(quaternions[cell:cell + 1])[0][0]
+            ref = torch.tensor([0.0, 0.0, 1.0], device=points.device,
+                               dtype=points.dtype)
+            if torch.abs(torch.dot(normal, ref)) > 0.9:
+                ref = torch.tensor([0.0, 1.0, 0.0], device=points.device,
+                                   dtype=points.dtype)
+            tangent = F.normalize(torch.linalg.cross(ref, normal), dim=0)
+            extent = extent_scale * radius
+            q = center + extent * (
+                uu.reshape(-1, 1) * tangent + vv.reshape(-1, 1) * normal)
+
+            owner = radfoam.nn(points, model.aabb_tree, q).long()
+            learned, _, signed = split_cell_query(
+                q, points, owner, density_flat, density_delta, quaternions,
+                texel_sites_2d, texel_heights, cell_radius,
+                thin_temp=10.0, activation_scale=activation_scale,
+                blend_eps=0.0, density_mode=density_mode,
+                delta_max_frac=delta_max_frac)
+            gt_grid = q.to(dtype=gt_source.dtype).reshape(
+                1, 1, resolution, resolution, 3)
+            gt_values = F.grid_sample(
+                gt_source, gt_grid, mode="bilinear", padding_mode="zeros",
+                align_corners=True).reshape(resolution, resolution)
+
+            learned_np = torch.nan_to_num(learned).reshape(
+                resolution, resolution).cpu().numpy()
+            gt_np = torch.nan_to_num(gt_values).cpu().numpy()
+            owner_np = owner.reshape(resolution, resolution).cpu().numpy()
+            signed_np = signed.reshape(resolution, resolution).cpu().numpy()
+            plus = float(mu_plus[cell].item())
+            minus = float(mu_minus[cell].item())
+            abs_delta = float(effective_delta[cell].abs().item())
+            vmax = 1.02 * max(gt_p99, plus, minus, np.finfo(np.float32).eps)
+
+            fig, axes = plt.subplots(1, 2, figsize=(8.0, 4.2))
+            draw_panel(axes[0], learned_np, owner_np, signed_np, cell, vmax,
+                       "Learned hard split")
+            draw_panel(axes[1], gt_np, owner_np, signed_np, cell, vmax, "GT")
+            fig.suptitle(
+                f"cell {cell}  mu-/mu+ {minus:.4g}/{plus:.4g}  "
+                f"abs delta {abs_delta:.4g}  step {step}\n"
+                f"shared density range [0, {vmax:.4g}]",
+                fontsize=11)
+            fig.tight_layout()
+            try:
+                writer.add_figure(f"{tag}/cell_{cell}", fig,
+                                  global_step=step)
+            finally:
+                plt.close(fig)
 
 
 def log_density_histogram(model, writer, step):
