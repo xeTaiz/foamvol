@@ -1,0 +1,14 @@
+commit: 5dac797
+arms:
+- tag: FC64_control
+  weight: 0.0
+  config: experiments/face_continuity_v1/configs/FC64_control.yaml
+- tag: FC64_w3e-5
+  weight: 3.0e-05
+  config: experiments/face_continuity_v1/configs/FC64_w3e-5.yaml
+- tag: FC64_w1e-4
+  weight: 0.0001
+  config: experiments/face_continuity_v1/configs/FC64_w1e-4.yaml
+- tag: FC64_w3e-4
+  weight: 0.0003
+  config: experiments/face_continuity_v1/configs/FC64_w3e-4.yaml
