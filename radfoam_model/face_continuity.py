@@ -437,12 +437,14 @@ def face_continuity_loss(
     orientation_j = torch.where(
         plus_j >= minus_j, torch.ones_like(plus_j), -torch.ones_like(plus_j)).detach()
 
-    signed_i, normals_i = evaluate_surface_field(
+    signed_i, _ = evaluate_surface_field(
         i, query, model.primal_points, model.quaternions,
-        model.texel_sites_2d, model.texel_heights, model._cached_cell_radius)
-    signed_j, normals_j = evaluate_surface_field(
+        model.texel_sites_2d, model.texel_heights, model._cached_cell_radius,
+        return_normal=False)
+    signed_j, _ = evaluate_surface_field(
         j, query, model.primal_points, model.quaternions,
-        model.texel_sites_2d, model.texel_heights, model._cached_cell_radius)
+        model.texel_sites_2d, model.texel_heights, model._cached_cell_radius,
+        return_normal=False)
     phi_i = orientation_i[:, None] * signed_i
     phi_j = orientation_j[:, None] * signed_j
 
@@ -484,10 +486,12 @@ def face_continuity_loss(
         side_same = ((phi_i * phi_j) > 0) & away
         side_agreement = side_same.sum(-1).float() / away.sum(-1).clamp_min(1)
 
-    near_i = torch.softmax(-phi_i.abs() / (zero_bandwidth * face_scale[:, None]), dim=-1).detach()
-    near_j = torch.softmax(-phi_j.abs() / (zero_bandwidth * face_scale[:, None]), dim=-1).detach()
-    normal_i = F.normalize((near_i[..., None] * normals_i).sum(dim=1), dim=-1)
-    normal_j = F.normalize((near_j[..., None] * normals_j).sum(dim=1), dim=-1)
+    # The quaternion frame normal is the model's local plane direction. The
+    # face-restricted zero-set term separately constrains learned K-height
+    # offsets/curvature. Avoiding height-field normal derivatives makes this
+    # per-step regularizer substantially cheaper while preserving both controls.
+    normal_i = quaternion_to_frame(model.quaternions[i])[0]
+    normal_j = quaternion_to_frame(model.quaternions[j])[0]
     high_normal_i = orientation_i[:, None] * normal_i
     high_normal_j = orientation_j[:, None] * normal_j
     normal_dot = (high_normal_i * high_normal_j).sum(-1).clamp(-1.0, 1.0)
