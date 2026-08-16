@@ -249,6 +249,9 @@ class OptimizationParams(ParamGroup):
         self.thin_surface_face_weight = 0.0
         self.thin_surface_face_start = -1
         self.thin_surface_face_batch = 1024
+        # Sparse updates keep measured overhead near 5-6% (one ~79 ms face
+        # backward every 8 CT steps versus ~161 ms/reference CT step).
+        self.thin_surface_face_interval = 8
         self.thin_surface_face_candidate_refresh = 50
         self.thin_surface_face_samples = 12
         self.thin_surface_face_max_vertices = 32

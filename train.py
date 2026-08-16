@@ -1081,6 +1081,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
             log_volume_slices(model, writer, gt_volume, 0, experiment_name)
 
         _loss_cpu = None
+        last_face_loss = None
+        last_face_diag = None
         with tqdm.trange(pipeline_args.iterations) as train:
             for i in train:
                 # True stationary-frame control (LC64 plan v2):
@@ -1245,7 +1247,11 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         ts_height_loss = model.texel_heights.abs().mean()
                         loss = loss + ts_height_w * ts_height_loss
 
-                    if face_weight > 0 and face_start >= 0 and i >= face_start:
+                    face_interval = int(getattr(
+                        optimizer_args, "thin_surface_face_interval", 8))
+                    if (face_weight > 0 and face_start >= 0 and i >= face_start
+                            and face_interval > 0
+                            and (i - face_start) % face_interval == 0):
                         face_loss, face_diag = (
                             model.thin_surface_face_continuity_regularization(
                                 step=i, density_scale=gt_density_scale,
@@ -1283,6 +1289,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                                     optimizer_args, "thin_surface_face_seed", 42)),
                             ))
                         loss = loss + face_weight * face_loss
+                        last_face_loss = face_loss.detach()
+                        last_face_diag = face_diag
 
                 rv_w_cfg = getattr(optimizer_args, "ref_volume_weight", 0.0)
                 rv_start = getattr(optimizer_args, "ref_volume_start", 0)
@@ -1442,12 +1450,14 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         writer.add_scalar("train/ts_delta_loss", ts_delta_loss.item(), i)
                     if ts_height_loss is not None:
                         writer.add_scalar("train/ts_height_loss", ts_height_loss.item(), i)
-                    if face_loss is not None:
+                    if last_face_loss is not None:
                         writer.add_scalar("face_continuity/weighted_total",
-                                          face_weight * face_loss.item(), i)
+                                          face_weight * last_face_loss.item(), i)
                         writer.add_scalar("face_continuity/raw_total",
-                                          face_loss.item(), i)
-                        for _key, _value in face_diag.items():
+                                          last_face_loss.item(), i)
+                        writer.add_scalar("face_continuity/update_interval",
+                                          face_interval, i)
+                        for _key, _value in last_face_diag.items():
                             writer.add_scalar(f"face_continuity/{_key}", _value, i)
                     # P0-F thin-surface activity/parameter diagnostics
                     if getattr(model, '_thin_surface_active', False):
