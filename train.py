@@ -525,6 +525,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     gt_volume = load_gt_volume(dataset_args.data_path, dataset_args.dataset, dataset_args=dataset_args)
     if gt_volume is not None:
         print(f"Loaded GT volume: shape={gt_volume.shape}")
+    gt_density_scale = (float(np.percentile(gt_volume, 99))
+                        if gt_volume is not None else 1.0)
     zoom_anchors = select_gt_sobel_anchors(
         gt_volume,
         count=int(getattr(optimizer_args, "thin_surface_zoom_anchor_count", 6)),
@@ -1088,6 +1090,19 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 # primal-points param group.  Idempotent; no-op when
                 # points_hard_freeze_at is disabled (default).
                 model.enforce_hard_point_freeze(i)
+                face_weight = float(getattr(
+                    optimizer_args, "thin_surface_face_weight", 0.0))
+                face_start = int(getattr(
+                    optimizer_args, "thin_surface_face_start", -1))
+                # Build the temporary-heavy geometry cache before the CT forward
+                # graph exists. Runtime face batches then reuse the compact cache.
+                if (face_weight > 0 and i == face_start
+                        and getattr(model, "_thin_surface_active", False)):
+                    model.build_thin_surface_face_cache(
+                        num_samples=int(getattr(
+                            optimizer_args, "thin_surface_face_samples", 12)),
+                        max_vertices=int(getattr(
+                            optimizer_args, "thin_surface_face_max_vertices", 32)))
                 return_diag = (pipeline_args.diag and i % diag_interval == diag_interval - 1 and not pipeline_args.debug)
                 proj_output, contribution, hit_count, _, _ = model(ray_batch, return_contribution=return_diag)
 
@@ -1205,6 +1220,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 # Thin-surface regularization (active only after thin_surface_start)
                 ts_delta_loss = None
                 ts_height_loss = None
+                face_loss = None
+                face_diag = None
                 if getattr(model, '_thin_surface_active', False):
                     ts_delta_w  = getattr(optimizer_args, 'thin_surface_delta_weight', 1e-3)
                     ts_height_w = getattr(optimizer_args, 'thin_surface_height_weight', 1e-3)
@@ -1227,6 +1244,43 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     if ts_height_w > 0 and hasattr(model, 'texel_heights'):
                         ts_height_loss = model.texel_heights.abs().mean()
                         loss = loss + ts_height_w * ts_height_loss
+
+                    if face_weight > 0 and face_start >= 0 and i >= face_start:
+                        face_loss, face_diag = (
+                            model.thin_surface_face_continuity_regularization(
+                                step=i, density_scale=gt_density_scale,
+                                batch_size=int(getattr(
+                                    optimizer_args, "thin_surface_face_batch", 8192)),
+                                num_samples=int(getattr(
+                                    optimizer_args, "thin_surface_face_samples", 12)),
+                                max_vertices=int(getattr(
+                                    optimizer_args, "thin_surface_face_max_vertices", 32)),
+                                abs_contrast_fraction=float(getattr(
+                                    optimizer_args, "thin_surface_face_abs_contrast_fraction", 0.01)),
+                                relative_contrast_threshold=float(getattr(
+                                    optimizer_args, "thin_surface_face_relative_contrast", 0.10)),
+                                base_density_fraction=float(getattr(
+                                    optimizer_args, "thin_surface_face_base_density_fraction", 0.05)),
+                                crossing_margin_fraction=float(getattr(
+                                    optimizer_args, "thin_surface_face_crossing_margin", 0.005)),
+                                side_agreement_threshold=float(getattr(
+                                    optimizer_args, "thin_surface_face_side_agreement", 0.60)),
+                                normal_dot_threshold=float(getattr(
+                                    optimizer_args, "thin_surface_face_normal_dot", 0.0)),
+                                zero_bandwidth=float(getattr(
+                                    optimizer_args, "thin_surface_face_zero_bandwidth", 0.20)),
+                                huber_beta=float(getattr(
+                                    optimizer_args, "thin_surface_face_huber_beta", 0.05)),
+                                zero_weight=float(getattr(
+                                    optimizer_args, "thin_surface_face_zero_weight", 1.0)),
+                                normal_weight=float(getattr(
+                                    optimizer_args, "thin_surface_face_normal_weight", 0.25)),
+                                density_weight=float(getattr(
+                                    optimizer_args, "thin_surface_face_density_weight", 0.10)),
+                                seed=int(getattr(
+                                    optimizer_args, "thin_surface_face_seed", 42)),
+                            ))
+                        loss = loss + face_weight * face_loss
 
                 rv_w_cfg = getattr(optimizer_args, "ref_volume_weight", 0.0)
                 rv_start = getattr(optimizer_args, "ref_volume_start", 0)
@@ -1386,6 +1440,13 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         writer.add_scalar("train/ts_delta_loss", ts_delta_loss.item(), i)
                     if ts_height_loss is not None:
                         writer.add_scalar("train/ts_height_loss", ts_height_loss.item(), i)
+                    if face_loss is not None:
+                        writer.add_scalar("face_continuity/weighted_total",
+                                          face_weight * face_loss.item(), i)
+                        writer.add_scalar("face_continuity/raw_total",
+                                          face_loss.item(), i)
+                        for _key, _value in face_diag.items():
+                            writer.add_scalar(f"face_continuity/{_key}", _value, i)
                     # P0-F thin-surface activity/parameter diagnostics
                     if getattr(model, '_thin_surface_active', False):
                         _ts_diag = model.thin_surface_diagnostics()

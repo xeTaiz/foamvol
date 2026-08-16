@@ -799,6 +799,11 @@ class CTScene(torch.nn.Module):
         if needs_permute:
             perm = self.triangulation.permutation().to(torch.long)
             self.permute_points(perm)
+        if needs_permute or failures > 3:
+            # Any cell-row permutation or in-place perturbation invalidates the
+            # cached Delaunay-edge/Voronoi-face correspondence.
+            self._thin_surface_face_cache = None
+            self._thin_surface_face_cache_signature = None
         self._reapply_hard_freeze()
 
         self.aabb_tree = radfoam.build_aabb_tree(self.primal_points)
@@ -1251,6 +1256,60 @@ class CTScene(torch.nn.Module):
 
         denom  = active.sum().clamp_min(1.0)
         return (active * residual).sum() / denom
+
+    def build_thin_surface_face_cache(
+            self, num_samples: int = 12, domain_extent: float = 1.0,
+            max_vertices: int = 32):
+        """Construct/reuse the exact finite-face cache on the current GPU."""
+        if not getattr(self, "_thin_surface_active", False):
+            raise RuntimeError("face continuity requires active thin surfaces")
+        if self.primal_points.requires_grad:
+            raise RuntimeError(
+                "face continuity requires hard-frozen primal points before use")
+        required = ("density_delta", "quaternions", "texel_sites_2d",
+                    "texel_heights", "_cached_cell_radius")
+        if any(getattr(self, name, None) is None for name in required):
+            raise RuntimeError("face continuity thin-surface state is incomplete")
+
+        from radfoam_model.face_continuity import build_voronoi_face_cache
+        signature = (self.primal_points.data_ptr(), self.primal_points.shape[0],
+                     int(num_samples), float(domain_extent), int(max_vertices))
+        cache = getattr(self, "_thin_surface_face_cache", None)
+        if cache is None or getattr(self, "_thin_surface_face_cache_signature", None) != signature:
+            # CTScene already permutes every parameter row into the live
+            # triangulation's internal sorted order. Therefore live tets index
+            # primal_points directly; applying triangulation.permutation again
+            # would be a double permutation.
+            identity = torch.arange(
+                self.primal_points.shape[0], device=self.primal_points.device)
+            cache = build_voronoi_face_cache(
+                self.primal_points.detach(), self.triangulation.tets(), identity,
+                num_samples=int(num_samples), domain_extent=float(domain_extent),
+                max_vertices=int(max_vertices),
+            )
+            self._thin_surface_face_cache = cache
+            self._thin_surface_face_cache_signature = signature
+            print(
+                f"[face-continuity] GPU cache: {cache.num_faces:,} faces from "
+                f"{cache.num_finite_tets:,} finite tets in "
+                f"{cache.build_seconds:.3f}s")
+        return cache
+
+    def thin_surface_face_continuity_regularization(
+            self, step: int, density_scale: float, **kwargs):
+        """Robust continuity of meaningful split surfaces across shared faces."""
+        from radfoam_model.face_continuity import face_continuity_loss
+        cache = self.build_thin_surface_face_cache(
+            num_samples=kwargs.pop("num_samples", 12),
+            domain_extent=kwargs.pop("domain_extent", 1.0),
+            max_vertices=kwargs.pop("max_vertices", 32))
+        loss, diagnostics = face_continuity_loss(
+            self, cache, step=step, density_scale=density_scale, **kwargs)
+        diagnostics.update({
+            "cache_faces": float(cache.num_faces),
+            "cache_build_seconds": float(cache.build_seconds),
+        })
+        return loss, diagnostics
 
     def cvt_regularization(self, hops: int = 1) -> torch.Tensor:
         """CVT centroidal regularization (Laplacian/Lloyd proxy).

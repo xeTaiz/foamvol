@@ -245,6 +245,24 @@ class OptimizationParams(ParamGroup):
         self.thin_surface_zoom_min_separation = 0.16
         self.thin_surface_zoom_resolution = 192
         self.thin_surface_zoom_extent_scale = 2.2
+        # Shared-Voronoi-face split-surface continuity (frozen geometry only).
+        self.thin_surface_face_weight = 0.0
+        self.thin_surface_face_start = -1
+        self.thin_surface_face_batch = 8192
+        self.thin_surface_face_samples = 12
+        self.thin_surface_face_max_vertices = 32
+        self.thin_surface_face_zero_weight = 1.0
+        self.thin_surface_face_normal_weight = 0.25
+        self.thin_surface_face_density_weight = 0.10
+        self.thin_surface_face_abs_contrast_fraction = 0.01
+        self.thin_surface_face_relative_contrast = 0.10
+        self.thin_surface_face_base_density_fraction = 0.05
+        self.thin_surface_face_crossing_margin = 0.005
+        self.thin_surface_face_side_agreement = 0.60
+        self.thin_surface_face_normal_dot = 0.0
+        self.thin_surface_face_zero_bandwidth = 0.20
+        self.thin_surface_face_huber_beta = 0.05
+        self.thin_surface_face_seed = 42
         # ----------------------------------------------------------------
         # LC64 plan v3 — explicit independent-side density mode (Commit 1).
         # See specs/LC64-AIR-SPLIT-DIAGNOSIS-PLAN-v2.md ("Resolved E0
