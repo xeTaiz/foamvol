@@ -1250,7 +1250,9 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                             model.thin_surface_face_continuity_regularization(
                                 step=i, density_scale=gt_density_scale,
                                 batch_size=int(getattr(
-                                    optimizer_args, "thin_surface_face_batch", 8192)),
+                                    optimizer_args, "thin_surface_face_batch", 1024)),
+                                candidate_refresh=int(getattr(
+                                    optimizer_args, "thin_surface_face_candidate_refresh", 50)),
                                 num_samples=int(getattr(
                                     optimizer_args, "thin_surface_face_samples", 12)),
                                 max_vertices=int(getattr(

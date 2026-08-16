@@ -34,6 +34,8 @@ class VoronoiFaceCache:
     num_finite_tets: int
     num_faces_before_domain_filter: int
     max_vertices: int
+    candidate_faces: torch.Tensor | None = None
+    candidate_refresh_step: int = -1
 
     @property
     def num_faces(self) -> int:
@@ -347,6 +349,7 @@ def face_continuity_loss(
     normal_weight: float = 0.25,
     density_weight: float = 0.10,
     seed: int = 42,
+    candidate_refresh: int = 50,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Stochastic robust shared-face continuity loss for relative/absolute splits."""
     if cache.num_faces == 0:
@@ -358,13 +361,48 @@ def face_continuity_loss(
         raise ValueError("face continuity currently supports absolute/relative split modes")
 
     device = model.primal_points.device
+    # Contrast is cheap to evaluate for all cells and changes slowly. Refresh a
+    # detached candidate-face pool periodically, then spend surface evaluations
+    # only on pairs that can pass the meaningful-density gate. This improves
+    # eligible samples per millisecond by roughly the inverse meaningful fraction.
+    if (candidate_refresh <= 0 or cache.candidate_faces is None
+            or int(step) - cache.candidate_refresh_step >= int(candidate_refresh)):
+        with torch.no_grad():
+            all_density = float(getattr(model, "activation_scale", 1.0)) * F.softplus(
+                model.density.reshape(-1), beta=10.0)
+            all_raw_delta = model.density_delta.reshape(-1)
+            if mode == "relative":
+                all_delta = (float(getattr(model, "_thin_surface_delta_max_frac", 0.5))
+                             * all_density * torch.tanh(all_raw_delta))
+            else:
+                all_delta = all_raw_delta
+            all_plus = torch.clamp(all_density + all_delta, min=0.0)
+            all_minus = torch.clamp(all_density - all_delta, min=0.0)
+            all_contrast = (all_plus - all_minus).abs()
+            meaningful_cells = (
+                (all_contrast >= float(abs_contrast_fraction) * float(density_scale))
+                & (all_contrast / all_density.clamp_min(1e-12)
+                   >= relative_contrast_threshold)
+                & (all_density >= float(base_density_fraction) * float(density_scale)))
+            candidate_mask = (meaningful_cells[cache.pairs[:, 0]]
+                              & meaningful_cells[cache.pairs[:, 1]])
+            cache.candidate_faces = torch.nonzero(
+                candidate_mask, as_tuple=False).squeeze(-1)
+            cache.candidate_refresh_step = int(step)
+    candidates = cache.candidate_faces
+    if candidates is None or candidates.numel() == 0:
+        zero = (model.quaternions.sum() + model.texel_heights.sum()
+                + model.density_delta.sum() + model.density.sum()) * 0.0
+        return zero, {"candidate_faces": torch.zeros((), device=device)}
+
     generator = torch.Generator(device=device)
     generator.manual_seed(int(seed) + int(step))
-    if int(batch_size) >= cache.num_faces:
-        chosen = torch.arange(cache.num_faces, device=device)
+    if int(batch_size) >= candidates.numel():
+        chosen = candidates
     else:
-        chosen = torch.randint(
-            cache.num_faces, (int(batch_size),), generator=generator, device=device)
+        positions = torch.randint(
+            candidates.numel(), (int(batch_size),), generator=generator, device=device)
+        chosen = candidates[positions]
     pairs = cache.pairs[chosen]
     query = cache.samples[chosen]
     face_scale = cache.scale[chosen]
@@ -485,6 +523,7 @@ def face_continuity_loss(
     diagnostics = {
         # Keep diagnostics as detached GPU tensors; train.py materializes them
         # only at logging events, avoiding per-step host synchronization.
+        "candidate_faces": torch.as_tensor(candidates.numel(), device=device),
         "sampled_faces": torch.as_tensor(pairs.shape[0], device=device),
         "meaningful_pairs": (meaningful_i & meaningful_j).sum().detach(),
         "both_crossing_pairs": (crossing_i & crossing_j).sum().detach(),
