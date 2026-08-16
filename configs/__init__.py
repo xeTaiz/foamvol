@@ -236,10 +236,13 @@ class OptimizationParams(ParamGroup):
         # Default OFF: opt-in per config so existing checkpoints stay valid.
         self.thin_surface_relative_delta = False
         self.thin_surface_delta_max_frac = 0.5   # rho; only read when above is True
-        # Persistent TensorBoard closeups.  These are row IDs, intentionally
-        # fixed for a stationary-geometry run so the same cells can be compared
-        # at every diagnostic step. Empty disables the extra image logging.
-        self.thin_surface_zoom_cells = ""
+        # Persistent GT-anchored TensorBoard closeups. Anchors are selected
+        # once from central high-Sobel GT locations, then remain fixed in world
+        # coordinates while their current Voronoi owner is reassociated.
+        self.thin_surface_zoom_anchor_count = 6
+        self.thin_surface_zoom_anchor_seed = 42
+        self.thin_surface_zoom_center_fraction = 0.6
+        self.thin_surface_zoom_min_separation = 0.16
         self.thin_surface_zoom_resolution = 192
         self.thin_surface_zoom_extent_scale = 2.2
         # ----------------------------------------------------------------

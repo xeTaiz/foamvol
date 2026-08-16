@@ -1904,13 +1904,129 @@ def visualize_slices(density_slices, idw_slices, cell_density_slices,
     return None
 
 
-def log_thin_surface_zoom_panels(
-        model, gt_volume, writer, step, cell_ids, resolution=192,
-        extent_scale=2.2, tag="thin_surface_zoom"):
-    """Log learned/GT oblique zooms for fixed thin-surface cell rows.
+def select_gt_sobel_anchors(gt_volume, count=6, seed=42,
+                            center_fraction=0.6, min_separation=0.16):
+    """Select fixed high-gradient anchors from a 3-D GT volume.
 
-    This is a read-only training diagnostic.  Unsupported or incomplete model
-    states, invalid GT volumes, and invalid cell IDs are skipped silently.
+    Returned coordinates are in the normalized ``(x, y, z)`` convention used
+    by ``grid_sample`` (each component is in [-1, 1]).  Sobel score is the
+    primary ordering; ``seed`` only supplies a deterministic tie-break order.
+    If the separation constraint prevents selecting ``count`` anchors, the
+    remaining highest-scoring central candidates are used without separation.
+    Invalid inputs produce an empty ``(0, 3)`` array.
+    """
+    empty = np.empty((0, 3), dtype=np.float32)
+    if (not isinstance(count, (int, np.integer)) or isinstance(count, bool)
+            or count <= 0):
+        return empty
+    try:
+        center_fraction = float(center_fraction)
+        min_separation = float(min_separation)
+    except (TypeError, ValueError, OverflowError):
+        return empty
+    if (not np.isfinite(center_fraction) or center_fraction <= 0
+            or center_fraction > 1 or not np.isfinite(min_separation)
+            or min_separation < 0):
+        return empty
+
+    try:
+        if isinstance(gt_volume, torch.Tensor):
+            if (gt_volume.ndim != 3 or gt_volume.numel() == 0
+                    or gt_volume.is_complex()):
+                return empty
+            volume = gt_volume.detach().to(device="cpu", dtype=torch.float32)
+        else:
+            volume_np = np.array(gt_volume, dtype=np.float32, order="C",
+                                 copy=True)
+            if volume_np.ndim != 3 or volume_np.size == 0:
+                return empty
+            volume = torch.from_numpy(volume_np)
+    except (TypeError, ValueError, RuntimeError, OverflowError):
+        return empty
+    if not torch.isfinite(volume).all():
+        return empty
+
+    # Separable 3-D Sobel derivatives.  The input's logical dimension order is
+    # already (x, y, z); only the magnitude matters here, so no image-layout
+    # permutation is needed.
+    source = F.pad(volume[None, None], (1, 1, 1, 1, 1, 1),
+                   mode="replicate")
+    smooth = torch.tensor([1.0, 2.0, 1.0], dtype=torch.float32)
+    diff = torch.tensor([-1.0, 0.0, 1.0], dtype=torch.float32)
+    kernels = (
+        diff[:, None, None] * smooth[None, :, None] * smooth[None, None, :],
+        smooth[:, None, None] * diff[None, :, None] * smooth[None, None, :],
+        smooth[:, None, None] * smooth[None, :, None] * diff[None, None, :],
+    )
+    derivatives = [F.conv3d(source, k.reshape(1, 1, 3, 3, 3))
+                   for k in kernels]
+    magnitude = torch.sqrt(sum(component.square()
+                               for component in derivatives))[0, 0].numpy()
+
+    # Use the same centered fraction on all three normalized axes.  Index
+    # bounds (rather than a coordinate threshold) keep tiny volumes usable.
+    slices = []
+    normalized_axes = []
+    for size in volume.shape:
+        start = int(np.floor(0.5 * (1.0 - center_fraction) * size))
+        stop = int(np.ceil(0.5 * (1.0 + center_fraction) * size))
+        start = max(0, min(start, size - 1))
+        stop = max(start + 1, min(stop, size))
+        slices.append(slice(start, stop))
+        indices = np.arange(start, stop, dtype=np.float64)
+        if size == 1:
+            normalized_axes.append(np.zeros_like(indices))
+        else:
+            normalized_axes.append(2.0 * indices / (size - 1) - 1.0)
+
+    central_scores = magnitude[tuple(slices)].reshape(-1).astype(np.float64)
+    mesh = np.meshgrid(*normalized_axes, indexing="ij")
+    candidates = np.stack(mesh, axis=-1).reshape(-1, 3)
+    if candidates.shape[0] == 0:
+        return empty
+
+    # Score-descending greedy traversal, with seeded ties and flat index as a
+    # final stable key.  This remains deterministic even for constant volumes.
+    try:
+        rng = np.random.default_rng(seed)
+    except (TypeError, ValueError):
+        return empty
+    tie_order = rng.random(candidates.shape[0])
+    flat_order = np.arange(candidates.shape[0])
+    order = np.lexsort((flat_order, tie_order, -central_scores))
+
+    selected = []
+    selected_set = set()
+    separation_sq = float(min_separation) ** 2
+    for candidate_index in order:
+        coordinate = candidates[candidate_index]
+        if all(np.sum((coordinate - candidates[other]) ** 2) >= separation_sq
+               for other in selected):
+            selected.append(int(candidate_index))
+            selected_set.add(int(candidate_index))
+            if len(selected) == count:
+                break
+
+    # A small/flat central region may not support the requested packing.
+    for candidate_index in order:
+        candidate_index = int(candidate_index)
+        if len(selected) == count:
+            break
+        if candidate_index not in selected_set:
+            selected.append(candidate_index)
+            selected_set.add(candidate_index)
+
+    return candidates[selected].astype(np.float32, copy=False)
+
+
+def log_thin_surface_zoom_panels(
+        model, gt_volume, writer, step, anchors, resolution=192,
+        extent_scale=2.2, tag="thin_surface_zoom"):
+    """Log learned/GT oblique zooms centered on fixed GT-space anchors.
+
+    At every call each normalized anchor is mapped to its current nearest cell;
+    that owner supplies the radius and orientation while the anchor remains the
+    plane center.  Unsupported or incomplete state is skipped silently.
     """
     # Keep this helper safe to call unconditionally from train.py.  In
     # particular, independent-side checkpoints are intentionally not handled.
@@ -1966,25 +2082,24 @@ def log_thin_surface_zoom_panels(
             or adjacency_offsets.shape != (n_cells + 1,)):
         return
 
-    # A fixed row ID is deliberately not coerced from floats or strings.
-    selected = []
-    seen = set()
+    selected_anchors = []
     try:
-        candidates = iter(cell_ids)
+        anchor_candidates = iter(anchors)
     except TypeError:
         return
-    for value in candidates:
-        if isinstance(value, torch.Tensor):
-            if value.ndim != 0 or value.dtype == torch.bool or value.dtype.is_floating_point:
-                continue
-            value = value.item()
-        if not isinstance(value, (int, np.integer)) or isinstance(value, (bool, np.bool_)):
+    for value in anchor_candidates:
+        try:
+            if isinstance(value, torch.Tensor):
+                coordinate = value.detach().to(device="cpu", dtype=torch.float64).numpy()
+            else:
+                coordinate = np.asarray(value, dtype=np.float64)
+        except (TypeError, ValueError, RuntimeError, OverflowError):
             continue
-        cell = int(value)
-        if 0 <= cell < n_cells and cell not in seen:
-            seen.add(cell)
-            selected.append(cell)
-    if not selected:
+        if (coordinate.shape != (3,) or not np.isfinite(coordinate).all()
+                or np.any(coordinate < -1.0) or np.any(coordinate > 1.0)):
+            continue
+        selected_anchors.append(coordinate.copy())
+    if not selected_anchors:
         return
 
     if isinstance(gt_volume, torch.Tensor):
@@ -2091,12 +2206,20 @@ def log_thin_surface_zoom_panels(
         mu_plus = torch.clamp(mu_bar + effective_delta, min=0.0)
         mu_minus = torch.clamp(mu_bar - effective_delta, min=0.0)
 
-        for cell in selected:
-            radius = cell_radius[cell]
+        for anchor_index, anchor_np in enumerate(selected_anchors):
+            anchor = torch.as_tensor(anchor_np, device=points.device,
+                                     dtype=points.dtype)
+            current_owner = radfoam.nn(
+                points, model.aabb_tree, anchor.reshape(1, 3)).long().reshape(-1)
+            if (current_owner.numel() != 1 or current_owner[0] < 0
+                    or current_owner[0] >= n_cells):
+                continue
+            owner_cell = int(current_owner[0].item())
+            radius = cell_radius[owner_cell]
             if not torch.isfinite(radius) or radius <= 0:
                 continue
-            center = points[cell]
-            normal = quat_to_frame(quaternions[cell:cell + 1])[0][0]
+            normal = quat_to_frame(
+                quaternions[owner_cell:owner_cell + 1])[0][0]
             ref = torch.tensor([0.0, 0.0, 1.0], device=points.device,
                                dtype=points.dtype)
             if torch.abs(torch.dot(normal, ref)) > 0.9:
@@ -2104,7 +2227,7 @@ def log_thin_surface_zoom_panels(
                                    dtype=points.dtype)
             tangent = F.normalize(torch.linalg.cross(ref, normal), dim=0)
             extent = extent_scale * radius
-            q = center + extent * (
+            q = anchor + extent * (
                 uu.reshape(-1, 1) * tangent + vv.reshape(-1, 1) * normal)
 
             owner = radfoam.nn(points, model.aabb_tree, q).long()
@@ -2125,23 +2248,26 @@ def log_thin_surface_zoom_panels(
             gt_np = torch.nan_to_num(gt_values).cpu().numpy()
             owner_np = owner.reshape(resolution, resolution).cpu().numpy()
             signed_np = signed.reshape(resolution, resolution).cpu().numpy()
-            plus = float(mu_plus[cell].item())
-            minus = float(mu_minus[cell].item())
-            abs_delta = float(effective_delta[cell].abs().item())
+            plus = float(mu_plus[owner_cell].item())
+            minus = float(mu_minus[owner_cell].item())
+            abs_delta = float(effective_delta[owner_cell].abs().item())
             vmax = 1.02 * max(gt_p99, plus, minus, np.finfo(np.float32).eps)
+            anchor_text = ", ".join(f"{component:.3f}" for component in anchor_np)
+            diagnostic = f"anchor ({anchor_text})  current owner {owner_cell}"
 
             fig, axes = plt.subplots(1, 2, figsize=(8.0, 4.2))
-            draw_panel(axes[0], learned_np, owner_np, signed_np, cell, vmax,
-                       "Learned hard split")
-            draw_panel(axes[1], gt_np, owner_np, signed_np, cell, vmax, "GT")
+            draw_panel(axes[0], learned_np, owner_np, signed_np, owner_cell,
+                       vmax, f"Learned hard split — {diagnostic}")
+            draw_panel(axes[1], gt_np, owner_np, signed_np, owner_cell, vmax,
+                       f"GT — {diagnostic}")
             fig.suptitle(
-                f"cell {cell}  mu-/mu+ {minus:.4g}/{plus:.4g}  "
+                f"{diagnostic}  mu-/mu+ {minus:.4g}/{plus:.4g}  "
                 f"abs delta {abs_delta:.4g}  step {step}\n"
                 f"shared density range [0, {vmax:.4g}]",
                 fontsize=11)
             fig.tight_layout()
             try:
-                writer.add_figure(f"{tag}/cell_{cell}", fig,
+                writer.add_figure(f"{tag}/anchor_{anchor_index:02d}", fig,
                                   global_step=step)
             finally:
                 plt.close(fig)
