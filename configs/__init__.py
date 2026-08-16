@@ -236,6 +236,12 @@ class OptimizationParams(ParamGroup):
         # Default OFF: opt-in per config so existing checkpoints stay valid.
         self.thin_surface_relative_delta = False
         self.thin_surface_delta_max_frac = 0.5   # rho; only read when above is True
+        # Persistent TensorBoard closeups.  These are row IDs, intentionally
+        # fixed for a stationary-geometry run so the same cells can be compared
+        # at every diagnostic step. Empty disables the extra image logging.
+        self.thin_surface_zoom_cells = ""
+        self.thin_surface_zoom_resolution = 192
+        self.thin_surface_zoom_extent_scale = 2.2
         # ----------------------------------------------------------------
         # LC64 plan v3 — explicit independent-side density mode (Commit 1).
         # See specs/LC64-AIR-SPLIT-DIAGNOSIS-PLAN-v2.md ("Resolved E0
