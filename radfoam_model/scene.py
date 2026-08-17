@@ -1260,22 +1260,31 @@ class CTScene(torch.nn.Module):
     def build_thin_surface_face_cache(
             self, num_samples: int = 12, domain_extent: float = 1.0,
             max_vertices: int = 32):
-        """Construct/reuse the exact finite-face cache on the current GPU."""
+        """Construct/reuse the exact finite-face cache on the current GPU.
+
+        When ``primal_points`` is trainable (not hard-frozen), the cached
+        geometry can go silently stale: Adam mutates the parameter storage
+        in place, so ``data_ptr()``/shape alone cannot detect that points
+        moved between calls. In that case always rebuild from the live
+        triangulation (~0.07s, no re-triangulation) rather than reuse the
+        signature-keyed cache. Frozen points keep the cheap reuse path.
+        """
         if not getattr(self, "_thin_surface_active", False):
             raise RuntimeError("face continuity requires active thin surfaces")
-        if self.primal_points.requires_grad:
-            raise RuntimeError(
-                "face continuity requires hard-frozen primal points before use")
         required = ("density_delta", "quaternions", "texel_sites_2d",
                     "texel_heights", "_cached_cell_radius")
         if any(getattr(self, name, None) is None for name in required):
             raise RuntimeError("face continuity thin-surface state is incomplete")
 
         from radfoam_model.face_continuity import build_voronoi_face_cache
+        points_trainable = bool(self.primal_points.requires_grad)
         signature = (self.primal_points.data_ptr(), self.primal_points.shape[0],
                      int(num_samples), float(domain_extent), int(max_vertices))
         cache = getattr(self, "_thin_surface_face_cache", None)
-        if cache is None or getattr(self, "_thin_surface_face_cache_signature", None) != signature:
+        stale = (cache is None
+                 or getattr(self, "_thin_surface_face_cache_signature", None) != signature
+                 or points_trainable)
+        if stale:
             # CTScene already permutes every parameter row into the live
             # triangulation's internal sorted order. Therefore live tets index
             # primal_points directly; applying triangulation.permutation again
@@ -1289,10 +1298,15 @@ class CTScene(torch.nn.Module):
             )
             self._thin_surface_face_cache = cache
             self._thin_surface_face_cache_signature = signature
-            print(
-                f"[face-continuity] GPU cache: {cache.num_faces:,} faces from "
-                f"{cache.num_finite_tets:,} finite tets in "
-                f"{cache.build_seconds:.3f}s")
+            rebuild_count = getattr(self, "_thin_surface_face_cache_rebuilds", 0) + 1
+            self._thin_surface_face_cache_rebuilds = rebuild_count
+            if not points_trainable or rebuild_count <= 1 or rebuild_count % 200 == 0:
+                print(
+                    f"[face-continuity] GPU cache rebuild #{rebuild_count} "
+                    f"(points_trainable={points_trainable}): "
+                    f"{cache.num_faces:,} faces from "
+                    f"{cache.num_finite_tets:,} finite tets in "
+                    f"{cache.build_seconds:.3f}s")
         return cache
 
     def thin_surface_face_continuity_regularization(
