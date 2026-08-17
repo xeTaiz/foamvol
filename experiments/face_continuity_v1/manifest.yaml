@@ -20,3 +20,29 @@ arms:
   weight: 3.0e-05
   density_weight: 1.0
   config: experiments/face_continuity_v1/configs/FC64_w3e-5_d1.yaml
+- tag: FC64_unfrozen_control
+  weight: 0.0
+  points_hard_freeze_at: -1
+  config: experiments/face_continuity_v1/configs/FC64_unfrozen_control.yaml
+- tag: FC64_unfrozen_w3e-5
+  weight: 3.0e-05
+  points_hard_freeze_at: -1
+  config: experiments/face_continuity_v1/configs/FC64_unfrozen_w3e-5.yaml
+- tag: FC128_control
+  weight: 0.0
+  init_points: 128000
+  config: experiments/face_continuity_v1/configs/FC128_control.yaml
+- tag: FC128_w3e-5
+  weight: 3.0e-05
+  init_points: 128000
+  config: experiments/face_continuity_v1/configs/FC128_w3e-5.yaml
+- tag: FC128_unfrozen_control
+  weight: 0.0
+  init_points: 128000
+  points_hard_freeze_at: -1
+  config: experiments/face_continuity_v1/configs/FC128_unfrozen_control.yaml
+- tag: FC128_unfrozen_w3e-5
+  weight: 3.0e-05
+  init_points: 128000
+  points_hard_freeze_at: -1
+  config: experiments/face_continuity_v1/configs/FC128_unfrozen_w3e-5.yaml

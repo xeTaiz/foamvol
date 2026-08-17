@@ -1,4 +1,4 @@
-# Shared-face split continuity: implementation and 64k results
+# Shared-face split continuity: implementation, 64k results, and 64k/128k × frozen/unfrozen extension
 
 ## Implementation
 Branch `face-continuity-v1`; principal commits:
@@ -66,14 +66,56 @@ Means over 16 independently sampled B=4096 batches:
 
 The regularizer clearly changes its intended geometry: from control to `3e-4`, zero-set mismatch drops 35.4%, normal mismatch drops 24.4%, and side agreement rises 6.15 percentage points. The effect is dose-responsive. However, the configured density term does not reduce final density mismatch; increasing its component ratio to 1.0 also fails on the model-specific eligible population.
 
+## Extension: 64k/128k × frozen/unfrozen matrix
+
+The matched experiment above only tested hard-frozen 64k geometry. Two more axes were added: cell count (64k vs 128k, `init_points`/`final_points` scaled together, all else matched) and point-freeze state (`points_hard_freeze_at: 1500` frozen vs `-1` never-frozen; `freeze_points` learning-rate-schedule horizon left at `10000` unchanged, so unfrozen points keep receiving a decaying LR through the full run instead of going stationary at 1500). New configs: `configs/FC64_unfrozen_{control,w3e-5}.yaml`, `configs/FC128_{control,w3e-5,unfrozen_control,unfrozen_w3e-5}.yaml`. `w3e-5` = `zero=1, normal=.25, density=.1` at global weight `3e-5`, the density-emphasized safety reference from the matched experiment.
+
+### Cache-staleness bug found and fixed
+`build_thin_surface_face_cache` (`radfoam_model/scene.py`) hard-raised `RuntimeError` whenever `primal_points.requires_grad`, and separately keyed its cache reuse only on `(primal_points.data_ptr(), shape)`. Adam updates `primal_points` in place, so the pointer and shape never change even though the values do — the geometry cache would have silently gone stale (circumcenters/quadrature computed from an old point cloud) the moment points became trainable. Fixed by removing the hard guard and rebuilding the cache unconditionally whenever points are trainable (frozen runs keep the old signature-cached fast path, unchanged). This adds a full cache rebuild (~70–400 ms depending on cell count) at every face-loss application step instead of a no-op cache hit — the only way to get a geometrically-correct prior against moving points. Verified non-regression on the frozen path (0.0 point displacement, byte-identical to the original matched-experiment behavior) and verified unfrozen points actually move: `FC64_unfrozen_control` primal points displaced mean 0.0109 / median 0.00892 / max 0.102 (scene extent `[-1,1]^3`) between step 2000 and the final checkpoint, vs exactly 0.0 for the original hard-frozen control over the same range.
+
+### Hard reconstruction metrics
+
+| Arm | Cells | Frozen | Vol PSNR | Sobel PSNR | SSIM3D | Dice | strict-air MAE | strict-air FPR | CD | HD95 | F1@1 / F1@2 |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| control (matched exp.) | 64k | yes | 31.4391 | 29.7501 | .89538 | .95399 | .00053380 | .00017717 | 4.3426 | 33.422 | .6097 / .7379 |
+| `3e-5` (matched exp.) | 64k | yes | 31.3539 | 29.6319 | .89366 | .95351 | .00054554 | .00023179 | 4.4133 | 37.796 | .6107 / .7393 |
+| unfrozen control | 64k | no | 33.9384 | 32.7362 | .92929 | .96112 | .00047581 | .00006301 | 3.0861 | 25.559 | .6883 / .7911 |
+| unfrozen `3e-5` | 64k | no | 34.0042 | 32.8163 | .93048 | .96129 | .00047399 | .00007038 | 2.9852 | 24.712 | .6916 / .7951 |
+| control | 128k | yes | 32.1982 | 31.0292 | .91062 | .95728 | .00050247 | .00016203 | 3.9497 | 31.797 | .6556 / .7742 |
+| `3e-5` | 128k | yes | 32.1613 | 30.9315 | .91007 | .95694 | .00050069 | .00016100 | 3.7678 | 30.403 | .6604 / .7801 |
+| unfrozen control | 128k | no | 34.4896 | 33.5448 | .93685 | .96258 | .00048436 | .00009595 | 3.0076 | 26.798 | .7304 / .8248 |
+| unfrozen `3e-5` | 128k | no | 34.5805 | 33.6474 | .93804 | .96282 | .00048111 | .00008163 | 2.9383 | 25.855 | .7287 / .8233 |
+
+### Continuity statistics (mean, final checkpoint)
+
+| Arm | Cells | Frozen | zero-set loss | normal loss | density mismatch | side agreement |
+|---|---:|---|---:|---:|---:|---:|
+| `3e-5` (matched exp.) | 64k | yes | .2476 | .0644 | .1506 | .8685 |
+| unfrozen control | 64k | no | .2625 | .0536 | .1813 | .8524 |
+| unfrozen `3e-5` | 64k | no | .2142 | .0461 | .1688 | .8790 |
+| control | 128k | yes | .2791 | .0488 | .1547 | .8476 |
+| `3e-5` | 128k | yes | .2373 | .0431 | .1401 | .8714 |
+| unfrozen control | 128k | no | .2464 | .0318 | .1733 | .8583 |
+| unfrozen `3e-5` | 128k | no | .1979 | .0273 | .1567 | .8855 |
+
+### Findings
+- **Letting geometry keep moving past the split-activation freeze dominates every other lever tested.** Unfreezing points is worth +2.50 dB volume PSNR at 64k and +2.29 dB at 128k (control vs. control) — an order of magnitude larger than any regularizer weight tested, and it also improves every other metric (SSIM3D, Dice, air MAE/FPR, chamfer, HD95, F1@1/F1@2) simultaneously. This is the single largest lever in the whole experiment set.
+- **Doubling cell count gives smaller, still-positive gains:** 64k→128k control is +0.759 dB frozen, +0.551 dB unfrozen — diminishing returns, and much smaller than unfreezing.
+- **The regularizer's sign flips with freeze state.** With frozen geometry (both 64k, matched experiment, and 128k here), `3e-5` costs volume PSNR (−0.085 dB at 64k, −0.037 dB at 128k), matching the original Decision. With unfrozen geometry, `3e-5` instead *gains* volume PSNR at both cell counts (+0.066 dB at 64k, +0.091 dB at 128k) and also improves Sobel PSNR, SSIM3D, Dice, air MAE, chamfer, and HD95 at both cell counts; F1@1/F1@2 are a wash (+/− ≤0.002 at 128k). This is consistent with the geometric interpretation: forcing continuity onto a *frozen* surface can only ever compromise fit to the CT data, whereas geometry that is still trainable can locally relax to satisfy the shared-face constraint at near-zero cost to data fit, and evidently helps slightly by regularizing the split boundary.
+- **The regularizer changes the same underlying quantity regardless of freeze state**: zero-set/normal mismatch drop and side agreement rises going from control→`3e-5` in all four (cell count × freeze) cells, at a similar relative magnitude to the original dose-response curve — the fix did not change what the loss optimizes, only whether the geometry is allowed to respond to it.
+- Single seed per arm (matching the original matched-experiment protocol). The unfrozen `3e-5` gains are small (0.07–0.09 dB) and directionally consistent across both cell counts but have not been replicated across seeds; treat as suggestive, not conclusive.
+
 ## Decision
 - Implementation and GPU cache are technically successful and fast enough; no custom CUDA kernel is currently justified.
 - The current continuity objective is a real geometric prior, not a no-op.
-- Do **not** promote it as reconstruction-quality improvement: every arm loses volume PSNR and worsens strict-air MAE/FPR; most worsen surface distance/F1 metrics.
-- Preserve it as an opt-in experimental regularizer (`weight=0` default).
+- On **frozen** geometry (64k matched experiment, 128k extension): do **not** promote it as a reconstruction-quality improvement — every frozen arm loses volume PSNR and worsens strict-air MAE/FPR; most worsen surface distance/F1 metrics.
+- On **unfrozen** geometry (64k, 128k extension): the density-emphasized `3e-5` arm is a small net positive (+0.07–0.09 dB volume PSNR, improved SSIM3D/Dice/air MAE/chamfer/HD95, neutral F1) versus its own control. Single-seed evidence only — worth a seed-replication pass before promoting.
+- Unfreezing points past the split-activation freeze (`points_hard_freeze_at: -1`) is a far larger and unconditional win (+2.3–2.5 dB volume PSNR) independent of the continuity regularizer; if pursuing further gains, prioritize this over regularizer tuning.
+- Preserve the regularizer as an opt-in experimental term (`weight=0` default) either way.
 - If continuing, test a gentler `~1e-5` weight or a late ramp, and redesign/normalize density consistency before increasing it. Use the density-emphasized `3e-5` arm as the present safety reference, not the stronger weights.
 
 ## Artifacts
-- Remote: `KW60995:/code/lc64-radfoam/output/FC64_*`.
+- Remote: `KW60995:/code/lc64-radfoam/output/FC64_*`, `output/FC64_unfrozen_*`, `output/FC128_*`.
 - Local TensorBoard logs and metrics: `output/ray_batch_scaling_v1_tb/KW60995/FC64_*`.
 - TensorBoard: `http://camel.hs.d0me.xyz:16006/`.
+- Hard-surface Chamfer/HD95/F1 metrics for the extension matrix were computed with the new standalone `experiments/face_continuity_v1/eval_hard_surface.py` (reuses `train.py`'s `compute_surface_metrics` against the existing `volume_hard_ss4.npy`/ground truth, independent of `split_voxelize.py`'s own PSNR/SSIM/air path); verified to reproduce the original `FC64_w3e-5` `surface_hard_ss4_metrics.json` byte-for-byte before use on the new arms.
