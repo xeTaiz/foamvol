@@ -243,11 +243,17 @@ def field_from_model(model):
         return field
 
 
-def load_density_field(model_path, device="cuda"):
+def load_density_field(model_path, device="cuda", load_thin_surface=True):
     """Load a checkpoint and build an AABB tree for NN queries.
 
     Returns a dict with keys: points, density_flat, gradients,
-    grad_max_slope, aabb_tree, device.
+    grad_max_slope, aabb_tree, device, activation_scale. When
+    load_thin_surface is True (default) and the checkpoint carries active
+    thin-surface state, also sets the same thin_surface_*/quaternions/
+    texel_*/density_delta (or raw_plus/raw_minus) keys field_from_model()
+    sets for a live model, so query_density()/voxelize_volumes() resolve
+    the two-sided split instead of silently falling back to flat
+    per-cell density.
     """
     device = torch.device(device)
     scene_data = torch.load(model_path)
@@ -265,7 +271,7 @@ def load_density_field(model_path, device="cuda"):
     aabb_tree = radfoam.build_aabb_tree(points)
     _, cell_radius = radfoam.farthest_neighbor(points, adjacency, adjacency_offsets)
 
-    return {
+    field = {
         "points": points,
         "density_flat": density_flat,
         "gradients": gradients,
@@ -275,8 +281,35 @@ def load_density_field(model_path, device="cuda"):
         "aabb_tree": aabb_tree,
         "cell_radius": cell_radius,
         "device": device,
+        "activation_scale": float(scene_data.get("activation_scale", 1.0)),
         **_build_tet_topology(points),
     }
+
+    ts_meta = scene_data.get("thin_surface") if load_thin_surface else None
+    if isinstance(ts_meta, dict) and ts_meta.get("active", False):
+        density_mode = ts_meta.get("density_mode")
+        if density_mode is None:
+            density_mode = ("relative" if ts_meta.get("relative_delta", False)
+                            else "absolute")
+        thin_field = {
+            "thin_surface_active": True,
+            "thin_surface_density_mode": density_mode,
+            "thin_surface_relative_delta": (density_mode == "relative"),
+            "thin_surface_delta_max_frac": float(ts_meta.get("delta_max_frac", 0.5)),
+            "quaternions": scene_data["quaternions"].to(device),
+            "texel_sites_2d": scene_data["texel_sites_2d"].to(device),
+            "texel_heights": scene_data["texel_heights"].to(device),
+        }
+        if density_mode == "independent":
+            thin_field["raw_plus"] = scene_data["raw_plus"].to(device)
+            thin_field["raw_minus"] = scene_data["raw_minus"].to(device)
+        else:
+            thin_field["density_delta"] = scene_data["density_delta"].to(device)
+        candidate = {**field, **thin_field}
+        if _thin_surface_query_config(candidate) is not None:
+            field.update(thin_field)
+
+    return field
 
 
 def query_density(field, coordinates):
@@ -1390,9 +1423,16 @@ def load_r2_volume(data_path):
 def voxelize_volumes(field, resolution, extent, sigma, sigma_v, hop=1):
     """Voxelize the field into two 3D volumes in one pass.
 
-    Raw volume: softplus(density[nearest_cell]) — constant per Voronoi cell.
+    Raw volume: split-aware when the field carries active thin-surface state
+    (see load_density_field/field_from_model) — each voxel takes its owning
+    cell's split-resolved density via split_cell_query, the same evaluation
+    query_density() uses for the live slices_interleaved panel. Falls back to
+    softplus(density[nearest_cell]) — constant per Voronoi cell — otherwise.
     IDW volume: Gaussian bilateral natural-neighbor interpolation matching
-    the CUDA tracing kernel (exp(-d²/σ²) spatial, exp(-Δμ²/σ_v²) bilateral).
+    the CUDA tracing kernel (exp(-d²/σ²) spatial, exp(-Δμ²/σ_v²) bilateral)
+    over the flat per-cell density. NOT split-aware: blending would require
+    resolving each blended neighbor's own split side before combining, which
+    this helper does not attempt.
 
     Args:
         field: dict from load_density_field() or field_from_model()
@@ -1419,11 +1459,39 @@ def voxelize_volumes(field, resolution, extent, sigma, sigma_v, hop=1):
     global_max_k = int((adj_off[1:] - adj_off[:-1]).max().item())
     batch_size = 2_000_000
 
+    thin_config = _thin_surface_query_config(field)
+    if thin_config is not None:
+        from split_voxelize import split_cell_query
+        density_mode, activation_scale, delta_max_frac = thin_config
+
     for start in range(0, num_voxels, batch_size):
         end = min(start + batch_size, num_voxels)
-        res = _idw_query(coords_flat[start:end], field, activated,
+        query = coords_flat[start:end]
+        res = _idw_query(query, field, activated,
                          sigma, sigma_v, global_max_k, hop=hop)
-        raw_vol[start:end] = activated[res.nn_idx]
+        if thin_config is not None:
+            if density_mode == "independent":
+                value, _, _ = split_cell_query(
+                    query, field["points"], res.nn_idx, field["density_flat"],
+                    None, field["quaternions"], field["texel_sites_2d"],
+                    field["texel_heights"], field["cell_radius"],
+                    thin_temp=10.0, activation_scale=activation_scale,
+                    blend_eps=0.0, density_mode="independent",
+                    raw_plus=field["raw_plus"], raw_minus=field["raw_minus"],
+                    delta_max_frac=delta_max_frac,
+                )
+            else:
+                value, _, _ = split_cell_query(
+                    query, field["points"], res.nn_idx, field["density_flat"],
+                    field["density_delta"], field["quaternions"],
+                    field["texel_sites_2d"], field["texel_heights"],
+                    field["cell_radius"], thin_temp=10.0,
+                    activation_scale=activation_scale, blend_eps=0.0,
+                    density_mode=density_mode, delta_max_frac=delta_max_frac,
+                )
+            raw_vol[start:end] = torch.nan_to_num(value)
+        else:
+            raw_vol[start:end] = activated[res.nn_idx]
         idw_vol[start:end] = torch.nan_to_num(res.idw_result)
 
     raw_vol = raw_vol.reshape(resolution, resolution, resolution)
