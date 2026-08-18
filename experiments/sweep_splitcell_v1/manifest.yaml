@@ -1,0 +1,97 @@
+name: sweep_splitcell_v1
+tensorboard_prefix: sweep_splitcell/
+dataset: r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone
+
+purpose: >
+  Does the shared-face split-plane continuity regularizer help on a real
+  training schedule, and how does that interact with cell count? The prior
+  face-continuity matrix used a fixed-cell protocol (no densification, points
+  hard-frozen at 1500) which is not how the model is normally trained. This
+  sweep moves to the standard schedule and scales cell count instead.
+
+schedule:
+  source: configs/fixed_final/{128k,256k,512k}.yaml loaded verbatim
+  iterations: 10000
+  rays_per_batch: 1000000
+  rays_per_batch_late: 4000000
+  rays_per_batch_late_start: 9000
+  densify_from: 1000
+  densify_until: 6000
+  densify_factor: 1.15
+  prune_variance_criterion: true
+  redundancy_cap: 0.05
+  targeted_fraction: 0.1
+  high_error_fraction: 0.2
+  freeze_points: 9500
+  points_hard_freeze_at: -1
+  ordering: >
+    densify 1000-6000 -> splits activate 6000 (point count settled) ->
+    continuity prior 6100 -> ray ramp 9000 -> points freeze 9500
+
+rationale:
+  unfrozen_geometry: >
+    points_hard_freeze_at is -1 throughout. In the 64k/128k face-continuity
+    matrix, letting geometry train past split activation was worth +2.50 dB
+    (64k) and +2.29 dB (128k) volume PSNR versus the frozen arms - larger than
+    any regularizer weight tested, and it improved SSIM3D, Dice, air MAE/FPR,
+    chamfer and F1 simultaneously. It is the dominant effect, so every arm here
+    uses it.
+  weights: >
+    The prior matrix recommended testing a gentler ~1e-5 weight; 3e-4/1e-4 were
+    clearly harmful and 3e-5 was roughly neutral-to-slightly-positive on
+    unfrozen geometry. So the ladder is 0 / 1e-5 / 3e-5, not the old 3e-4 range.
+  density_term: >
+    The density-consistency component is ablated rather than assumed. Across
+    the 4 frozen/unfrozen x 64k/128k replications it reduced density mismatch
+    in 3 of 4; the one pair that got worse was the original 64k-frozen sample
+    the earlier "does not work" claim rested on. w1e-5 vs w1e-5d isolates it at
+    matched strength.
+
+arms:
+  # 3 cell counts x 4 regularization settings, + 1 no-split control.
+  - {tag: SC128_ctrl,   cells: 128k, face_weight: 0.0,     density_weight: 0.0, split: true}
+  - {tag: SC128_w1e-5,  cells: 128k, face_weight: 1.0e-5,  density_weight: 0.0, split: true}
+  - {tag: SC128_w1e-5d, cells: 128k, face_weight: 1.0e-5,  density_weight: 0.1, split: true}
+  - {tag: SC128_w3e-5d, cells: 128k, face_weight: 3.0e-5,  density_weight: 0.1, split: true}
+  - {tag: SC256_ctrl,   cells: 256k, face_weight: 0.0,     density_weight: 0.0, split: true}
+  - {tag: SC256_w1e-5,  cells: 256k, face_weight: 1.0e-5,  density_weight: 0.0, split: true}
+  - {tag: SC256_w1e-5d, cells: 256k, face_weight: 1.0e-5,  density_weight: 0.1, split: true}
+  - {tag: SC256_w3e-5d, cells: 256k, face_weight: 3.0e-5,  density_weight: 0.1, split: true}
+  - {tag: SC512_ctrl,   cells: 512k, face_weight: 0.0,     density_weight: 0.0, split: true}
+  - {tag: SC512_w1e-5,  cells: 512k, face_weight: 1.0e-5,  density_weight: 0.0, split: true}
+  - {tag: SC512_w1e-5d, cells: 512k, face_weight: 1.0e-5,  density_weight: 0.1, split: true}
+  - {tag: SC512_w3e-5d, cells: 512k, face_weight: 3.0e-5,  density_weight: 0.1, split: true}
+  - {tag: SC256_scalar, cells: 256k, face_weight: 0.0,     density_weight: 0.0, split: false}
+
+comparisons:
+  splits_help: SC256_ctrl vs SC256_scalar (split cells vs scalar cells, matched schedule)
+  regularizer_helps: SC<N>_ctrl vs SC<N>_w1e-5 / SC<N>_w1e-5d / SC<N>_w3e-5d
+  density_component: SC<N>_w1e-5 vs SC<N>_w1e-5d (matched strength, density off/on)
+  strength: SC<N>_w1e-5d vs SC<N>_w3e-5d
+  cell_count: SC128_* vs SC256_* vs SC512_* within matched arm
+
+split_aware_evaluation: >
+  Every density-evaluating visualization and metric path resolves split cells
+  when thin surfaces are active - there is no longer a separate "_split" panel
+  family. query_density (raw slice column) already did; this sweep adds
+  per-neighbor side resolution to the IDW paths via idw_query's value_fn hook,
+  so sample_idw (interleaved IDW column), sample_idw_diagnostic
+  (idw_diagnostics panel) and voxelize_volumes' IDW volume are all side-correct
+  instead of blending flat per-cell densities across internal surfaces.
+  Reduces exactly to the old behavior for scalar cells, so SC256_scalar is
+  unaffected.
+
+known_metric_caveat: >
+  In-training volume metrics (test/vol_raw_psnr, test/vol_idw_psnr) voxelize at
+  1 sample per voxel, while the headline volume_hard_ss4_metrics.json comes from
+  split_voxelize.py at 4x supersampling with hard side selection. Both are
+  split-aware; the supersampled one is ~3 dB higher purely from partial-volume
+  anti-aliasing at boundaries (measured: 29.9 -> 33.1 dB on one FC64 slice).
+  Compare like with like: TB scalars against TB scalars, JSON against JSON.
+
+artifacts:
+  per_run: output/sweep_splitcell/<tag>/
+  volume: volume_hard_ss4.npy + volume_hard_ss4_metrics.json
+  surface: surface_hard_ss4_metrics.json
+  continuity: face_continuity_eval.json (split arms only)
+  markers: DONE / FAILED
