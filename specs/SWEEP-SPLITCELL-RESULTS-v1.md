@@ -69,6 +69,65 @@ python experiments/sweep_splitcell_v1/summarize.py
 cat output/sweep_splitcell/SC128_ctrl/volume_hard_ss4_metrics.json
 ```
 
+## Decomposing the 3.8 dB gap (measured, not assumed)
+
+Both numbers were reproduced from the single `SC128_ctrl` checkpoint with one
+evaluator, varying only one factor at a time. `linspace ss1` reproduces TB's
+`test/vol_raw_psnr` to 4 decimals and `centers ss4` reproduces the JSON
+`volume_psnr` to 4 decimals, so the comparison is exact:
+
+| config | PSNR | note |
+|---|---|---|
+| `linspace` ss1 | **30.0920** | == TB `test/vol_raw_psnr` (30.0920) |
+| `centers` ss1 | 31.8165 | grid fix alone: **+1.72 dB** |
+| `centers` ss2 | 33.6428 | +1.83 |
+| `centers` ss4 | **33.9199** | == JSON `volume_psnr` (33.91995) |
+| `centers` ss8 | 33.9575 | +0.038 — converged |
+| `linspace` ss4 | 31.7333 | supersampling without the grid fix |
+| `centers` ss4, split ignored | 33.9231 | **−0.0032 dB** vs split-aware |
+
+So the gap is `+1.72 dB` grid registration `+ 2.10 dB` anti-aliasing, and
+**0.00 dB** from split cells. Two non-factors, both verified rather than
+assumed:
+
+- **Split cells contribute nothing.** The TB raw path *is* split-aware
+  (`voxelize_volumes:1535-1537` calls `_split_eval`). Evaluating the same grid
+  with the split ignored changes PSNR by −0.003 dB, independently confirming the
+  delta collapse: the split is not what separates these numbers.
+- **The two PSNR formulas agree.** `train.py:95` uses `gt.max()**2`,
+  `voxelize.py:52` uses `(gt.max()-gt.min())**2`; `vol_gt.npy` has
+  `min=0.0, max=1.0`, so they are identical (every row above scored the same
+  under both).
+
+### The TB grid is misregistered, not merely coarser
+
+`voxelize_volumes:1513` samples `torch.linspace(-extent, extent, resolution)`:
+pitch `2/255` and phase starting at a voxel *edge*. `split_voxelize:330` samples
+voxel centers at pitch `2/256`. A sub-voxel offset scan at correct pitch `2/R`,
+ss1, settles which matches the GT:
+
+| offset t (voxels) | 0.00 | 0.25 | 0.40 | **0.50** | 0.60 | 0.75 | 1.00 |
+|---|---|---|---|---|---|---|---|
+| PSNR | 29.182 | 31.076 | 31.694 | **31.817** | 31.666 | 31.022 | 29.261 |
+
+Symmetric with a maximum exactly at `t=0.5`: `vol_gt.npy` is defined on **voxel
+centers**, and sampling at voxel edges costs 2.6 dB. TB's `linspace` grid also
+has the wrong pitch (`2/255` vs `2/256`), a 0.4% stretch that is aligned at the
+volume centre and drifts to half a voxel at the edges — which is why it lands at
+30.09, between the `t=0` and `t=0.5` extremes.
+
+Conclusion: for this dataset the JSON number is the correct one and
+`test/vol_raw_psnr` is biased low by ~3.8 dB — ~1.7 dB of that a genuine
+registration error against the GT, ~2.1 dB unconverged single-sample quadrature.
+`ss4` is within 0.04 dB of converged, so 4x supersampling is the right operating
+point; `ss8` costs 8x for +0.038 dB.
+
+Do not "fix" this by switching `voxelize_volumes` to centers without checking
+the dataset: `load_gt_volume`'s `ct_synthetic` branch *generates* its GT with
+`np.linspace(-1, 1, G)`, so that dataset's GT is edge/endpoint-defined and the
+current sampling is correct there. The defect is the repo mixing two conventions,
+not one function being wrong everywhere.
+
 ## Results
 
 | arm | volPSNR | SSIM3D | sobPSNR | dice | airMAE | airFPR | chamfer | hd95 | f1_1v | cand |
