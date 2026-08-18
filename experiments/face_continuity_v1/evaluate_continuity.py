@@ -13,13 +13,46 @@ from radfoam_model.face_continuity import (
     build_voronoi_face_cache, face_continuity_loss)
 
 
+def _robust_triangulation(points_input, max_failures=10):
+    """Triangulate, retrying with adaptive jitter like CTScene does.
+
+    ``radfoam.Triangulation`` can raise TriangulationFailedError("divergent
+    growth iterations") on a point cloud the live *incremental* triangulation
+    renders and trains on happily -- observed at 512k on sweep_splitcell_v1's
+    SC512_w1e-5, whose 10000-step run finished at test PSNR 48.91 and was then
+    unevaluable. ``CTScene.update_triangulation`` already recovers from this via
+    extent-relative perturbation, so reuse that policy verbatim (same 1e-5 and
+    3**failures constants) rather than losing a completed run. The applied
+    jitter is returned so it lands in the JSON and the number stays auditable.
+    """
+    points = points_input
+    extent = points_input.abs().max().item()
+    failures = 0
+    perturbation = 0.0
+    while True:
+        try:
+            return radfoam.Triangulation(points), points, failures, perturbation
+        except radfoam.TriangulationFailedError as error:
+            failures += 1
+            if failures > max_failures:
+                raise RuntimeError(
+                    f"aborted triangulation after {max_failures} attempts") from error
+            perturbation = extent * 1e-5 * (3.0 ** failures)
+            print(f"[continuity-eval] caught {error}; retry {failures} with "
+                  f"perturbation {perturbation:.3e}")
+            points = points_input + perturbation * torch.randn_like(points_input)
+            points = points.contiguous()
+
+
 def main(args):
     device = torch.device(args.device)
     checkpoint = torch.load(args.model, map_location=device, weights_only=True)
     points_input = checkpoint["xyz"].to(device).contiguous()
-    triangulation = radfoam.Triangulation(points_input)
+    triangulation, points_used, tri_retries, tri_perturbation = (
+        _robust_triangulation(points_input))
     permutation = triangulation.permutation().long()
-    points = points_input[permutation].contiguous()
+    # Geometry must come from the point set the tets actually describe.
+    points = points_used[permutation].contiguous()
     identity = torch.arange(points.shape[0], device=device)
     cache = build_voronoi_face_cache(
         points, triangulation.tets(), identity,
@@ -55,6 +88,10 @@ def main(args):
         "model": str(Path(args.model).resolve()),
         "cache_faces": cache.num_faces,
         "cache_build_seconds": cache.build_seconds,
+        # Nonzero means the from-scratch rebuild diverged and the geometry was
+        # jittered by this much to recover it; compare such an arm with care.
+        "triangulation_retries": tri_retries,
+        "triangulation_perturbation": tri_perturbation,
         "density_scale": density_scale,
         "batches": args.batches,
         "batch_size": args.batch_size,
