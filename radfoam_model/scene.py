@@ -80,7 +80,7 @@ IDWResult = namedtuple("IDWResult", [
 def idw_query(query, points, adjacency, adjacency_offsets, aabb_tree,
               activated, sigma, sigma_v, global_max_k=None,
               per_cell_sigma=False, per_neighbor_sigma=False,
-              cell_radius=None, hop=1):
+              cell_radius=None, hop=1, value_fn=None):
     """Bilateral IDW interpolation for a batch of query points.
 
     Matches the CUDA kernel: exp(-d²/σ²) spatial × exp(-Δμ²/σ_v²) bilateral.
@@ -99,6 +99,13 @@ def idw_query(query, points, adjacency, adjacency_offsets, aabb_tree,
         per_neighbor_sigma: each neighbor slot uses its own cell's radius
         cell_radius: (N,) required when per_cell_sigma=True
         hop: neighborhood depth (1=direct neighbors only, 2=include neighbors-of-neighbors)
+        value_fn: optional callable(query, pad_idx, valid) -> (vals, ref_val)
+            supplying per-(query, neighbor) densities in place of the flat
+            per-cell ``activated`` gather. Required for split-cell
+            (thin-surface) fields, where a neighbor's density at the query
+            point depends on which side of that neighbor's own internal
+            surface the point falls. None = flat per-cell gather (default;
+            leaves the training path byte-identical).
 
     Returns:
         IDWResult namedtuple
@@ -176,9 +183,12 @@ def idw_query(query, points, adjacency, adjacency_offsets, aabb_tree,
 
     w = torch.exp(-dist_sq / sigma_sq)
 
-    vals = activated[pad_idx]
+    if value_fn is None:
+        vals = activated[pad_idx]
+        ref_val = activated[nn_idx] if sigma_v is not None else None
+    else:
+        vals, ref_val = value_fn(query, pad_idx, valid)
     if sigma_v is not None:
-        ref_val = activated[nn_idx]
         val_diff = vals - ref_val.unsqueeze(1)
         w = w * torch.exp(-val_diff * val_diff / (sigma_v * sigma_v))
 

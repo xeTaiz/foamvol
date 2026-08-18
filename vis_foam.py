@@ -172,6 +172,74 @@ def _thin_surface_query_config(field):
     return mode, activation_scale, delta_max_frac
 
 
+def _split_eval(field, thin_config, query, owners):
+    """Evaluate split-resolved density of specific cells at query points.
+
+    ``owners[i]`` names the cell whose own internal surface (quaternion frame
+    + K-texel soft-Voronoi height field) decides the density seen at
+    ``query[i]``. ``owners`` is deliberately a free parameter rather than the
+    nearest-cell lookup: the IDW blend needs each *neighbor* evaluated against
+    its own surface, not just the containing cell.
+
+    Hard side selection (``blend_eps=0``) matches split_voxelize.py, so a
+    point takes one side's density outright with no smoothing across the
+    boundary.
+    """
+    from split_voxelize import split_cell_query
+    density_mode, activation_scale, delta_max_frac = thin_config
+    if density_mode == "independent":
+        value, _, _ = split_cell_query(
+            query, field["points"], owners, field["density_flat"],
+            None, field["quaternions"], field["texel_sites_2d"],
+            field["texel_heights"], field["cell_radius"],
+            thin_temp=10.0, activation_scale=activation_scale,
+            blend_eps=0.0, density_mode="independent",
+            raw_plus=field["raw_plus"], raw_minus=field["raw_minus"],
+            delta_max_frac=delta_max_frac,
+        )
+    else:
+        value, _, _ = split_cell_query(
+            query, field["points"], owners, field["density_flat"],
+            field["density_delta"], field["quaternions"],
+            field["texel_sites_2d"], field["texel_heights"],
+            field["cell_radius"], thin_temp=10.0,
+            activation_scale=activation_scale, blend_eps=0.0,
+            density_mode=density_mode, delta_max_frac=delta_max_frac,
+        )
+    return value
+
+
+def _make_split_value_fn(field, thin_config, max_pairs=8_000_000):
+    """Build an ``idw_query`` value_fn that resolves each neighbor's own split.
+
+    Flat IDW gathers a single density per neighbor cell. For a split cell that
+    is simply wrong: the cell carries two densities and which one applies
+    depends on where the query point sits relative to that cell's internal
+    surface. This evaluates every (query, neighbor) pair against the
+    neighbor's own surface so the bilateral blend mixes side-correct values.
+
+    Reduces exactly to the flat gather when nothing is split (delta = 0 makes
+    both sides equal), so enabling it cannot change a scalar-cell run.
+    """
+    def value_fn(query, pad_idx, valid):
+        B, K = pad_idx.shape
+        vals = torch.empty(B, K, device=query.device, dtype=query.dtype)
+        # Chunk over query rows, not flattened pairs: expand(...).reshape()
+        # copies, so a 2M-row batch at K~30 would materialize ~700MB.
+        rows = max(1, int(max_pairs) // max(K, 1))
+        for s in range(0, B, rows):
+            e = min(s + rows, B)
+            q = query[s:e].unsqueeze(1).expand(-1, K, 3).reshape(-1, 3)
+            owners = pad_idx[s:e].reshape(-1)
+            vals[s:e] = _split_eval(
+                field, thin_config, q, owners).view(e - s, K)
+        # Slot 0 is the containing cell (idw_query sets pad_idx[:, 0] =
+        # nn_idx), so the bilateral reference is exactly the value
+        # query_density() reports for this point.
+        return vals, vals[:, 0]
+    return value_fn
+
+
 def field_from_model(model):
     """Build a field dict from a live CTScene (no checkpoint save/load)."""
     with torch.no_grad():
@@ -337,29 +405,8 @@ def query_density(field, coordinates):
 
         thin_config = _thin_surface_query_config(field)
         if thin_config is not None:
-            # Keep the split dependency local to live thin-surface slices.
-            from split_voxelize import split_cell_query
-            density_mode, activation_scale, delta_max_frac = thin_config
-            if density_mode == "independent":
-                value, _, _ = split_cell_query(
-                    query, field["points"], nn_indices, field["density_flat"],
-                    None, field["quaternions"], field["texel_sites_2d"],
-                    field["texel_heights"], field["cell_radius"],
-                    thin_temp=10.0, activation_scale=activation_scale,
-                    blend_eps=0.0, density_mode="independent",
-                    raw_plus=field["raw_plus"], raw_minus=field["raw_minus"],
-                    delta_max_frac=delta_max_frac,
-                )
-            else:
-                value, _, _ = split_cell_query(
-                    query, field["points"], nn_indices, field["density_flat"],
-                    field["density_delta"], field["quaternions"],
-                    field["texel_sites_2d"], field["texel_heights"],
-                    field["cell_radius"], thin_temp=10.0,
-                    activation_scale=activation_scale, blend_eps=0.0,
-                    density_mode=density_mode, delta_max_frac=delta_max_frac,
-                )
-            result[start:end] = value
+            result[start:end] = _split_eval(
+                field, thin_config, query, nn_indices)
         elif field["gradients"] is not None:
             result[start:end] = sample_interpolated(
                 query, nn_indices,
@@ -381,7 +428,8 @@ def query_density(field, coordinates):
 
 
 def _idw_query(query, field, activated, sigma, sigma_v, global_max_k=None,
-               per_cell_sigma=False, per_neighbor_sigma=False, hop=1):
+               per_cell_sigma=False, per_neighbor_sigma=False, hop=1,
+               value_fn=None):
     """Core bilateral IDW for a batch of query points. Thin wrapper around scene.idw_query."""
     return idw_query(
         query, field["points"], field["adjacency"], field["adjacency_offsets"],
@@ -391,6 +439,7 @@ def _idw_query(query, field, activated, sigma, sigma_v, global_max_k=None,
         per_neighbor_sigma=per_neighbor_sigma,
         cell_radius=field.get("cell_radius"),
         hop=hop,
+        value_fn=value_fn,
     )
 
 
@@ -428,6 +477,13 @@ def sample_idw(field, coordinates, sigma=0.01, sigma_v=None,
     adj_off = field["adjacency_offsets"]
     global_max_k = int((adj_off[1:] - adj_off[:-1]).max().item())
 
+    # A split cell's density at the query point depends on which side of that
+    # cell's own internal surface the point falls, so idw_query's flat
+    # per-cell gather would blend wrong-side values across the neighborhood.
+    thin_config = _thin_surface_query_config(field)
+    value_fn = (_make_split_value_fn(field, thin_config)
+                if thin_config is not None else None)
+
     result = torch.zeros(coords_flat.shape[0], device=field["device"])
     batch_size = 2_000_000
 
@@ -437,7 +493,7 @@ def sample_idw(field, coordinates, sigma=0.01, sigma_v=None,
                          sigma, sigma_v, global_max_k,
                          per_cell_sigma=per_cell_sigma,
                          per_neighbor_sigma=per_neighbor_sigma,
-                         hop=hop)
+                         hop=hop, value_fn=value_fn)
         result[start:end] = res.idw_result
 
     return torch.nan_to_num(result).reshape(original_shape).cpu().numpy()
@@ -880,9 +936,15 @@ def sample_idw_diagnostic(field, coordinates, sigma=0.001, sigma_v=None):
     coords_flat = coordinates.reshape(-1, 3).to(field["device"])
 
     activated = F.softplus(field["density_flat"], beta=10)
-    res = _idw_query(coords_flat, field, activated, sigma, sigma_v)
+    thin_config = _thin_surface_query_config(field)
+    value_fn = (_make_split_value_fn(field, thin_config)
+                if thin_config is not None else None)
+    res = _idw_query(coords_flat, field, activated, sigma, sigma_v,
+                     value_fn=value_fn)
 
-    nn_density = activated[res.nn_idx]
+    # Slot 0 is the containing cell; res.vals is split-resolved when value_fn
+    # is active and identical to activated[nn_idx] when it is not.
+    nn_density = res.vals[:, 0]
     idw_result = torch.nan_to_num(res.idw_result)
     cell_weight = torch.nan_to_num(res.weights[:, 0])
 
@@ -1429,10 +1491,11 @@ def voxelize_volumes(field, resolution, extent, sigma, sigma_v, hop=1):
     query_density() uses for the live slices_interleaved panel. Falls back to
     softplus(density[nearest_cell]) — constant per Voronoi cell — otherwise.
     IDW volume: Gaussian bilateral natural-neighbor interpolation matching
-    the CUDA tracing kernel (exp(-d²/σ²) spatial, exp(-Δμ²/σ_v²) bilateral)
-    over the flat per-cell density. NOT split-aware: blending would require
-    resolving each blended neighbor's own split side before combining, which
-    this helper does not attempt.
+    the CUDA tracing kernel (exp(-d²/σ²) spatial, exp(-Δμ²/σ_v²) bilateral).
+    Also split-aware when thin-surface state is active: every blended
+    neighbor is evaluated against its own internal surface at the query point
+    (see _make_split_value_fn) instead of contributing one flat per-cell
+    density, so the blend never mixes wrong-side values.
 
     Args:
         field: dict from load_density_field() or field_from_model()
@@ -1460,36 +1523,18 @@ def voxelize_volumes(field, resolution, extent, sigma, sigma_v, hop=1):
     batch_size = 2_000_000
 
     thin_config = _thin_surface_query_config(field)
-    if thin_config is not None:
-        from split_voxelize import split_cell_query
-        density_mode, activation_scale, delta_max_frac = thin_config
+    value_fn = (_make_split_value_fn(field, thin_config)
+                if thin_config is not None else None)
 
     for start in range(0, num_voxels, batch_size):
         end = min(start + batch_size, num_voxels)
         query = coords_flat[start:end]
         res = _idw_query(query, field, activated,
-                         sigma, sigma_v, global_max_k, hop=hop)
+                         sigma, sigma_v, global_max_k, hop=hop,
+                         value_fn=value_fn)
         if thin_config is not None:
-            if density_mode == "independent":
-                value, _, _ = split_cell_query(
-                    query, field["points"], res.nn_idx, field["density_flat"],
-                    None, field["quaternions"], field["texel_sites_2d"],
-                    field["texel_heights"], field["cell_radius"],
-                    thin_temp=10.0, activation_scale=activation_scale,
-                    blend_eps=0.0, density_mode="independent",
-                    raw_plus=field["raw_plus"], raw_minus=field["raw_minus"],
-                    delta_max_frac=delta_max_frac,
-                )
-            else:
-                value, _, _ = split_cell_query(
-                    query, field["points"], res.nn_idx, field["density_flat"],
-                    field["density_delta"], field["quaternions"],
-                    field["texel_sites_2d"], field["texel_heights"],
-                    field["cell_radius"], thin_temp=10.0,
-                    activation_scale=activation_scale, blend_eps=0.0,
-                    density_mode=density_mode, delta_max_frac=delta_max_frac,
-                )
-            raw_vol[start:end] = torch.nan_to_num(value)
+            raw_vol[start:end] = torch.nan_to_num(
+                _split_eval(field, thin_config, query, res.nn_idx))
         else:
             raw_vol[start:end] = activated[res.nn_idx]
         idw_vol[start:end] = torch.nan_to_num(res.idw_result)
