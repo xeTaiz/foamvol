@@ -30,7 +30,7 @@ from radfoam_model.mesh import surface_metrics_vs_gt_volume
 from radfoam_model.scene import idw_query
 from radfoam_model.utils import gauss_conv3d_separable as _gauss_conv3d_separable
 from visualize_volume import visualize
-from vis_foam import (load_density_field, field_from_model, query_density,
+from vis_foam import (field_from_model, query_density,
                       sample_idw, sample_idw_diagnostic,
                       visualize_idw_diagnostics,
                       make_slice_coords, compute_cell_density_slice,
@@ -1739,7 +1739,16 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                             else pipeline_args.interp_sigma_scale * cell_radius.median().item())
             interp_sigma_v = pipeline_args.interp_sigma_v
 
-        field = load_density_field(model_path)
+        # Build the field from the LIVE model, not by reloading the checkpoint.
+        # load_density_field() calls radfoam.Triangulation(points) to recover
+        # tetrahedra, and that from-scratch rebuild can raise
+        # TriangulationFailedError("divergent growth iterations") on a point
+        # cloud the live incremental triangulation renders happily (observed at
+        # 512k on sweep_splitcell_v1/SC512_w1e-5, which lost its post-training
+        # metrics after a clean 10000-step run). field_from_model() takes the
+        # tets from model.triangulation, so it cannot diverge and skips a
+        # redundant full Delaunay build.
+        field = field_from_model(model)
 
         # 3D volume metrics (matching R2-Gaussian evaluation)
         if gt_volume is not None:
