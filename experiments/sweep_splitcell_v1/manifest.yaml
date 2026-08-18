@@ -81,6 +81,19 @@ split_aware_evaluation: >
   Reduces exactly to the old behavior for scalar cells, so SC256_scalar is
   unaffected.
 
+known_cell_count_caveat: >
+  The 128k arms start from init_points 32000 while the 256k and 512k arms start
+  from 64000. That asymmetry is inherited verbatim from the reference baselines
+  (configs/fixed_final/128k.yaml was tuned that way) and was kept rather than
+  silently edited, since the point of loading those files is that the schedule
+  matches validated runs. Consequence: the within-cell-count comparisons (the
+  four regularization arms against each other, and SC256_ctrl vs SC256_scalar)
+  are clean, but cross-cell-count comparisons additionally differ in initial
+  point count and therefore in densification trajectory. Treat the 128k-vs-256k
+  -vs-512k trend as indicative, not as a controlled single-variable sweep. A
+  follow-up wanting a strict cell-count ablation should re-run 128k from
+  init_points 64000 and accept the off-baseline deviation.
+
 known_metric_caveat: >
   In-training volume metrics (test/vol_raw_psnr, test/vol_idw_psnr) voxelize at
   1 sample per voxel, while the headline volume_hard_ss4_metrics.json comes from
