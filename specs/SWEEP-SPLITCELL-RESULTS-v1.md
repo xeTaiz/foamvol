@@ -32,9 +32,42 @@ Arms per cell count: `ctrl` (weight 0), `w1e-5` (weight 1e-5, density 0),
 `thin_surface_face_weight`, `thin_surface_face_density_weight`, and
 `experiment_name` — verified by config diff.
 
-All numbers below come from the hard split-aware voxelization at 256^3 with 4x
-supersampling (`split_voxelize.py`), the single artifact every metric is scored
-from.
+## Where these numbers live — they are NOT in TensorBoard
+
+Every metric in the table below is read from JSON files on disk, not from TB:
+
+```
+output/sweep_splitcell/<ARM>/volume_hard_ss4_metrics.json   -> volume_psnr, ssim, dice, air.*
+output/sweep_splitcell/<ARM>/surface_hard_ss4_metrics.json  -> chamfer, hausdorff_95, f1_*
+output/sweep_splitcell/<ARM>/face_continuity_eval.json      -> candidate_faces
+```
+
+They are produced by `split_voxelize.py --resolution 256 --supersample 4`, which
+`run_sweep.sh` runs as a **separate process after training** (lines 51-56). That
+script contains no `SummaryWriter` and never calls `add_scalar`, so none of these
+values can appear in TensorBoard. It writes `.npy`, `_metrics.json`, a slices
+PNG, and a NIfTI.
+
+Three different volume PSNRs therefore exist for one run. For `SC128_ctrl`:
+
+| value | number | source | why it differs |
+|---|---|---|---|
+| `volume_psnr` | **33.920** | `volume_hard_ss4_metrics.json` (the table below) | hard split voxelization, 256^3, supersample **4** |
+| `test/vol_raw_psnr` | 30.092 | TensorBoard scalar | same idea but **1 sample/voxel**; ~+3.8 dB is pure partial-volume anti-aliasing |
+| `test/vol_r2_psnr` | 35.851 | TensorBoard scalar | R2-Gaussian normalization, a different metric definition |
+
+Searching TB for ~34 dB finds nothing precisely because TB holds 30.09 and 35.85
+for that run. See `known_metric_caveat` in the manifest: compare TB against TB,
+JSON against JSON, never across.
+
+To reproduce the table on the worker:
+
+```
+cd /code/lc64-radfoam
+python experiments/sweep_splitcell_v1/summarize.py
+# or read one arm directly:
+cat output/sweep_splitcell/SC128_ctrl/volume_hard_ss4_metrics.json
+```
 
 ## Results
 
