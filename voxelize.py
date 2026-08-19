@@ -22,6 +22,7 @@ import radfoam
 import torch.nn.functional as F
 
 from radfoam_model.scene import idw_query
+from radfoam_model.utils import compute_volume_psnr
 from voxel_grid import voxel_center_grid
 
 
@@ -50,23 +51,6 @@ def gaussian_blur_3d(volume, kernel_size=3, sigma=1.0):
     return F.conv3d(vol_5d, kernel, padding=pad).squeeze(0).squeeze(0)
 
 
-def compute_volume_psnr(pred, gt):
-    """3D PSNR matching R2-Gaussian: ``10*log10(pixel_max**2 / MSE)``.
-
-    ``pixel_max = gt.max()`` is R2-Gaussian's default and is what train.py,
-    train_vol.py and eval_vol.py use, so headline numbers stay comparable with
-    the published baseline.  This used to be ``gt.max() - gt.min()``; the two
-    agree exactly whenever the GT floor is 0 (true for the r2_gaussian CT
-    volumes, verified: min=0.0, max=1.0) and diverge only on data with a
-    non-zero air floor -- where the R2 convention is the correct reference.
-    """
-    mse = np.mean((pred - gt) ** 2)
-    if mse == 0:
-        return float("inf")
-    pixel_max = gt.max()
-    if pixel_max == 0:
-        return float("inf")
-    return 10.0 * np.log10(pixel_max ** 2 / mse)
 
 
 def compute_volume_ssim(pred, gt, window_size=11):

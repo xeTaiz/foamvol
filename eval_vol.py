@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 from skimage.measure import marching_cubes
 from scipy.spatial import KDTree
+from radfoam_model.utils import compute_volume_psnr
 
 
 # ─── metric helpers ──────────────────────────────────────────────────────────
@@ -33,13 +34,6 @@ def _to_tensor(x, device):
     return x.float().to(device)
 
 
-def compute_volume_psnr(pred, gt):
-    pred, gt = pred.float(), gt.float()
-    pixel_max = gt.max()
-    mse = torch.mean((pred - gt) ** 2)
-    if mse == 0:
-        return float("inf")
-    return (10 * torch.log10(pixel_max ** 2 / mse)).item()
 
 
 @torch.no_grad()
