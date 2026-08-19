@@ -83,6 +83,18 @@ Sampling grids (endpoint → centres):
 - `voxelize.py:voxelize` — standalone script whose docstring already *claimed* centres.
 - `experiments/orientation_recovery.py:_assign_samples` — world mapping and `np.gradient` spacing.
 - `radfoam_model/scene.py:391` and `split_voxelize.py` were already correct; unified onto the helper so there is one spelling.
+- `radfoam_model/mesh.py:surface_metrics_vs_gt_volume` — marching-cubes vertex
+  index→world used `2/(R-1)` with no half-voxel shift. See the dedicated section
+  below: this one is a **metric** error, not cosmetic.
+- `eval_sigma_sweep.py:264` — same GT-mesh mapping for the TB mesh export.
+- `visualize_volume.py:coord_to_index` — slice picking used `(R-1)`.
+- `split_voxelize.py` NIfTI affine — origin was the box face; NIfTI maps index 0
+  to the **centre** of voxel 0, so the saved geometry was off by half a voxel in
+  external viewers.
+- `experiments/analyze_split_cells.py:363` — locator z-axis.
+- `demos/click_segment.py` (9 sites: world↔voxel for slice binning, click
+  markers, label sampling, mask voxelization, float slice indexing) and
+  `demos/text_segment.py:167`. Cosmetic, but fixed so no mixed spelling remains.
 
 `align_corners=True` → `ALIGN_CORNERS` (False):
 - `radfoam_model/scene.py` — FDK init sampling, ref-volume resize (×2), ref-weight sampling, `mu_gt` backward probe.
@@ -102,17 +114,64 @@ PSNR: `voxelize.py:compute_volume_psnr` used `(gt.max()-gt.min())**2` while
 in every row of the decomposition above — so no published number changes. They
 diverge only on data with a non-zero air floor, where R2 parity is correct.
 
+## The two surface-metric paths are affected differently
+
+`cd`/`hd`/`hd95`/`f1`/`dice` reach you through two different code paths, and only
+one of them had a registration error in its own right:
+
+1. **`compute_surface_metrics`** (duplicated in `train.py`, `eval_vol.py`,
+   `train_vol.py`; used by `eval_hard_surface.py` and therefore by
+   `surface_hard_ss4_metrics.json`) runs marching cubes on the **prediction and
+   GT arrays in index space**. Both meshes share one indexing, so the metric is
+   internally registered. It is only wrong if the *prediction volume* was
+   sampled on the wrong grid — true for `train.py`'s TB numbers (fed by
+   `voxelize_volumes`), **not** true for the sweep, whose volumes come from
+   `split_voxelize` and were always on centres. **The sweep's published chamfer /
+   hd95 / f1 numbers stand.**
+
+2. **`surface_metrics_vs_gt_volume`** (`radfoam_model/mesh.py`, reported as
+   `Mesh Raw CD / HD95 / F1`) compares an index-derived GT mesh against the
+   Voronoi mesh in **true world coordinates**, so the index→world mapping matters
+   directly. It used `2/(R-1)` with no half-voxel shift. Measured effect of the
+   fix on the GT mesh at R=256: vertices move by **mean 0.375, max 0.708 voxels**.
+   Reported chamfer values are 1.14-2.05 voxels, so this was an **18-33%
+   systematic error** in those numbers. All `Mesh Raw *` metrics must be
+   recomputed.
+
+Dice is a thresholded volume-overlap metric, so it inherits case 1: correct
+wherever the prediction volume was on centres, wrong in `train.py`'s TB path.
+
+## Deliberately unchanged
+
+Not every `linspace` or `(N-1)` is a voxel grid. These were audited and left:
+
+- **Detector / ray geometry** — `data_loader/ct_synthetic.py:47-48`,
+  `acr_dicomctpd.py:114`. These define projector geometry that must match the
+  rays stored with each dataset; changing them would desynchronise the
+  projections. The production loaders (`r2_gaussian.py`, `blender.py`,
+  `colmap.py`, `inveon_ct.py`, `ct_cube.py` detector code) already use `+0.5`
+  pixel centres.
+- **2-D tangent-space parameter grids** — `vis_foam.py:2278,2309`,
+  `analyze_split_cells.py:275,299`. These sweep a local surface patch in
+  `[-1,1]` parameter coordinates, not a voxel lattice; endpoints are correct.
+- **Point initialisation lattice** — `radfoam_model/scene.py:265`. Cell seed
+  positions with jitter, not a sampling grid.
+- **Array-bound clamps** — `adj.shape[0] - 1`, `cache.vertices.shape[0] - 1`, etc.
+  Index arithmetic, unrelated to geometry.
+
 ## Rerun scope
 
 **Re-score only — no retraining (the large majority, including all 13 sweep arms).**
 Standard projection-loss CT training never touches a voxel grid; supervision goes
 through the CUDA rasterizer. Only the *reported* metric was wrong. Affected:
 `test/vol_raw_psnr`, `test/vol_idw_psnr`, both Sobel variants, all volume SSIMs,
-dice, and `train.py`'s final `compute_surface_metrics` (chamfer/HD95/F1, shifted
-by ~half a voxel), plus slice panels and DRR projection comparisons.
+dice, `train.py`'s `compute_surface_metrics` (its prediction volume came from
+`voxelize_volumes`), every `Mesh Raw *` metric (see above), plus slice panels and
+DRR projection comparisons.
 Re-scoring runs from a saved `model.pt` in seconds to minutes per arm; the 13-arm
 volume-PSNR sweep above took ~1 minute total. `test/vol_r2_psnr` is unaffected
-(loaded volume, no sampling grid).
+(loaded volume, no sampling grid), and the sweep's `surface_hard_ss4_metrics.json`
+numbers are unaffected (prediction volumes came from `split_voxelize`).
 
 **Genuine reruns required — the misregistration entered the optimization target:**
 - **FDK-initialized runs** — `scene.py` sampled the FDK volume at cell positions
@@ -133,10 +192,13 @@ pre-fork `RadFoamScene`) shadows the `test/` directory as module name `test`, so
 
 ## Verification
 
-- `test/test_voxel_grid_convention.py`: 10/10 pass, including an exact
-  `grid_sample` round-trip under `align_corners=False` and its failure under
-  `True`.
-- Pre-existing suites still green: `test_split_aware_idw`, `test_face_continuity`,
-  `test_split_voxelize_modes`, `test_air_metrics` — 0 failures.
+- `test/test_voxel_grid_convention.py`: **13/13** pass, including an exact
+  `grid_sample` round-trip under `align_corners=False`, its failure under `True`,
+  and index↔world inverse round-trips with half-open voxel spans.
+- Full run across `test_voxel_grid_convention`, `test_split_aware_idw`,
+  `test_face_continuity`, `test_split_voxelize_modes`, `test_air_metrics`:
+  **38 tests ran, 0 failures.**
 - End-to-end: `vis_foam.voxelize_volumes` on `SC128_ctrl` at ss1 now reports
   **31.8165**, exactly the standalone centres reference, up from 30.0920.
+- Mesh registration shift measured directly at R=256: mean 0.375, max 0.708
+  voxels.
