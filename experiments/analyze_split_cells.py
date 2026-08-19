@@ -28,6 +28,7 @@ import radfoam  # noqa: E402
 from split_voxelize import (  # noqa: E402
     assert_supported_thin_K, quat_to_frame, split_cell_query,
 )
+from voxel_grid import ALIGN_CORNERS  # noqa: E402
 
 REL_THRESHOLDS = (0.02, 0.05, 0.1, 0.2, 0.5)
 ABS_THRESHOLDS = (0.005, 0.01, 0.02, 0.05)
@@ -335,12 +336,12 @@ def _make_figure(path, web_dir, gt, selected, primary, points, density, delta,
                 q, points, owner, density, delta, quat, sites, heights, radius,
                 thin_temp=thin_temp, activation_scale=activation_scale,
                 blend_eps=0.0, density_mode="relative", delta_max_frac=rho)
-            # q is reused verbatim as the grid_sample grid. align_corners=True
-            # maps normalized -1/+1 to the first/last GT voxel centers.
+            # q is reused verbatim as the grid_sample grid. The GT volume follows
+            # the voxel-centre convention, so align_corners must be False.
             gt_grid = q.to(dtype=gt_source.dtype).reshape(1, 1, 320, 320, 3)
             gt_value = F.grid_sample(
                 gt_source, gt_grid, mode="bilinear", padding_mode="zeros",
-                align_corners=True).reshape(320, 320)
+                align_corners=ALIGN_CORNERS).reshape(320, 320)
             owner_np = owner.reshape(320, 320).detach().cpu().numpy()
             value_np = torch.nan_to_num(value).reshape(320, 320).detach().cpu().numpy()
             gt_value_np = torch.nan_to_num(gt_value).detach().cpu().numpy()

@@ -16,6 +16,8 @@ import radfoam
 
 from voxelize import sample_interpolated
 from radfoam_model.scene import IDWResult, idw_query
+from voxel_grid import (ALIGN_CORNERS, voxel_center_coords,
+                        voxel_center_coords_np, voxel_center_grid)
 
 
 def _build_tet_topology(points):
@@ -1107,7 +1109,7 @@ def make_slice_coords(axis, coord, resolution, extent):
     Returns:
         (resolution, resolution, 3) numpy array
     """
-    lin = np.linspace(-extent, extent, resolution)
+    lin = voxel_center_coords_np(resolution, extent, dtype=np.float64)
     other = [a for a in range(3) if a != axis]
     u, v = np.meshgrid(lin, lin, indexing="ij")
 
@@ -1321,7 +1323,7 @@ def render_volume_drr(volume, rays, extent=1.0, num_samples=256):
     grid_5d = grid.reshape(1, -1, 1, 1, 3)   # (1, H*W*S, 1, 1, 3)
     vol_5d = vol_t.unsqueeze(0).unsqueeze(0)  # (1, 1, R, R, R)
     sampled = F.grid_sample(vol_5d, grid_5d, mode='bilinear',
-                            padding_mode='zeros', align_corners=True)
+                            padding_mode='zeros', align_corners=ALIGN_CORNERS)
     vals = sampled.reshape(H, W, num_samples)  # (H, W, S)
 
     # Ray-sum with step length
@@ -1352,7 +1354,7 @@ def load_gt_volume(data_path, dataset_type, dataset_args=None):
         return None
     elif dataset_type == "ct_synthetic":
         G = 256
-        lin = np.linspace(-1, 1, G)
+        lin = voxel_center_coords_np(G, 1.0, dtype=np.float64)
         x, y, z = np.meshgrid(lin, lin, lin, indexing="ij")
         vol = np.zeros((G, G, G), dtype=np.float32)
         vol[x ** 2 + y ** 2 + z ** 2 <= 1.0] = 1.0
@@ -1510,9 +1512,7 @@ def voxelize_volumes(field, resolution, extent, sigma, sigma_v, hop=1):
     device = field["device"]
     activated = F.softplus(field["density_flat"], beta=10)
 
-    lin = torch.linspace(-extent, extent, resolution, device=device)
-    gx, gy, gz = torch.meshgrid(lin, lin, lin, indexing="ij")
-    coords_flat = torch.stack([gx, gy, gz], dim=-1).reshape(-1, 3)
+    coords_flat = voxel_center_grid(resolution, extent, device=device)
 
     num_voxels = coords_flat.shape[0]
     raw_vol = torch.zeros(num_voxels, device=device)
@@ -1561,8 +1561,9 @@ def sample_gt_slice(gt_volume, axis, coord, resolution, extent):
     if gt_volume is None:
         return None
     G = gt_volume.shape[0]
-    # Map world coord to voxel index
-    idx = int((coord + extent) / (2 * extent) * (G - 1) + 0.5)
+    # World coord -> voxel index under the centre convention: voxel i spans
+    # [-extent + i*pitch, -extent + (i+1)*pitch), so floor, never /(G-1).
+    idx = int(np.floor((coord + extent) / (2 * extent) * G))
     idx = max(0, min(G - 1, idx))
 
     if axis == 0:
@@ -2354,7 +2355,7 @@ def log_thin_surface_zoom_panels(
                 1, 1, resolution, resolution, 3)
             gt_values = F.grid_sample(
                 gt_source, gt_grid, mode="bilinear", padding_mode="zeros",
-                align_corners=True).reshape(resolution, resolution)
+                align_corners=ALIGN_CORNERS).reshape(resolution, resolution)
 
             learned_np = torch.nan_to_num(learned).reshape(
                 resolution, resolution).cpu().numpy()

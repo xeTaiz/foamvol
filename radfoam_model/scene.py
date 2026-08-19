@@ -10,6 +10,7 @@ import tqdm
 
 import radfoam
 from radfoam_model.render import TraceRays
+from voxel_grid import ALIGN_CORNERS, voxel_center_grid
 
 # K values with a verified forward+backward gradcheck. K=8 is blocked until the
 # CUDA backward's fixed-size w_arr[8] path and adjoint are gradient-checked
@@ -339,7 +340,8 @@ class CTScene(torch.nn.Module):
         stride = max(1, raw_res // ref_resolution)
         t_ref = F.avg_pool3d(vol_5d, kernel_size=stride, stride=stride) if stride > 1 else vol_5d
         if t_ref.shape[-1] != ref_resolution:
-            t_ref = F.interpolate(t_ref, size=ref_resolution, mode="trilinear", align_corners=True)
+            t_ref = F.interpolate(t_ref, size=ref_resolution, mode="trilinear",
+                                  align_corners=ALIGN_CORNERS)
         self._ref_volume = t_ref.squeeze().detach().float()
         self._ref_weight = None
 
@@ -348,7 +350,8 @@ class CTScene(torch.nn.Module):
         # volume is (D=X, H=Y, W=Z) so we need to pass (z, y, x) — flip world (x,y,z)
         grid = pts.flip(-1).reshape(1, 1, 1, -1, 3)           # (1, 1, 1, N, 3)
         sampled = F.grid_sample(
-            vol_5d, grid, mode="bilinear", padding_mode="border", align_corners=True
+            vol_5d, grid, mode="bilinear", padding_mode="border",
+            align_corners=ALIGN_CORNERS,
         )                                                       # (1, 1, 1, 1, N)
         fdk_mu = sampled.reshape(-1).clamp(1e-6, 1.0)         # (N,) — clamp negatives
 
@@ -387,13 +390,7 @@ class CTScene(torch.nn.Module):
 
             # Sample at 128³ to avoid undersampling the Voronoi, then blur+downsample
             idw_res = 128
-            voxel_size = 2.0 / idw_res
-            centers = torch.linspace(
-                -1 + voxel_size / 2, 1 - voxel_size / 2, idw_res,
-                device=self.device,
-            )
-            xx, yy, zz = torch.meshgrid(centers, centers, centers, indexing="ij")
-            query = torch.stack([xx.flatten(), yy.flatten(), zz.flatten()], dim=-1)
+            query = voxel_center_grid(idw_res, 1.0, device=self.device)
 
             adj_off_long = adjacency_offsets.long()
             global_max_k = int((adj_off_long[1:] - adj_off_long[:-1]).max().item())
@@ -429,7 +426,8 @@ class CTScene(torch.nn.Module):
             gauss_1d = gauss_1d / gauss_1d.sum()
             t = gauss_conv3d_separable(t, gauss_1d, pad)
         if t.shape[2] != resolution:
-            t = F.interpolate(t, size=resolution, mode="trilinear", align_corners=True)
+            t = F.interpolate(t, size=resolution, mode="trilinear",
+                              align_corners=ALIGN_CORNERS)
         vol = t.squeeze()
         self.set_reference_volume(vol, edge_mask=edge_mask, edge_alpha=edge_alpha)
         print(f"[ref vol] loaded {path} → {resolution}³ grid")
@@ -469,7 +467,7 @@ class CTScene(torch.nn.Module):
         grid = points.flip(-1).reshape(1, 1, 1, -1, 3)                # ZYX flip — volume stored (X,Y,Z)=(D,H,W)
         sampled = F.grid_sample(
             vol, grid, mode='bilinear',
-            padding_mode='zeros', align_corners=True,
+            padding_mode='zeros', align_corners=ALIGN_CORNERS,
         )
         return sampled.reshape(-1)                                     # (N,) in [0,1]
 
@@ -601,7 +599,7 @@ class CTScene(torch.nn.Module):
         if ref.shape[0] != resolution:
             ref = F.interpolate(
                 ref.unsqueeze(0).unsqueeze(0),
-                size=resolution, mode="trilinear", align_corners=True,
+                size=resolution, mode="trilinear", align_corners=ALIGN_CORNERS,
             ).squeeze()
 
         diff = vol - ref  # (R,R,R)
@@ -611,7 +609,7 @@ class CTScene(torch.nn.Module):
             if w.shape[0] != resolution:
                 w = F.interpolate(
                     w.unsqueeze(0).unsqueeze(0),
-                    size=resolution, mode="trilinear", align_corners=True,
+                    size=resolution, mode="trilinear", align_corners=ALIGN_CORNERS,
                 ).squeeze()
             return (w[occupied] * diff[occupied] ** 2).mean()
 
@@ -677,7 +675,7 @@ class CTScene(torch.nn.Module):
             grid = (query / extent).flip(-1)[None, None, None]
             mu_gt = F.grid_sample(
                 vol_gt_5d, grid, mode='bilinear',
-                align_corners=True, padding_mode='zeros',
+                align_corners=ALIGN_CORNERS, padding_mode='zeros',
             ).reshape(-1).detach()
 
             (mu_pred - mu_gt).abs().sum().backward()

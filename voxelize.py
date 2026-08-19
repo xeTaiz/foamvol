@@ -22,6 +22,7 @@ import radfoam
 import torch.nn.functional as F
 
 from radfoam_model.scene import idw_query
+from voxel_grid import voxel_center_grid
 
 
 # Kept for vis_foam.py compatibility.
@@ -50,13 +51,22 @@ def gaussian_blur_3d(volume, kernel_size=3, sigma=1.0):
 
 
 def compute_volume_psnr(pred, gt):
+    """3D PSNR matching R2-Gaussian: ``10*log10(pixel_max**2 / MSE)``.
+
+    ``pixel_max = gt.max()`` is R2-Gaussian's default and is what train.py,
+    train_vol.py and eval_vol.py use, so headline numbers stay comparable with
+    the published baseline.  This used to be ``gt.max() - gt.min()``; the two
+    agree exactly whenever the GT floor is 0 (true for the r2_gaussian CT
+    volumes, verified: min=0.0, max=1.0) and diverge only on data with a
+    non-zero air floor -- where the R2 convention is the correct reference.
+    """
     mse = np.mean((pred - gt) ** 2)
     if mse == 0:
         return float("inf")
-    data_range = gt.max() - gt.min()
-    if data_range == 0:
+    pixel_max = gt.max()
+    if pixel_max == 0:
         return float("inf")
-    return 10.0 * np.log10(data_range ** 2 / mse)
+    return 10.0 * np.log10(pixel_max ** 2 / mse)
 
 
 def compute_volume_ssim(pred, gt, window_size=11):
@@ -178,10 +188,7 @@ def voxelize(model_path, resolution, output_path, extent=1.0, blur_sigma=0.0,
     grid_min = torch.tensor([-extent, -extent, -extent], device=device)
     grid_max = torch.tensor([extent, extent, extent], device=device)
 
-    coords = torch.linspace(0, 1, resolution, device=device)
-    gx, gy, gz = torch.meshgrid(coords, coords, coords, indexing="ij")
-    voxel_centers = torch.stack([gx, gy, gz], dim=-1).reshape(-1, 3)
-    voxel_centers = grid_min + voxel_centers * (grid_max - grid_min)
+    voxel_centers = voxel_center_grid(resolution, extent, device=device)
 
     def _idw(query_pts):
         res = idw_query(
