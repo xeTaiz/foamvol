@@ -155,17 +155,17 @@ def _render_chunks(scene: CTScene, rays: torch.Tensor, chunk: int) -> torch.Tens
 
 def _assign_samples(points: torch.Tensor, aabb_tree, gt: np.ndarray,
                     stride: int, chunk: int, device: str):
-    """Assign a strided endpoint GT grid to cells; return CPU arrays."""
+    """Assign a strided voxel-centre GT grid to cells; return CPU arrays."""
     ix = np.arange(0, gt.shape[0], stride, dtype=np.int32)
     iy = np.arange(0, gt.shape[1], stride, dtype=np.int32)
     iz = np.arange(0, gt.shape[2], stride, dtype=np.int32)
     gx, gy, gz = np.meshgrid(ix, iy, iz, indexing="ij")
     indices = np.stack([gx.reshape(-1), gy.reshape(-1), gz.reshape(-1)], axis=-1)
-    shape_m1 = np.asarray(gt.shape, dtype=np.float32) - 1.0
-    xyz = -1.0 + 2.0 * indices.astype(np.float32) / shape_m1
+    shape = np.asarray(gt.shape, dtype=np.float32)
+    xyz = -1.0 + (indices.astype(np.float32) + 0.5) * (2.0 / shape)
     values = gt[indices[:, 0], indices[:, 1], indices[:, 2]].astype(np.float32)
 
-    spacing = tuple(2.0 / (s - 1) for s in gt.shape)
+    spacing = tuple(2.0 / s for s in gt.shape)
     gradients = np.gradient(gt.astype(np.float32), *spacing, edge_order=1)
     grad = np.stack([
         gradients[0][indices[:, 0], indices[:, 1], indices[:, 2]],

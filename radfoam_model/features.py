@@ -10,6 +10,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from voxel_grid import ALIGN_CORNERS
+
 
 @torch.no_grad()
 def assign_cell_features(points, feature_volume, extent=1.0):
@@ -45,7 +47,8 @@ def assign_cell_features(points, feature_volume, extent=1.0):
     grid = grid.reshape(1, 1, 1, -1, 3)              # (1,1,1,N,3)
 
     sampled = F.grid_sample(
-        feat_t, grid, mode="bilinear", padding_mode="border", align_corners=True
+        feat_t, grid, mode="bilinear", padding_mode="border",
+        align_corners=ALIGN_CORNERS,
     )  # (1, F, 1, 1, N)
 
     cell_feats = sampled.reshape(F_dim, -1).T.half().cpu()  # (N, F) float16

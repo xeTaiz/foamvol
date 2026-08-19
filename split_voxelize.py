@@ -49,6 +49,7 @@ from voxelize import (
     save_slices,
 )
 from air_metrics import compute_air_masks, compute_air_metrics, save_masks_npz, write_metrics_json
+from voxel_grid import subvoxel_offsets, voxel_center_grid
 
 
 def _volume_ssim(pred, gt):
@@ -324,13 +325,8 @@ def voxelize_split(
     grid_min = torch.tensor([-extent, -extent, -extent], device=device)
     grid_max = torch.tensor([extent, extent, extent], device=device)
 
-    # Voxel CENTERS (not endpoints): sample at (i+0.5)/res so each voxel is
-    # represented by its centroid and the grid covers [grid_min, grid_max)
-    # without double-counting the boundary at grid_max.
-    coords = (torch.arange(resolution, device=device) + 0.5) / resolution
-    gx, gy, gz = torch.meshgrid(coords, coords, coords, indexing="ij")
-    voxel_centers = torch.stack([gx, gy, gz], dim=-1).reshape(-1, 3)
-    voxel_centers = grid_min + voxel_centers * (grid_max - grid_min)
+    # Voxel CENTRES, per the single repo-wide convention in voxel_grid.py.
+    voxel_centers = voxel_center_grid(resolution, extent, device=device)
 
     def _eval(query_pts):
         nn_idx = radfoam.nn(points, aabb_tree, query_pts).long()
@@ -362,10 +358,7 @@ def voxelize_split(
             if side_acc is not None and sd is not None:
                 side_acc[start:end] = sd.float()
     else:
-        voxel_size = (grid_max - grid_min) / resolution
-        sub_coords = torch.linspace(-0.5 + 0.5 / k, 0.5 - 0.5 / k, k, device=device)
-        ox, oy, oz = torch.meshgrid(sub_coords, sub_coords, sub_coords, indexing="ij")
-        offsets = torch.stack([ox, oy, oz], dim=-1).reshape(-1, 3) * voxel_size
+        offsets = subvoxel_offsets(k, resolution, extent, device=device)
         samples_per_voxel = k ** 3
         batch_size = max(1, 2_000_000 // samples_per_voxel)
         print(f"Supersampling: {k}^3 = {samples_per_voxel} samples/voxel, "

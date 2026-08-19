@@ -51,6 +51,7 @@ from vis_foam import (load_density_field, field_from_model, query_density,
                       voxelize_volumes, log_density_histogram,
                       log_volume_slices, visualize_cells_vs_gradient)
 import radfoam
+from voxel_grid import ALIGN_CORNERS
 
 
 seed = 42
@@ -357,7 +358,7 @@ def train_vol(args, pipeline_args, model_args, optimizer_args, dataset_args):
         grid = (query / extent).flip(-1)[None, None, None]  # (z,y,x) normalized for grid_sample
         return F.grid_sample(
             vol_gt_5d, grid, mode='bilinear',
-            align_corners=True, padding_mode='zeros',
+            align_corners=ALIGN_CORNERS, padding_mode='zeros',
         ).reshape(-1)
 
     def _voxel_step(query):

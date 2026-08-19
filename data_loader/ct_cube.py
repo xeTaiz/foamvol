@@ -122,10 +122,15 @@ def make_2x2x2_scene(block_half=0.25):
 def make_gt_volume(boxes, densities, resolution=256, extent=1.0):
     """Create a ground truth volume on a regular grid.
 
+    Voxels are sampled at their centres (see ``voxel_grid``), matching every
+    other volume in the repo.
+
     Returns:
         volume: (resolution, resolution, resolution) numpy array
     """
-    coords = np.linspace(-extent, extent, resolution, dtype=np.float32)
+    from voxel_grid import voxel_center_coords_np
+
+    coords = voxel_center_coords_np(resolution, extent, dtype=np.float32)
     x, y, z = np.meshgrid(coords, coords, coords, indexing="ij")
     vol = np.zeros((resolution, resolution, resolution), dtype=np.float32)
 
