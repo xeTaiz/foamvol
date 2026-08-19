@@ -49,13 +49,13 @@ import radfoam
 from torch.utils.tensorboard import SummaryWriter
 from radfoam_model.scene import CTScene, idw_query, load_model_for_mesh
 from radfoam_model.mesh import surface_metrics_vs_gt_volume, marching_tets
+from radfoam_model.utils import compute_volume_psnr
 from vis_foam import (
     load_density_field, load_gt_volume, voxelize_volumes,
     sample_gt_slice, compute_cell_density_slice, make_slice_coords,
     query_density, sample_idw, visualize_slices,
 )
 from train import (
-    compute_volume_psnr,
     compute_volume_ssim,
     compute_volume_ssim_3d,
     compute_dice,

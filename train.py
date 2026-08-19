@@ -28,7 +28,10 @@ from configs import *
 from radfoam_model.scene import CTScene
 from radfoam_model.mesh import surface_metrics_vs_gt_volume
 from radfoam_model.scene import idw_query
-from radfoam_model.utils import gauss_conv3d_separable as _gauss_conv3d_separable
+from radfoam_model.utils import (
+    compute_volume_psnr,
+    gauss_conv3d_separable as _gauss_conv3d_separable,
+)
 from visualize_volume import visualize
 from vis_foam import (field_from_model, query_density,
                       sample_idw, sample_idw_diagnostic,
@@ -91,22 +94,6 @@ def compute_ssim(pred, gt, window_size=11):
     return ssim_map.mean().item()
 
 
-@torch.no_grad()
-def compute_volume_psnr(pred, gt):
-    """3D PSNR matching R2-Gaussian: 10*log10(pixel_max^2 / MSE).
-
-    Uses gt.max() as pixel_max (R2 default when pixel_max=None).
-    """
-    if isinstance(pred, np.ndarray):
-        pred = torch.from_numpy(pred)
-    if isinstance(gt, np.ndarray):
-        gt = torch.from_numpy(gt)
-    pred, gt = pred.float(), gt.float()
-    pixel_max = gt.max()
-    mse = torch.mean((pred - gt) ** 2)
-    if mse == 0:
-        return float("inf")
-    return (10 * torch.log10(pixel_max ** 2 / mse)).item()
 
 
 @torch.no_grad()

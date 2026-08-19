@@ -16,6 +16,35 @@ def psnr(img1, img2):
     return 20 * torch.log10(1.0 / torch.sqrt(mse))
 
 
+def compute_volume_psnr(pred, gt) -> float:
+    """Return R2-Gaussian volume PSNR using ``gt.max()`` as ``pixel_max``.
+
+    NumPy inputs stay in NumPy; tensor inputs stay on their current device.
+    Both paths evaluate in float32, matching the reconstruction metrics.
+    """
+    if torch.is_tensor(pred) or torch.is_tensor(gt):
+        reference = pred if torch.is_tensor(pred) else gt
+        pred_t = torch.as_tensor(pred, device=reference.device).float()
+        gt_t = torch.as_tensor(gt, device=reference.device).float()
+        mse = torch.mean((pred_t - gt_t) ** 2)
+        if mse == 0:
+            return float("inf")
+        pixel_max = gt_t.max()
+        if pixel_max == 0:
+            return float("-inf")
+        return (10 * torch.log10(pixel_max ** 2 / mse)).item()
+
+    pred_np = np.asarray(pred, dtype=np.float32)
+    gt_np = np.asarray(gt, dtype=np.float32)
+    mse = np.mean((pred_np - gt_np) ** 2)
+    if mse == 0:
+        return float("inf")
+    pixel_max = np.max(gt_np)
+    if pixel_max == 0:
+        return float("-inf")
+    return float(10 * np.log10(pixel_max ** 2 / mse))
+
+
 def get_expon_lr_func(
     lr_init,
     lr_final,

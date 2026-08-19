@@ -42,9 +42,9 @@ import torch.nn.functional as F
 
 import radfoam
 from radfoam_model.scene import assert_supported_thin_K
+from radfoam_model.utils import compute_volume_psnr
 # Reuse the existing volume-eval helpers so metrics/slices/NIfTI match voxelize.
 from voxelize import (
-    compute_volume_psnr,
     gaussian_blur_3d,
     save_slices,
 )
