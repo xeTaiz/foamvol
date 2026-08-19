@@ -1735,7 +1735,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         field = field_from_model(model)
 
         # 3D volume metrics (matching R2-Gaussian evaluation)
-        if gt_volume is not None:
+        if gt_volume is not None and pipeline_args.diag:
             vol_res = gt_volume.shape[0]
             print(f"Voxelizing at {vol_res}³ for 3D volume metrics...")
             raw_vol, idw_vol = voxelize_volumes(
