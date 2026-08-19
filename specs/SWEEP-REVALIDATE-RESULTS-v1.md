@@ -154,14 +154,18 @@ Immediate caveats visible even before Stage C:
   blanket "it never worked": guiding *what gets pruned* with the reference
   field helped; adding it as a direct loss term did not, at any of the
   three configurations tested.
-- **NV_1e4 is a same-host borderline pass.** Its `Δpsnr = +0.0376 dB` clears
-  the manifest's committed `2σ = 0.1310 dB` (5-replicate, mixed-host) bar
-  comfortably, but NV_1e4 ran on `KW60996`, so the tighter same-host
-  `2σ = 0.0376 dB` bar (4-replicate `BASE_s42-45` only) puts it exactly at
-  the boundary rather than decisively above it. Its Stage-C confirmation
-  (mean over 3 more same-host replicates against a 2σ bar) is therefore the
-  more informative test for this arm specifically, more so than for the
-  other 10 passes, most of which clear either bar by a wider margin.
+- **NV_1e4 passed on chamfer, not PSNR, and does not survive the tighter
+  same-host floor.** Its `Δchamfer = -0.1600` clears the manifest's
+  committed `2σ_chamfer = 0.1518` (5-replicate, mixed-host) bar; `Δpsnr =
+  +0.0376` does not clear `2σ_psnr = 0.1310` on its own; the pass is on
+  chamfer alone. NV_1e4 ran on `KW60996`, so re-measured against the
+  4-replicate same-host floor (`BASE_s42-45` only, mean psnr 34.9009 dB,
+  mean chamfer 1.5214, `σ_psnr = 0.0188`, `σ_chamfer = 0.0752`), NV_1e4 is
+  `Δpsnr = +0.0092` (needs `> 0.0376`) and `Δchamfer = -0.1425` (needs
+  `> 0.1504`) — it fails **both** axes under the tighter bar. Of the 11
+  screening passes, NV_1e4 is the one whose pass is entirely an artefact of
+  the wider, mixed-host noise estimate; its Stage-C confirmation is the
+  most informative test in the batch.
 - **D_thr500/1000/1000_v5e3 (gradient-threshold densification) are badly
   negative** on both axes (up to -3.86 dB, +1.29 chamfer) — these arms also
   reached far fewer cells (52825-90961 vs the ~237000 baseline) because
