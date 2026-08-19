@@ -48,17 +48,18 @@ script contains no `SummaryWriter` and never calls `add_scalar`, so none of thes
 values can appear in TensorBoard. It writes `.npy`, `_metrics.json`, a slices
 PNG, and a NIfTI.
 
-Three different volume PSNRs therefore exist for one run. For `SC128_ctrl`:
+Three volume PSNRs were historically visible for one run. For `SC128_ctrl`:
 
-| value | number | source | why it differs |
+| value | number | source | interpretation |
 |---|---|---|---|
-| `volume_psnr` | **33.920** | `volume_hard_ss4_metrics.json` (the table below) | hard split voxelization, 256^3, supersample **4** |
-| `test/vol_raw_psnr` | 30.092 | TensorBoard scalar | same idea but **1 sample/voxel**; ~+3.8 dB is pure partial-volume anti-aliasing |
-| `test/vol_r2_psnr` | 35.851 | TensorBoard scalar | R2-Gaussian normalization, a different metric definition |
+| `volume_psnr` | **33.920** | `volume_hard_ss4_metrics.json` (table below) | correctly registered hard split voxelization, 256³, SS4 |
+| old `test/vol_raw_psnr` | 30.092 | TensorBoard scalar | pre-fix endpoint grid, one sample/voxel; biased low |
+| `test/vol_r2_psnr` | **35.851** | TensorBoard scalar | fixed precomputed R2 volume; correctly registered |
 
-Searching TB for ~34 dB finds nothing precisely because TB holds 30.09 and 35.85
-for that run. See `known_metric_caveat` in the manifest: compare TB against TB,
-JSON against JSON, never across.
+The R2 number uses the same `gt.max()` PSNR definition and was never affected by
+foam voxelization or supersampling. A fair multi-metric comparison still requires
+running the saved foam and R2 volumes through one evaluator, because the original
+JSON and TensorBoard paths used different SSIM and Dice definitions.
 
 To reproduce the table on the worker:
 
@@ -94,10 +95,10 @@ assumed:
   (`voxelize_volumes:1535-1537` calls `_split_eval`). Evaluating the same grid
   with the split ignored changes PSNR by −0.003 dB, independently confirming the
   delta collapse: the split is not what separates these numbers.
-- **The two PSNR formulas agree.** `train.py:95` uses `gt.max()**2`,
-  `voxelize.py:52` uses `(gt.max()-gt.min())**2`; `vol_gt.npy` has
-  `min=0.0, max=1.0`, so they are identical (every row above scored the same
-  under both).
+- **The PSNR formulas agree.** All consumers now use
+  `radfoam_model.utils.compute_volume_psnr`, with `pixel_max=gt.max()`.
+  `vol_gt.npy` has `min=0.0, max=1.0`, so the former peak-to-peak spelling was
+  numerically identical and no R2 or published foam PSNR changed.
 
 ### The TB grid is misregistered, not merely coarser
 
@@ -122,11 +123,35 @@ registration error against the GT, ~2.1 dB unconverged single-sample quadrature.
 `ss4` is within 0.04 dB of converged, so 4x supersampling is the right operating
 point; `ss8` costs 8x for +0.038 dB.
 
-Do not "fix" this by switching `voxelize_volumes` to centers without checking
-the dataset: `load_gt_volume`'s `ct_synthetic` branch *generates* its GT with
-`np.linspace(-1, 1, G)`, so that dataset's GT is edge/endpoint-defined and the
-current sampling is correct there. The defect is the repo mixing two conventions,
-not one function being wrong everywhere.
+This grid mismatch has since been fixed repo-wide: voxel volumes use centres,
+`grid_sample` uses `align_corners=False`, and generated GT volumes use the same
+centre convention. See `specs/VOXEL-GRID-CONVENTION-v1.md`. The sweep JSON table
+does not change because `split_voxelize.py` already sampled centres; the old
+TensorBoard foam values do change. The fixed `vol_r2.npy` baseline does not.
+
+## Common-evaluator overview against R2
+
+To compare more than PSNR, `eval_vol.py` was run on each saved 256³ volume and
+the same `vol_gt.npy`. This removes the old SSIM/Dice-definition mismatch:
+SSIM below is Gaussian-window 3-D SSIM; Dice is the mean over thresholds
+0.1, 0.2, ..., 0.9; Chamfer is lower-is-better; F1 is reported at 1/2 voxels.
+
+| Model | Actual cells | Split | Vol PSNR | Vol SSIM3D | Dice | Chamfer | F1@1 / F1@2 |
+|---|---:|:---:|---:|---:|---:|---:|---:|
+| SC128 control | 121,932 | yes | 33.9199 | .912343 | .835986 | 2.0454 | .7488 / .8447 |
+| SC256 scalar | 237,124 | no | 34.8358 | .924820 | .849124 | 1.6204 | .7823 / .8719 |
+| SC256 control | 237,394 | yes | 34.8299 | .924534 | .849052 | 1.4388 | .7880 / .8777 |
+| SC512 control | 462,712 | yes | 35.0250 | .927302 | .859017 | 1.1396 | .8185 / .9044 |
+| R2-Gaussian `vol_r2.npy` | — | — | **35.8512** | **.943398** | **.889397** | **.7283** | **.8838 / .9481** |
+
+Only SC256 scalar/control is a matched split ablation. Splitting changes intensity
+metrics by effectively zero (−0.0059 dB PSNR, −.000286 SSIM, −.000072 Dice) but
+improves Chamfer by 0.1816 voxels (11.2%) and F1 by about .006. This is
+suggestive geometry improvement, not established from one scalar seed.
+
+The strongest foam row here, SC512 split, remains 0.8262 dB PSNR, .0161 SSIM,
+.0304 Dice, and .0653 F1@1 behind R2; its Chamfer is 1.1396 versus R2's .7283
+(1.56× higher/worse).
 
 ## Results
 

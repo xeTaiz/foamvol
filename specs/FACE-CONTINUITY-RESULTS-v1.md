@@ -119,10 +119,18 @@ The matched experiment above only tested hard-frozen 64k geometry. Two more axes
 ## Independent verification of the extension-matrix numbers
 **None of the `volume_psnr`/`sobel_psnr`/chamfer/HD95/F1 numbers in the tables above are in TensorBoard.** They come exclusively from `output/<run>/volume_hard_ss4_metrics.json` (produced by `split_voxelize.py --model output/<run>/model.pt --gt .../vol_gt.npy`) and `output/<run>/surface_hard_ss4_metrics.json` (produced by the new `eval_hard_surface.py`). Per-run files: `FC64_control`, `FC64_w3e-5`, `FC64_unfrozen_control`, `FC64_unfrozen_w3e-5`, `FC128_control`, `FC128_w3e-5`, `FC128_unfrozen_control`, `FC128_unfrozen_w3e-5` — each has its own pair of JSONs under `output/<name>/` on `KW60995:/code/lc64-radfoam`.
 
-TensorBoard does have volume-PSNR-shaped tags (`test/vol_raw_psnr`, `test/vol_idw_psnr`, `test/vol_r2_psnr`), but they are a **different, non-comparable evaluation**, not a source for the numbers above:
-- `test/vol_r2_psnr` is 35.8512 dB, bit-identical on every single run including a 40-iteration smoke test. Traced to `load_r2_volume(data_path)` in `train.py`: a fixed, precomputed reconstruction from the competing R2-Gaussian baseline method, scored against the same GT every time. Unrelated to our model.
-- `test/vol_raw_psnr` / `test/vol_idw_psnr` come from `voxelize_volumes()` in `vis_foam.py`, which builds its volume as `softplus(field["density_flat"][nearest_cell])` — **one density value per Voronoi cell**. It never evaluates the thin-surface split's two-sided density at all, so it structurally cannot see whatever a split cell resolved on either side of its internal surface. For `FC64_control`/`FC64_unfrozen_control` this shows 28.70 → 29.14 dB, only **+0.44 dB** — much smaller than the +2.50 dB from the split-aware hard eval, because it's measuring a different, coarser thing (the shared per-cell base density), not because the +2.50 dB number is wrong.
-- The `volume_hard_ss4_metrics.json` pipeline (`split_voxelize.py`) is the one built to resolve this correctly: for each voxel it evaluates the model's own quaternion/height-defined local plane, takes `side = sign(signed_dist)` from the model's own field, and picks that side's density (`split_voxelize.py:231–246`) — **before** ever touching `gt_path`, which is loaded later purely to score the finished volume against ground truth (`split_voxelize.py:399`). No GT leaks into which side gets picked. The +2.50 dB gap is a real, split-aware-eval-only finding: unfrozen geometry improves the split boundary placement/orientation specifically, a signal only visible to an eval that resolves sides at all.
+The old TensorBoard foam tags were not the source for the hard-SS4 table above.
+They used a misregistered one-sample grid that has since been corrected (see
+`VOXEL-GRID-CONVENTION-v1.md`). Current interpretation:
+- `test/vol_r2_psnr = 35.8512` scores a fixed precomputed R2 volume. It already
+  used the correct grid and PSNR formula; the number is unchanged and is
+  comparable when foam and R2 saved volumes are passed through one evaluator.
+- The current `voxelize_volumes` path is centre-registered and split-aware, but
+  remains one sample/voxel. The hard SS4 files below are the converged foam
+  evaluation and remain the source for the extension table.
+- `split_voxelize.py` resolves the model's own local surface and chooses its
+  density side before loading GT; GT is used only to score the completed volume.
+  No GT leaks into side selection.
 - Ruled out an eval-config confound directly: all 8 arms' `volume_hard_ss4_metrics.json` record identical `blend_eps=0.0` (hard side selection, no smoothing that could inflate PSNR), `supersample=4`, `resolution=256`, `density_mode=relative` — the eval methodology itself did not vary across arms.
 - **Dataset check**: all 8 extension configs use identical `dataset: r2_gaussian`, `data_path: r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone`, `densify_from: 0` — confirmed via direct diff of the shipped YAML files; no accidental dataset/protocol swap.
 - **Output-file check**: `volume_hard_ss4.npy` for `FC64_control` vs `FC64_unfrozen_control` are different files (different SHA-256, mean abs difference 0.0095), ruling out a stale/cached-file bug.
