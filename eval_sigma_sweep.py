@@ -261,7 +261,7 @@ def main():
     from skimage.measure import marching_cubes as _mc
     try:
         _gt_verts_vox, _gt_faces, _, _ = _mc(gt_volume, level=MESH_THRESHOLD)
-        gt_verts_world = (_gt_verts_vox * (2.0 / (vol_res - 1)) - 1.0).astype(np.float32)
+        gt_verts_world = ((_gt_verts_vox + 0.5) * (2.0 / vol_res) - 1.0).astype(np.float32)
         gt_faces_np = _gt_faces.astype(np.int32)
     except Exception:
         gt_verts_world, gt_faces_np = None, None

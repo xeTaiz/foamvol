@@ -438,7 +438,8 @@ def voxelize_split(
         import nibabel as nib
         voxel_size_np = ((grid_max - grid_min) / resolution).cpu().numpy()
         affine = np.diag([*voxel_size_np, 1.0])
-        affine[:3, 3] = grid_min.cpu().numpy()
+        # NIfTI maps index 0 to the CENTRE of voxel 0, not the box face.
+        affine[:3, 3] = grid_min.cpu().numpy() + 0.5 * voxel_size_np
         nib.save(nib.Nifti1Image(volume_np, affine), nifti_path)
         print(f"Saved NIfTI to {nifti_path}")
     except ImportError:

@@ -48,6 +48,9 @@ __all__ = [
     "voxel_center_grid_np",
     "voxel_pitch",
     "subvoxel_offsets",
+    "world_to_voxel_float",
+    "world_to_voxel_index",
+    "voxel_index_to_world",
 ]
 
 
@@ -129,3 +132,39 @@ def subvoxel_offsets(
     sub = torch.linspace(-0.5 + 0.5 / k, 0.5 - 0.5 / k, k, device=device, dtype=dtype)
     ox, oy, oz = torch.meshgrid(sub, sub, sub, indexing="ij")
     return torch.stack([ox, oy, oz], dim=-1).reshape(-1, 3) * pitch
+
+
+def world_to_voxel_float(w, resolution: int, extent: float = 1.0):
+    """Continuous voxel index of world coordinate(s).
+
+    Calibrated so that the *centre* of voxel ``i`` maps to exactly ``i``, which
+    is the inverse of :func:`voxel_index_to_world`.  Use for sub-voxel
+    positioning (plot markers, interpolation weights).  The endpoint spelling
+    ``(w + extent) / (2*extent) * (R - 1)`` is wrong: it is off by half a voxel
+    and scaled by ``(R-1)/R``.
+    """
+    return (np.asarray(w, dtype=np.float64) + float(extent)) / (
+        2.0 * float(extent)
+    ) * int(resolution) - 0.5
+
+
+def world_to_voxel_index(w, resolution: int, extent: float = 1.0):
+    """Index of the voxel *containing* world coordinate(s), clipped to the grid.
+
+    Voxel ``i`` owns the half-open span
+    ``[-extent + i*pitch, -extent + (i+1)*pitch)``, so this floors rather than
+    rounds.
+    """
+    idx = np.floor(
+        (np.asarray(w, dtype=np.float64) + float(extent))
+        / (2.0 * float(extent))
+        * int(resolution)
+    )
+    return np.clip(idx, 0, int(resolution) - 1).astype(np.int64)
+
+
+def voxel_index_to_world(i, resolution: int, extent: float = 1.0):
+    """World coordinate of the centre of voxel ``i`` (float indices allowed)."""
+    return -float(extent) + (np.asarray(i, dtype=np.float64) + 0.5) * voxel_pitch(
+        resolution, extent
+    )

@@ -24,7 +24,10 @@ from voxel_grid import (
     voxel_center_coords_np,
     voxel_center_grid,
     voxel_center_grid_np,
+    voxel_index_to_world,
     voxel_pitch,
+    world_to_voxel_float,
+    world_to_voxel_index,
 )
 
 
@@ -180,3 +183,42 @@ def test_supersampling_preserves_the_grid_mean_for_linear_fields():
 
     supersampled = field(q).reshape(centers.shape[0], k ** 3).mean(1)
     assert torch.allclose(supersampled, field(centers), atol=1e-12)
+
+
+def test_index_world_round_trip():
+    """voxel_index_to_world and world_to_voxel_float must be exact inverses."""
+    R, extent = 64, 1.0
+    idx = np.arange(R)
+    w = voxel_index_to_world(idx, R, extent)
+
+    # Centres agree with the 1-D coordinate constructor.
+    assert np.allclose(w, voxel_center_coords_np(R, extent, dtype=np.float64))
+    # Round-trip is exact, and a centre maps to an integer index.
+    assert np.allclose(world_to_voxel_float(w, R, extent), idx.astype(np.float64))
+    # And the containing-voxel index recovers the original index.
+    assert np.array_equal(world_to_voxel_index(w, R, extent), idx)
+
+
+def test_world_to_voxel_index_uses_half_open_spans():
+    R, extent = 8, 1.0
+    pitch = voxel_pitch(R, extent)
+
+    # Lower face of voxel 0 and just inside the upper face of voxel R-1.
+    assert int(world_to_voxel_index(-extent, R, extent)) == 0
+    assert int(world_to_voxel_index(extent - 1e-9, R, extent)) == R - 1
+    # Out-of-box coordinates clamp rather than wrap or go negative.
+    assert int(world_to_voxel_index(-extent - 5.0, R, extent)) == 0
+    assert int(world_to_voxel_index(extent + 5.0, R, extent)) == R - 1
+    # A voxel boundary belongs to the upper voxel (half-open [lo, hi)).
+    boundary = -extent + 3 * pitch
+    assert int(world_to_voxel_index(boundary, R, extent)) == 3
+    assert int(world_to_voxel_index(boundary - 1e-9, R, extent)) == 2
+
+
+def test_index_world_respects_extent():
+    """Non-unit extents must scale, not just offset."""
+    R, extent = 16, 2.5
+    w = voxel_index_to_world(np.arange(R), R, extent)
+    assert np.isclose(w[0], -extent + 0.5 * voxel_pitch(R, extent))
+    assert np.isclose(w[-1], extent - 0.5 * voxel_pitch(R, extent))
+    assert np.array_equal(world_to_voxel_index(w, R, extent), np.arange(R))

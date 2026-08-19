@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from vis_foam import load_gt_volume, load_density_field
 from radfoam_model.features import load_cell_features
+from voxel_grid import world_to_voxel_float
 
 
 def load_clip_text_encoder(backbone="openai/clip-vit-base-patch32"):
@@ -164,7 +165,7 @@ def main():
     from click_segment import project_sim_to_slices, make_figure
 
     def world_to_vox_f(w):
-        return (np.array(w) + 1.0) / 2.0 * (R - 1)
+        return world_to_voxel_float(w, R, 1.0)
 
     center = np.zeros(3, dtype=np.float32)
     gt_slices = {
