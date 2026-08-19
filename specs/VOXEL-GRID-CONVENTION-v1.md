@@ -107,12 +107,13 @@ GT generators (endpoint → centres): `vis_foam.py:load_gt_volume` (`ct_syntheti
 `data_loader/ct_cube.py:make_gt_volume`. `r2_gaussian` loads `vol_gt.npy` and was
 always centre-defined.
 
-PSNR: `voxelize.py:compute_volume_psnr` used `(gt.max()-gt.min())**2` while
-`train.py`, `train_vol.py` and `eval_vol.py` all use R2-Gaussian's
-`pixel_max = gt.max()`. Unified on the R2 convention for baseline parity. For
-`vol_gt.npy` (`min=0.0, max=1.0`) the two are **numerically identical**, verified
-in every row of the decomposition above — so no published number changes. They
-diverge only on data with a non-zero air floor, where R2 parity is correct.
+PSNR: `voxelize.py` used `(gt.max()-gt.min())**2` while `train.py`,
+`train_vol.py` and `eval_vol.py` used R2-Gaussian's `pixel_max = gt.max()`.
+All consumers now import the single `radfoam_model.utils.compute_volume_psnr`
+implementation; NumPy stays in NumPy and tensors stay on their current device.
+For `vol_gt.npy` (`min=0.0, max=1.0`) the formulas are numerically identical,
+verified in every decomposition row above, so no published number changes. They
+diverge only on data with a non-zero air floor, where R2 parity is the reference.
 
 ## The two surface-metric paths are affected differently
 
@@ -198,6 +199,10 @@ pre-fork `RadFoamScene`) shadows the `test/` directory as module name `test`, so
 - Full run across `test_voxel_grid_convention`, `test_split_aware_idw`,
   `test_face_continuity`, `test_split_voxelize_modes`, `test_air_metrics`:
   **38 tests ran, 0 failures.**
+- `test/test_volume_psnr.py`: **4/4** pass for NumPy/Torch parity, R2's
+  non-zero-floor convention, zero-MSE `+inf`, and zero-peak/nonzero-error
+  `-inf`. Import smoke confirms all six consumers resolve to the canonical
+  function object.
 - End-to-end: `vis_foam.voxelize_volumes` on `SC128_ctrl` at ss1 now reports
   **31.8165**, exactly the standalone centres reference, up from 30.0920.
 - Mesh registration shift measured directly at R=256: mean 0.375, max 0.708
