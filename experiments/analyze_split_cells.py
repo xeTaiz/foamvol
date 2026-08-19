@@ -28,7 +28,7 @@ import radfoam  # noqa: E402
 from split_voxelize import (  # noqa: E402
     assert_supported_thin_K, quat_to_frame, split_cell_query,
 )
-from voxel_grid import ALIGN_CORNERS  # noqa: E402
+from voxel_grid import ALIGN_CORNERS, voxel_center_coords_np  # noqa: E402
 
 REL_THRESHOLDS = (0.02, 0.05, 0.1, 0.2, 0.5)
 ABS_THRESHOLDS = (0.005, 0.01, 0.02, 0.05)
@@ -360,7 +360,7 @@ def _make_figure(path, web_dir, gt, selected, primary, points, density, delta,
         save_square_panel(web_dir / f"cell_{cell}_gt.png", gt_value_np,
                           owner_np, signed_np, cell)
 
-        z_axis = np.linspace(-1.0, 1.0, gt_xyz.shape[2])
+        z_axis = voxel_center_coords_np(gt_xyz.shape[2], 1.0, dtype=np.float64)
         z_index = int(np.argmin(np.abs(z_axis - center_np[2])))
         axial_z = float(z_axis[z_index])
         axial_xy = gt_xyz[:, :, z_index].T

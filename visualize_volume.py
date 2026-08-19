@@ -14,10 +14,12 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 
+from voxel_grid import world_to_voxel_index
+
 
 def coord_to_index(coord, resolution):
-    """Map coordinate in [-1, 1] to voxel index."""
-    return int((coord + 1) / 2 * (resolution - 1))
+    """Map coordinate in [-1, 1] to the index of the voxel containing it."""
+    return int(world_to_voxel_index(coord, resolution, 1.0))
 
 
 def visualize(volume_path, vmax=1.0, writer_fn=None):

@@ -282,7 +282,10 @@ def surface_metrics_vs_gt_volume(
     from scipy.spatial import KDTree
 
     R = gt_volume.shape[0]
-    vox_to_world = 2.0 / (R - 1)  # one voxel in world units
+    # Voxel-centre convention: index i is the world point -1 + (i+0.5)*pitch.
+    # Endpoint arithmetic (2/(R-1), no half-voxel shift) misregisters the GT mesh
+    # against the Voronoi mesh by half a voxel and stretches it by R/(R-1).
+    vox_to_world = 2.0 / R  # one voxel in world units (the pitch)
     f_thresholds_world = [fv * vox_to_world for fv in f_thresholds_vox]
 
     per_level = []
@@ -293,7 +296,7 @@ def surface_metrics_vs_gt_volume(
             continue
         if len(verts_g_vox) < 3:
             continue
-        verts_g = verts_g_vox * vox_to_world - 1.0  # → world coords
+        verts_g = (verts_g_vox + 0.5) * vox_to_world - 1.0  # → world coords
 
         verts_v, _ = marching_tets(points, density, tets, threshold=t, density_fn=density_fn)
         if len(verts_v) < 3:
@@ -304,7 +307,7 @@ def surface_metrics_vs_gt_volume(
         d_v_to_g, _ = tree_g.query(verts_v)
         d_g_to_v, _ = tree_v.query(verts_g)
 
-        world_to_vox = (R - 1) / 2.0
+        world_to_vox = R / 2.0
         chamfer = 0.5 * (float(d_v_to_g.mean()) + float(d_g_to_v.mean())) * world_to_vox
         hausdorff_95 = float(max(np.percentile(d_v_to_g, 95),
                                   np.percentile(d_g_to_v, 95))) * world_to_vox

@@ -53,6 +53,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import radfoam
 from vis_foam import load_gt_volume, load_density_field
 from radfoam_model.features import load_cell_features
+from voxel_grid import (voxel_index_to_world, world_to_voxel_float,
+                        world_to_voxel_index)
 
 
 def cosine_similarity_batch(query_feat, cell_feats):
@@ -113,7 +115,7 @@ def project_sim_to_slices(sim_np, points_np, gt_volume, slice_coords=None):
         slice_coords = {"axial": 0.0, "coronal": 0.0, "sagittal": 0.0}
 
     def world_to_vox(w):
-        return int(round((w + 1.0) / 2.0 * (R - 1)))
+        return int(world_to_voxel_index(w, R, 1.0))
 
     results = {}
     for name, axis, fixed_w in [
@@ -124,7 +126,7 @@ def project_sim_to_slices(sim_np, points_np, gt_volume, slice_coords=None):
         fixed_v = world_to_vox(fixed_w)
 
         # Select points within ±2 voxels of this slice plane
-        coord_v = ((points_np[:, axis] + 1.0) / 2.0 * (R - 1)).round().astype(int)
+        coord_v = world_to_voxel_index(points_np[:, axis], R, 1.0)
         mask = np.abs(coord_v - fixed_v) <= 2
         if mask.sum() == 0:
             results[name] = np.zeros((R, R), dtype=np.float32)
@@ -136,8 +138,8 @@ def project_sim_to_slices(sim_np, points_np, gt_volume, slice_coords=None):
         # Voxelize onto (R, R) grid
         grid = np.zeros((R, R), dtype=np.float32)
         cnt  = np.zeros((R, R), dtype=np.int32)
-        ui = ((pts_2d[:, 0] + 1.0) / 2.0 * (R - 1)).round().astype(int).clip(0, R - 1)
-        vi = ((pts_2d[:, 1] + 1.0) / 2.0 * (R - 1)).round().astype(int).clip(0, R - 1)
+        ui = world_to_voxel_index(pts_2d[:, 0], R, 1.0)
+        vi = world_to_voxel_index(pts_2d[:, 1], R, 1.0)
         np.add.at(grid, (ui, vi), sim_2d)
         np.add.at(cnt,  (ui, vi), 1)
         cnt = np.maximum(cnt, 1)
@@ -175,8 +177,9 @@ def make_figure(sim_slices, gt_slices, click_xyz, click_vox, threshold=None):
         ax_idx = ["axial", "coronal", "sagittal"].index(name)
         other = [i for i in range(3) if i != ax_idx]
         R = gt.shape[0]
-        cx = int((click_vox[other[0]] / (R - 1)) * R)
-        cy = int((click_vox[other[1]] / (R - 1)) * R)
+        # click_vox is already a voxel index into an R-wide image; no rescale.
+        cx = int(round(float(click_vox[other[0]])))
+        cy = int(round(float(click_vox[other[1]])))
         for ax_col in range(2):
             axes[row, ax_col].plot(cx, cy, "c+", markersize=12, markeredgewidth=2)
 
@@ -207,7 +210,7 @@ def sample_clicks_from_labels(labels_np, class_id, n_clicks, rng=None, extent=1.
     """Sample n_clicks voxel positions from the label mask and convert to world coords.
 
     Volume convention: (X, Y, Z) order matching vol_gt.npy and assign_cell_features.
-    World coords: vox_i / (R-1) * 2*extent - extent  (same as grid_sample convention).
+    World coords: voxel centres, ``-extent + (vox_i + 0.5) * 2*extent/R``.
 
     Args:
         labels_np: (R, R, R) int16 label volume
@@ -231,7 +234,7 @@ def sample_clicks_from_labels(labels_np, class_id, n_clicks, rng=None, extent=1.
     chosen = vox_idx[rng.choice(len(vox_idx), size=min(n_clicks, len(vox_idx)),
                                 replace=False)]
     R = labels_np.shape[0]
-    world = (chosen.astype(np.float32) / (R - 1)) * (2 * extent) - extent
+    world = voxel_index_to_world(chosen, R, extent).astype(np.float32)
     return world
 
 
@@ -253,7 +256,7 @@ def voxelize_sim_mask(sim_np, points_np, topk_frac, R, extent=1.0):
     mask_cells = sim_np >= thresh
 
     grid = np.zeros((R, R, R), dtype=np.bool_)
-    vi = ((points_np + extent) / (2 * extent) * (R - 1)).round().astype(int).clip(0, R - 1)
+    vi = world_to_voxel_index(points_np, R, extent)
     grid[vi[mask_cells, 0], vi[mask_cells, 1], vi[mask_cells, 2]] = True
     return grid
 
@@ -541,7 +544,7 @@ def main():
     click_mean = clicks.mean(0)
 
     def world_to_vox_f(w):
-        return (w + 1.0) / 2.0 * (R - 1)
+        return world_to_voxel_float(w, R, 1.0)
 
     click_vox = world_to_vox_f(click_mean)
     slice_coords = {
@@ -552,9 +555,8 @@ def main():
 
     # Build GT slices at click planes
     def slice_vol(vol, axis, coord):
-        idx = int(round(world_to_vox_f(coord)[axis] if hasattr(coord, '__len__') else
-                        (coord + 1.0) / 2.0 * (R - 1)))
-        idx = np.clip(idx, 0, R - 1)
+        idx = int(world_to_voxel_index(
+            coord[axis] if hasattr(coord, '__len__') else coord, R, 1.0))
         return np.take(vol, idx, axis=axis)
 
     gt_slices = {
