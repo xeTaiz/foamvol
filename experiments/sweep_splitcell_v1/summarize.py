@@ -4,9 +4,10 @@
 These numbers do NOT exist in TensorBoard. They are written after training by
 split_voxelize.py (256^3, 4x supersampled, hard side selection) plus the surface
 and continuity evaluators, all of which write JSON and never call add_scalar.
-TensorBoard's test/vol_raw_psnr is the same quantity at 1 sample/voxel (~3.8 dB
-lower) and test/vol_r2_psnr is a different normalization entirely, so neither
-matches this table. Compare TB against TB and JSON against JSON.
+The old TensorBoard `test/vol_raw_psnr` was the same quantity at one
+misregistered sample per voxel; it was corrected after this sweep. The fixed
+`test/vol_r2_psnr` volume was already correctly registered and uses the same
+R2 PSNR formula. This summarizer remains the source for the SS4 foam table.
 
 Usage:
     python experiments/sweep_splitcell_v1/summarize.py [run_root]
