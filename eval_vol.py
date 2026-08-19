@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 import numpy as np
@@ -267,6 +268,7 @@ def main():
     p.add_argument("--gt-name",   default="vol_gt.npy")
     p.add_argument("--cpu", action="store_true", help="Force CPU (default: CUDA if available)")
     p.add_argument("--save", action="store_true", help="Write metrics.txt next to each pred file")
+    p.add_argument("--json", dest="json_path", default="", help="Write metrics dict as JSON")
     p.add_argument("--skip-existing", action="store_true",
                    help="Skip folders where vol_metrics.txt already exists")
     args = p.parse_args()
@@ -307,6 +309,9 @@ def main():
         if args.save and r is not None:
             out = os.path.splitext(pred_path)[0] + "_metrics.txt"
             save_results(out, f"{pred_path} vs {gt_path}", r)
+        if args.json_path and r is not None:
+            with open(args.json_path, "w") as f:
+                json.dump(r, f, indent=2)
 
 
 if __name__ == "__main__":

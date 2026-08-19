@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Run a queue of sweep_revalidate_v1 arms sequentially on one GPU.
+#
+#   ./run_sweep.sh <gpu_index> <arm> [arm ...]
+#
+# Each arm: train -> hard SS4 voxelization (256^3, centre-registered) ->
+# eval_vol.py (JSON) -> air_metrics.py -> assert_active.py. Writes DONE or
+# FAILED into the run directory so progress is pollable without parsing
+# logs. A non-zero exit from assert_active.py does NOT count as a failure:
+# an inactive arm is a finding, not a crash, so the run is still marked
+# DONE with an INACTIVE marker alongside it.
+#
+# Safe to run one instance per GPU concurrently; each arm owns its own
+# output directory. Re-running an arm wipes and redoes it.
+set -u
+
+GPU="$1"; shift
+ARMS=("$@")
+
+REPO=/code/lc64-radfoam
+CFG_DIR=experiments/sweep_revalidate_v1/configs
+DATA=r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone
+GT="$DATA/vol_gt.npy"
+PY=/code/lc64-venv/bin/python
+
+cd "$REPO" || exit 1
+export CUDA_VISIBLE_DEVICES="$GPU"
+export LD_LIBRARY_PATH=/.singularity.d/libs:/usr/local/cuda/lib64
+export PYTHONPATH="$PWD/src:$PWD"
+export MPLBACKEND=Agg
+
+for ARM in "${ARMS[@]}"; do
+    CFG="$CFG_DIR/$ARM.yaml"
+    RUN="output/sweep_revalidate/$ARM"
+
+    if [ ! -f "$CFG" ]; then
+        echo "[$ARM] MISSING CONFIG $CFG" >&2
+        continue
+    fi
+
+    echo "=== [$ARM] gpu=$GPU start $(date -Is) ==="
+    rm -rf "$RUN"
+    mkdir -p "$RUN"
+
+    if ! $PY train.py --config "$CFG" >>"$RUN/run.log" 2>&1; then
+        echo "[$ARM] TRAIN FAILED (see $RUN/run.log)" >&2
+        touch "$RUN/FAILED"
+        continue
+    fi
+
+    # Centre-registered hard SS4 voxelization: falls back to scalar softplus
+    # density automatically (no arm in this sweep uses split cells), so all
+    # arms are voxelized identically. No --side_map: no arm here splits.
+    if ! $PY split_voxelize.py \
+            --model "$RUN/model.pt" \
+            --resolution 256 --supersample 4 \
+            --output "$RUN/volume_hard_ss4.npy" \
+            --gt "$GT" >>"$RUN/run.log" 2>&1; then
+        echo "[$ARM] VOXELIZE FAILED" >&2
+        touch "$RUN/FAILED"
+        continue
+    fi
+
+    if ! $PY eval_vol.py "$RUN/volume_hard_ss4.npy" "$GT" \
+            --json "$RUN/eval_vol.json" >>"$RUN/run.log" 2>&1; then
+        echo "[$ARM] EVAL_VOL FAILED" >&2
+        touch "$RUN/FAILED"
+        continue
+    fi
+
+    if ! $PY air_metrics.py \
+            --prediction "$RUN/volume_hard_ss4.npy" \
+            --gt "$GT" \
+            --output "$RUN/air_metrics.json" >>"$RUN/run.log" 2>&1; then
+        echo "[$ARM] AIR_METRICS FAILED" >&2
+        touch "$RUN/FAILED"
+        continue
+    fi
+
+    # Activation guard. A non-zero exit records INACTIVE and keeps the run
+    # (see module docstring) -- it must never `continue` here.
+    $PY experiments/sweep_revalidate_v1/assert_active.py \
+            --run "$RUN" --config "$CFG" >>"$RUN/run.log" 2>&1
+
+    touch "$RUN/DONE"
+    echo "=== [$ARM] gpu=$GPU done $(date -Is) ==="
+done
+
+echo "queue finished on gpu=$GPU"
