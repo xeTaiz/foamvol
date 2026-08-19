@@ -1,0 +1,158 @@
+name: sweep_revalidate_v1
+tensorboard_prefix: sweep_revalidate/
+
+purpose: >
+  specs/VOXEL-GRID-CONVENTION-v1.md fixed a repo-wide voxel-grid registration
+  bug: endpoint linspace(-extent,extent,R) grids -> voxel centres,
+  align_corners=True -> False. Volume metrics were biased ~1.7 dB by
+  misregistration plus ~2.1 dB by 1-sample quadrature, and the bias is
+  arm-dependent (0.21 dB spread), so it can reorder any comparison whose
+  margin is under ~0.25 dB. This sweep re-tests every plausible prior idea
+  under the corrected evaluator with a measured noise floor.
+
+base_configs:
+  screen: configs/fixed_final/256k.yaml
+  cells_512: configs/fixed_final/512k.yaml
+  cells_1m: configs/fixed_final/1m.yaml
+
+activation_policy: >
+  Regularizers start at densify_from (1000). Knobs taking an absolute step
+  get 1000 (tv_start, voxel_var_start, neighbor_var_start, ref_volume_start);
+  knobs supporting -1 keep -1, which already resolves to densify_from
+  (top_eig_align_start, normal_lap_start, cvt_start).
+
+decision_rule: >
+  sigma_psnr, sigma_chamfer = sample sd over the five Stage-A BASE_s{42..46}
+  replicates (256k, unmodified). An arm passes screening only if its delta
+  versus the Stage-A mean exceeds 2*sigma in the favourable direction on
+  volume PSNR OR Chamfer. Everything else -- including monotone-looking
+  dose-response ladders -- is reported as noise. Arms whose activation
+  marker is INACTIVE are reported as untested, never as a negative result.
+  Stage-B screen arms run one replicate; Stage-C promotes a screen pass to a
+  win only if the 3-replicate (seed 43/44/45) mean still clears 2*sigma.
+
+damage_classes:
+  bug_clean: >
+    Training never touched a voxel grid -- supervision goes through the CUDA
+    rasterizer. The model was fine; only the reported number was wrong. The
+    verdict is unreliable so the arm is re-measured, but nothing was broken.
+  bug_corrupted: >
+    The misregistered grid entered the optimization target itself via
+    align_corners=True. Exactly three families: FDK/volume density init
+    (init_volume_path), the reference-volume loss (ref_volume_*), and
+    reference-guided densification/pruning (ref_guided_*). For these the
+    sweep produces the first valid measurement that has ever existed.
+
+known_caveats:
+  boundary_alignment: >
+    boundary_align_weight / boundary_alignment_regularization were removed
+    from the codebase; the 19-arm configs/boundary_sweep/ corpus is not
+    re-testable as-is and is deliberately excluded. Surviving successors
+    top_eig_align_weight (proposal A) and normal_lap_weight (proposal C) are
+    tested instead; proposals B and D were never implemented.
+  targeted_rays: >
+    targeted_fraction weights cells by inverse cross-section (purely
+    geometric); there was never a voxelized-reference-guided ray sampler.
+    The "focus effort where it's hard" idea exists as high_error_fraction
+    (rendered-error map) and, for densification, as ref_guided_densify.
+  ablations_of_defaults: >
+    The 256k screen baseline already has targeted_fraction 0.1,
+    high_error_fraction 0.2, prune_variance_criterion True,
+    grad_smooth_hops 1, redundancy_cap 0.05, and
+    var_sigma_v_init/final 50.0/0.2. Several Stage-B arms below ablate an
+    already-on default rather than activating a new mechanism.
+  c2m_densify_until: >
+    C2M sets densify_until: 7000 (not the stock 6000). Densification paces
+    itself by next = max(100, (densify_factor-1)*N*(densify_until-
+    densify_from)/(final_points-init_points)) and stops at 0.9*final_points.
+    From init_points 64000 at densify_factor 1.15, reaching 0.9*2048000
+    needs ~24 growth steps whose intervals sum to just over the default
+    5000-iteration window, so the stock schedule would silently stall short
+    of target. C2M has every regularizer off, so extending densify_until
+    has no side effect on any regularizer schedule.
+  cell_count_asymmetry: >
+    configs/fixed_final/128k.yaml starts from init_points 32000 while
+    256k/512k/1m start from 64000. The screen runs entirely at 256k so this
+    does not affect it, and the CELLS ladder (C512/C1M/C2M) deliberately
+    uses only the 64000-init configs.
+  screen_budget: >
+    Screening at 256k might miss cell-count-dependent effects; accepted
+    deliberately to keep the screen affordable. Stage D re-tests the single
+    best Stage-C survivor at 512k.
+
+arms:
+  # --- Stage A: baseline / noise floor (5 replicates, unmodified 256k) ---
+  - {tag: BASE_s42, family: BASE, base: screen, overrides: {seed: 42}, assert_scalar: null, question: "Noise-floor replicate 1/5."}
+  - {tag: BASE_s43, family: BASE, base: screen, overrides: {seed: 43}, assert_scalar: null, question: "Noise-floor replicate 2/5."}
+  - {tag: BASE_s44, family: BASE, base: screen, overrides: {seed: 44}, assert_scalar: null, question: "Noise-floor replicate 3/5."}
+  - {tag: BASE_s45, family: BASE, base: screen, overrides: {seed: 45}, assert_scalar: null, question: "Noise-floor replicate 4/5."}
+  - {tag: BASE_s46, family: BASE, base: screen, overrides: {seed: 46}, assert_scalar: null, question: "Noise-floor replicate 5/5."}
+
+  # --- Stage B: the screen (50 arms, one replicate each, base 256k) ---
+  - {tag: TV_1e4, family: TV, base: screen, overrides: {tv_weight: 1.0e-4, tv_start: 1000}, assert_scalar: train/tv_loss, question: "Does adjacency TV at 1e-4 improve volume PSNR/chamfer?"}
+  - {tag: TV_1e3, family: TV, base: screen, overrides: {tv_weight: 1.0e-3, tv_start: 1000}, assert_scalar: train/tv_loss, question: "Does adjacency TV at 1e-3 improve volume PSNR/chamfer?"}
+  - {tag: TV_1e4_area, family: TV, base: screen, overrides: {tv_weight: 1.0e-4, tv_start: 1000, tv_area_weighted: True}, assert_scalar: train/tv_loss, question: "Does area-weighting TV help over plain TV at 1e-4?"}
+  - {tag: TV_1e4_border, family: TV, base: screen, overrides: {tv_weight: 1.0e-4, tv_start: 1000, tv_border: True}, assert_scalar: train/tv_loss, question: "Does border-only TV help over plain TV at 1e-4?"}
+  - {tag: NV_1e4, family: NV, base: screen, overrides: {neighbor_var_weight: 1.0e-4, neighbor_var_start: 1000}, assert_scalar: train/neighbor_var_loss, question: "Does neighbour-variance regularization at 1e-4 help?"}
+  - {tag: NV_1e3, family: NV, base: screen, overrides: {neighbor_var_weight: 1.0e-3, neighbor_var_start: 1000}, assert_scalar: train/neighbor_var_loss, question: "Does neighbour-variance regularization at 1e-3 help?"}
+  - {tag: NV_1e3_huber, family: NV, base: screen, overrides: {neighbor_var_weight: 1.0e-3, neighbor_var_start: 1000, neighbor_reg_type: bilateral_huber}, assert_scalar: train/neighbor_var_loss, question: "Does the Huber-robust variant beat plain bilateral_var at 1e-3?"}
+  - {tag: NV_1e3_median, family: NV, base: screen, overrides: {neighbor_var_weight: 1.0e-3, neighbor_var_start: 1000, neighbor_reg_type: bilateral_median}, assert_scalar: train/neighbor_var_loss, question: "Does the median-robust variant beat plain bilateral_var at 1e-3?"}
+  - {tag: NV_1e3_sharp, family: NV, base: screen, overrides: {neighbor_var_weight: 1.0e-3, neighbor_var_start: 1000, var_sigma_v_init: 0.2}, assert_scalar: train/neighbor_var_loss, question: "Does dropping the wide-to-narrow bilateral anneal (flat sigma_v=0.2) help?"}
+  - {tag: VV_1e4, family: VV, base: screen, overrides: {voxel_var_weight: 1.0e-4, voxel_var_start: 1000}, assert_scalar: train/voxel_var_loss, question: "Does volume-based (informed) TV at 1e-4 help?"}
+  - {tag: VV_1e3, family: VV, base: screen, overrides: {voxel_var_weight: 1.0e-3, voxel_var_start: 1000}, assert_scalar: train/voxel_var_loss, question: "Does volume-based TV at 1e-3 help?"}
+  - {tag: VV_1e2, family: VV, base: screen, overrides: {voxel_var_weight: 1.0e-2, voxel_var_start: 1000}, assert_scalar: train/voxel_var_loss, question: "Does volume-based TV at 1e-2 help?"}
+  - {tag: EIG_1e3, family: EIG, base: screen, overrides: {top_eig_align_weight: 1.0e-3, top_eig_align_start: -1}, assert_scalar: train/top_eig_align_loss, question: "Does top-eigenvector alignment (proposal A) at 1e-3 help?"}
+  - {tag: EIG_1e2, family: EIG, base: screen, overrides: {top_eig_align_weight: 1.0e-2, top_eig_align_start: -1}, assert_scalar: train/top_eig_align_loss, question: "Does top-eigenvector alignment at 1e-2 help?"}
+  - {tag: LAP_1e3, family: LAP, base: screen, overrides: {normal_lap_weight: 1.0e-3, normal_lap_start: -1}, assert_scalar: train/normal_lap_loss, question: "Does normal-Laplacian regularization (proposal C) at 1e-3 help?"}
+  - {tag: LAP_1e2, family: LAP, base: screen, overrides: {normal_lap_weight: 1.0e-2, normal_lap_start: -1}, assert_scalar: train/normal_lap_loss, question: "Does normal-Laplacian regularization at 1e-2 help?"}
+  - {tag: CVT_1e3, family: CVT, base: screen, overrides: {cvt_weight: 1.0e-3, cvt_start: -1}, assert_scalar: train/cvt_loss, question: "Does CVT/Lloyd sliver-pull regularization at 1e-3 help?"}
+  - {tag: CVT_1e2, family: CVT, base: screen, overrides: {cvt_weight: 1.0e-2, cvt_start: -1}, assert_scalar: train/cvt_loss, question: "Does CVT/Lloyd sliver-pull regularization at 1e-2 help?"}
+  - {tag: GS_0, family: GS, base: screen, overrides: {grad_smooth_hops: 0}, assert_scalar: null, question: "Does disabling density-gradient smoothing (default on, 1 hop) change the result?"}
+  - {tag: GS_2, family: GS, base: screen, overrides: {grad_smooth_hops: 2}, assert_scalar: null, question: "Does widening density-gradient smoothing to 2 hops help over the default 1?"}
+  - {tag: D_ent0, family: DENS, base: screen, overrides: {gradient_fraction: 0.6, idw_fraction: 0.4, entropy_fraction: 0.0}, assert_scalar: null, question: "Does removing the entropy-driven densification share help?"}
+  - {tag: D_entonly, family: DENS, base: screen, overrides: {gradient_fraction: 0.0, idw_fraction: 0.0, entropy_fraction: 1.0}, assert_scalar: null, question: "Does an entropy-only densification budget help?"}
+  - {tag: D_gradheavy, family: DENS, base: screen, overrides: {gradient_fraction: 0.8, idw_fraction: 0.2, entropy_fraction: 0.0}, assert_scalar: null, question: "Does a gradient-heavy densification budget help?"}
+  - {tag: D_bins3, family: DENS, base: screen, overrides: {entropy_bins: 3}, assert_scalar: null, question: "Does coarsening entropy_bins to 3 (from default 5) help?"}
+  - {tag: D_bins12, family: DENS, base: screen, overrides: {entropy_bins: 12}, assert_scalar: null, question: "Does refining entropy_bins to 12 (from default 5) help?"}
+  - {tag: D_ca1, family: DENS, base: screen, overrides: {contrast_alpha: 1.0}, assert_scalar: null, question: "Does contrast-weighted projection loss at alpha=1 help?"}
+  - {tag: D_ca4, family: DENS, base: screen, overrides: {contrast_alpha: 4.0}, assert_scalar: null, question: "Does contrast-weighted projection loss at alpha=4 help?"}
+  - {tag: D_thr500, family: DENS, base: screen, overrides: {densify_grad_thresh: 500, gradient_fraction: 1.0, idw_fraction: 0.0, entropy_fraction: 0.0}, assert_scalar: null, question: "Does gradient-threshold densification (thresh=500) beat the fixed-fraction budget?"}
+  - {tag: D_thr1000, family: DENS, base: screen, overrides: {densify_grad_thresh: 1000, gradient_fraction: 1.0, idw_fraction: 0.0, entropy_fraction: 0.0}, assert_scalar: null, question: "Does gradient-threshold densification (thresh=1000) beat the fixed-fraction budget?"}
+  - {tag: D_thr1000_v5e3, family: DENS, base: screen, overrides: {densify_grad_thresh: 1000, gradient_fraction: 1.0, idw_fraction: 0.0, entropy_fraction: 0.0, densify_var_thresh: 5.0e-3}, assert_scalar: null, question: "Does adding the variance AND-gate to the thresh=1000 arm help?"}
+  - {tag: P_idw, family: PRUNE, base: screen, overrides: {prune_variance_criterion: False}, assert_scalar: null, question: "Does reverting to IDW-based pruning (from the default variance criterion) change the result?"}
+  - {tag: P_cap03, family: PRUNE, base: screen, overrides: {redundancy_cap: 0.03}, assert_scalar: null, question: "Does tightening redundancy_cap to 0.03 (from default 0.05) help?"}
+  - {tag: P_cap10, family: PRUNE, base: screen, overrides: {redundancy_cap: 0.10}, assert_scalar: null, question: "Does loosening redundancy_cap to 0.10 (from default 0.05) help?"}
+  - {tag: P_hops2, family: PRUNE, base: screen, overrides: {prune_hops: 2}, assert_scalar: null, question: "Does widening the pruning neighborhood to 2 hops help?"}
+  - {tag: S_tgt0, family: SAMPLE, base: screen, overrides: {targeted_fraction: 0.0}, assert_scalar: null, question: "Does disabling targeted (inverse cross-section) ray sampling change the result?"}
+  - {tag: S_tgt30, family: SAMPLE, base: screen, overrides: {targeted_fraction: 0.3}, assert_scalar: null, question: "Does raising targeted-ray fraction to 0.3 (from default 0.1) help?"}
+  - {tag: S_he0, family: SAMPLE, base: screen, overrides: {high_error_fraction: 0.0}, assert_scalar: null, question: "Does disabling high-error ray resampling change the result?"}
+  - {tag: S_he40, family: SAMPLE, base: screen, overrides: {high_error_fraction: 0.4}, assert_scalar: null, question: "Does raising high-error fraction to 0.4 (from default 0.2) help?"}
+  - {tag: S_he_p2, family: SAMPLE, base: screen, overrides: {high_error_power: 2.0}, assert_scalar: null, question: "Does quadratic high-error weighting (power=2) beat linear (power=1)?"}
+  - {tag: BF_dens, family: BF, base: screen, overrides: {bf_start: 1000, bf_until: 6000, bf_period: 10}, assert_scalar: null, question: "Does bilateral density filtering during densification (1000-6000) help?"}
+  - {tag: BF_late, family: BF, base: screen, overrides: {bf_start: 6000, bf_until: 9000, bf_period: 10}, assert_scalar: null, question: "Does bilateral density filtering post-densification (6000-9000) help?"}
+  - {tag: REF_1e3, family: REF, base: screen, overrides: {ref_volume_path: __REF_NPY__, ref_volume_weight: 1.0e-3, ref_volume_start: 1000}, assert_scalar: train/ref_vol_loss, question: "Bug-corrupted family, first valid measurement: does a reference-volume loss at 1e-3 help?"}
+  - {tag: REF_1e2, family: REF, base: screen, overrides: {ref_volume_path: __REF_NPY__, ref_volume_weight: 1.0e-2, ref_volume_start: 1000}, assert_scalar: train/ref_vol_loss, question: "Bug-corrupted family, first valid measurement: does a reference-volume loss at 1e-2 help?"}
+  - {tag: REF_1e3_noedge, family: REF, base: screen, overrides: {ref_volume_path: __REF_NPY__, ref_volume_weight: 1.0e-3, ref_volume_start: 1000, ref_volume_edge_mask: False}, assert_scalar: train/ref_vol_loss, question: "Bug-corrupted family: does dropping the edge mask change the ref-volume-loss result at 1e-3?"}
+  - {tag: REFG_dens, family: REFG, base: screen, overrides: {ref_volume_path: __REF_NPY__, ref_guided_densify: True}, assert_scalar: null, question: "Bug-corrupted family, first valid measurement: does reference-guided densification (loss off) help?"}
+  - {tag: REFG_prune, family: REFG, base: screen, overrides: {ref_volume_path: __REF_NPY__, ref_guided_pruning: True}, assert_scalar: null, question: "Bug-corrupted family, first valid measurement: does reference-guided pruning (loss off) help?"}
+  - {tag: INIT_ref, family: INIT, base: screen, overrides: {init_volume_path: __REF_NPY__}, assert_scalar: null, question: "Bug-corrupted family, first valid measurement: does FDK/volume density init from a reference volume help?"}
+  - {tag: C512, family: CELLS, base: cells_512, overrides: {}, assert_scalar: null, question: "Cell-count ceiling: does 512k final points beat 256k?"}
+  - {tag: C1M, family: CELLS, base: cells_1m, overrides: {}, assert_scalar: null, question: "Cell-count ceiling: does 1M final points beat 512k?"}
+  - {tag: C2M, family: CELLS, base: cells_1m, overrides: {final_points: 2048000, densify_until: 7000}, assert_scalar: null, question: "Cell-count ceiling: does 2M final points beat 1M, and is the densification schedule wide enough to reach it?"}
+
+  # --- Smoke arms (not part of the headline 55; verification only) ---
+  - {tag: SMOKE_tv, family: SMOKE, base: screen, overrides: {tv_weight: 1.0e-3, tv_start: 50, iterations: 400, densify_from: 50, densify_until: 250, rays_per_batch: 200000, rays_per_batch_late_start: -1, freeze_points: 380}, assert_scalar: train/tv_loss, question: "Smoke: does the full train->voxelize->eval->assert_active chain work end to end and does the activation guard fire on a genuinely active knob?"}
+  - {tag: SMOKE_tv_inactive, family: SMOKE, base: screen, overrides: {tv_weight: 0.0, tv_start: 50, iterations: 400, densify_from: 50, densify_until: 250, rays_per_batch: 200000, rays_per_batch_late_start: -1, freeze_points: 380}, assert_scalar: train/tv_loss, question: "Negative control: assert_active.py must record INACTIVE (not FAILED, not a false ACTIVE) when the knob it is asserting on is a genuine no-op."}
+
+stages:
+  A: "5 replicates of the unmodified 256k baseline (BASE_s42..46) -> sigma_psnr, sigma_chamfer, and REF_NPY = output/sweep_revalidate/BASE_s42/volume_hard_ss4.npy."
+  B: "50 screen arms (all families above except SMOKE), one replicate each, base 256k unless family is CELLS."
+  C: "For every Stage-B arm that passes the decision rule, 3 more replicates (seed 43/44/45)."
+  D: "Single best Stage-C arm by mean volume PSNR, plus plain baseline, re-run at 512k, 3 replicates each. Skipped if Stage C promotes nothing."
+
+artifacts:
+  per_run: output/sweep_revalidate/<tag>/
+  volume: volume_hard_ss4.npy + eval_vol.json
+  air: air_metrics.json
+  markers: DONE / FAILED, ACTIVE / INACTIVE
+  results_doc: specs/SWEEP-REVALIDATE-RESULTS-v1.md

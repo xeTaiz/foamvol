@@ -108,6 +108,7 @@ class PipelineParams(ParamGroup):
         self.sibson_k_samples = 64             # Monte Carlo samples per query (sibson mode)
         self.sibson_sample_radius_scale = 1.5  # ball radius as multiple of cell_radius (sibson)
         self.sibson_temperature = 0.01         # sigmoid temperature for soft-stolen relaxation
+        self.seed = 42                         # RNG seed for point-cloud init and data sampling
         super().__init__(parser, "Setting Pipeline parameters")
 
 

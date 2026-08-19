@@ -47,11 +47,6 @@ from vis_foam import (field_from_model, query_density,
 import radfoam
 
 
-seed = 42
-torch.random.manual_seed(seed)
-np.random.seed(seed)
-
-
 def compute_psnr(pred, gt):
     """PSNR between two tensors using the ground-truth data range."""
     mse = ((pred - gt) ** 2).mean()
@@ -357,6 +352,8 @@ def _log_grad_distribution(writer, step, point_error):
 
 
 def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
+    torch.random.manual_seed(pipeline_args.seed)
+    np.random.seed(pipeline_args.seed)
     device = torch.device(model_args.device)
     # Setting up output directory
     if not pipeline_args.debug:
