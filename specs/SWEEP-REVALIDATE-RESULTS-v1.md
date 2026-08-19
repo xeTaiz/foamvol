@@ -147,12 +147,21 @@ Immediate caveats visible even before Stage C:
   outside 2σ). This matches the "cell-count scaling is real but budget the
   ray schedule with it" pattern flagged as a known caveat in
   `manifest.yaml`.
-- **REF_1e3, REF_1e2 (the reference-volume loss) do not pass**, but
-  `REFG_prune` (reference-guided pruning, loss weight left at 0) does. The
-  bug-corrupted family's first valid measurement is therefore a split
-  verdict, not a blanket "it never worked": guiding *what gets pruned* with
-  the reference field helped; adding it as a direct loss term did not, at
-  either weight tested.
+- **REF_1e3, REF_1e2, REF_1e3_noedge (the reference-volume loss, all three
+  weight/edge-mask variants tested) do not pass**, but `REFG_prune`
+  (reference-guided pruning, loss weight left at 0) does. The bug-corrupted
+  family's first valid measurement is therefore a split verdict, not a
+  blanket "it never worked": guiding *what gets pruned* with the reference
+  field helped; adding it as a direct loss term did not, at any of the
+  three configurations tested.
+- **NV_1e4 is a same-host borderline pass.** Its `Δpsnr = +0.0376 dB` clears
+  the manifest's committed `2σ = 0.1310 dB` (5-replicate, mixed-host) bar
+  comfortably, but NV_1e4 ran on `KW60996`, so the tighter same-host
+  `2σ = 0.0376 dB` bar (4-replicate `BASE_s42-45` only) puts it exactly at
+  the boundary rather than decisively above it. Its Stage-C confirmation
+  (mean over 3 more same-host replicates against a 2σ bar) is therefore the
+  more informative test for this arm specifically, more so than for the
+  other 10 passes, most of which clear either bar by a wider margin.
 - **D_thr500/1000/1000_v5e3 (gradient-threshold densification) are badly
   negative** on both axes (up to -3.86 dB, +1.29 chamfer) — these arms also
   reached far fewer cells (52825-90961 vs the ~237000 baseline) because
