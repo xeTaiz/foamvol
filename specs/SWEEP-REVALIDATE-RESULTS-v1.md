@@ -37,16 +37,23 @@ give `σ_psnr = 0.0188 dB` (mean 34.9009) — a 3.5× tighter floor than the
 with either a genuine outlier seed or a small cross-host/cross-torch-version
 offset; five replicates cannot distinguish the two. The decision rule below
 uses the full 5-replicate `σ = 0.0655 dB` because that is what the manifest
-commits to and because every Stage-B/C screen arm in this document ran on
-`KW60996` (same host as `BASE_s42..45`), so if anything the 5-replicate σ is
-conservative (wider) for those comparisons.
+commits to. This is **not** conservative for every arm: 16 of the 50
+Stage-B arms (`D_ca1`, `D_ca4`, `D_thr500`, `D_thr1000`, `D_thr1000_v5e3`,
+`P_idw`, `P_cap03`, `P_cap10`, `P_hops2`, `S_tgt0`, `S_tgt30`, `S_he0`,
+`S_he40`, `S_he_p2`, `BF_dens`, `BF_late`) ran on `KW60995`, not `KW60996`,
+including three screening passes (`P_idw`, `P_cap03`, `S_he40`). If the
+~0.14 dB `BASE_s46` gap is a real host/torch-version offset rather than
+seed noise, it works *against* those three arms' favourable direction (PSNR
+up), so their reported `Δpsnr` of +0.41, +0.27 and +0.06 dB are understated,
+not inflated. The remaining 34 Stage-B arms plus all 5 `BASE_*` and all 33
+Stage-C runs ran on `KW60996`.
 
 REF_NPY (for `REF_*`/`REFG_*`/`INIT_ref`) = `output/sweep_revalidate/BASE_s42/volume_hard_ss4.npy`.
 
 ## Stage B — screen (50 arms, 1 replicate each, base 256k unless noted)
 
-Full table (all on `KW60996`; PSNR/chamfer/etc. from `eval_vol.json`, air
-columns from `air_metrics.json`, `num_cells` from `metrics.txt`):
+Full table (PSNR/chamfer/etc. from `eval_vol.json`, air columns from
+`air_metrics.json`, `num_cells` from `metrics.txt`; host per arm noted above):
 
 | tag | family | psnr | Δpsnr | chamfer | Δchamfer | num_cells | verdict |
 |---|---|---|---|---|---|---|---|
@@ -109,7 +116,7 @@ against the numbers above per plan caveat):
 | R2-Gaussian | 35.8512 | 0.943398 | 0.889397 | 0.7283 | 4.1286 | 0.8838 | 0.9481 |
 | SC256_ctrl | 34.8299 | 0.924534 | 0.849052 | 1.4388 | 12.7060 | 0.7880 | 0.8777 |
 
-**Activation audit (Verification §6).** All 16 arms carrying a non-null
+**Activation audit (Verification §6).** All 21 arms carrying a non-null
 `assert_scalar` (`TV_1e4`, `TV_1e3`, `TV_1e4_area`, `TV_1e4_border`, `NV_1e4`,
 `NV_1e3`, `NV_1e3_huber`, `NV_1e3_median`, `NV_1e3_sharp`, `VV_1e4`, `VV_1e3`,
 `VV_1e2`, `EIG_1e3`, `EIG_1e2`, `LAP_1e3`, `LAP_1e2`, `CVT_1e3`, `CVT_1e2`,
@@ -119,10 +126,11 @@ recording as untested-inactive except the deliberate `SMOKE_tv_inactive`
 negative control.
 
 **Cell-count achieved budgets (Verification §7).** `C512` reached 462204
-(≈90.3% of 512000, matching the prior 512k run's 462712), `C1M` reached
-988893 (≈98.9% of 1000000, in excess of the 90% floor), `C2M` reached
-1892884 (≈92.4% of 2048000) — the extended `densify_until: 7000` schedule was
-sufficient; no ray-batch reduction fallback was needed.
+(≈90.3% of its `final_points: 512000`, matching the prior 512k run's 462712),
+`C1M` reached 988893 (≈96.6% of `1m.yaml`'s `final_points: 1024000`), `C2M`
+reached 1892884 (≈92.4% of its overridden `final_points: 2048000`) — the
+extended `densify_until: 7000` schedule was sufficient; no ray-batch
+reduction fallback was needed.
 
 ## Stage-B screening passes (11 arms → promoted to Stage C)
 
@@ -154,13 +162,14 @@ Immediate caveats visible even before Stage C:
 
 ## Known caveats
 
-- **Host split for BASE arms only.** `BASE_s42-45` + all 50 Stage-B arms ran
-  on `KW60996`; `BASE_s46` ran on `KW60995` because at the time of Stage-A
-  launch KW60995's other 2 GPUs were free (GPU0 there was pre-occupied by an
-  invisible external tenant). Stage B and C were both restricted to
-  `KW60996` after this was noticed (see Stage C section, once completed)
-  specifically to avoid a possible host/torch-version confound contaminating
-  the noise estimate used for promotion.
+- **Host split.** `BASE_s42-45`, 34 of 50 Stage-B arms, and all 33 Stage-C
+  arms ran on `KW60996`; `BASE_s46` plus the other 16 Stage-B arms
+  (enumerated above, including screening passes `P_idw`/`P_cap03`/`S_he40`)
+  ran on `KW60995`, whose other 2 GPUs were free at Stage-B launch time
+  (GPU0 there was pre-occupied by an invisible external tenant). Stage C
+  was restricted entirely to `KW60996` once this was noticed, specifically
+  to avoid compounding the possible host/torch-version confound into the
+  3-replicate confirmation.
 - **torch 2.13.0+cu126 (KW60996) vs 2.7.1+cu126 (KW60995).** Both print a
   compile-version mismatch warning against the CUDA extension (built for
   2.5.1) on every run, on both hosts; this is a pre-existing repo condition,
