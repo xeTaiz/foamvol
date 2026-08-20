@@ -23,8 +23,8 @@ PY="${PY:-/code/lc64-venv/bin/python}"
 
 cd "$REPO" || exit 1
 export CUDA_VISIBLE_DEVICES="$GPU"
-export LD_LIBRARY_PATH=/.singularity.d/libs:/usr/local/cuda/lib64
-export PYTHONPATH="$PWD/src:$PWD"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}/.singularity.d/libs:/usr/local/cuda/lib64"
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$PWD/src:$PWD"
 export MPLBACKEND=Agg
 
 for ARM in "${ARMS[@]}"; do
