@@ -179,6 +179,14 @@ arms:
   - {tag: TV_1e4_s44, family: TV, base: screen, overrides: {tv_weight: 0.0001, tv_start: 1000, seed: 44}, assert_scalar: train/tv_loss, question: "Stage-C replicate (seed 44) confirming Stage-B screening pass for TV_1e4."}
   - {tag: TV_1e4_s45, family: TV, base: screen, overrides: {tv_weight: 0.0001, tv_start: 1000, seed: 45}, assert_scalar: train/tv_loss, question: "Stage-C replicate (seed 45) confirming Stage-B screening pass for TV_1e4."}
 
+  # --- Stage D: 512k re-test of the Stage-C PSNR winner (REFG_prune) ---
+  - {tag: D_BASE_s43, family: STAGED_BASE, base: cells_512, overrides: {seed: 43}, assert_scalar: null, question: "Stage-D 512k plain-baseline replicate (seed 43)."}
+  - {tag: D_BASE_s44, family: STAGED_BASE, base: cells_512, overrides: {seed: 44}, assert_scalar: null, question: "Stage-D 512k plain-baseline replicate (seed 44)."}
+  - {tag: D_BASE_s45, family: STAGED_BASE, base: cells_512, overrides: {seed: 45}, assert_scalar: null, question: "Stage-D 512k plain-baseline replicate (seed 45)."}
+  - {tag: D_REFG_prune_s43, family: STAGED_REFG, base: cells_512, overrides: {ref_volume_path: __REF_NPY__, ref_guided_pruning: True, seed: 43}, assert_scalar: null, question: "Stage-D 512k REFG_prune replicate (seed 43); Stage-C PSNR winner."}
+  - {tag: D_REFG_prune_s44, family: STAGED_REFG, base: cells_512, overrides: {ref_volume_path: __REF_NPY__, ref_guided_pruning: True, seed: 44}, assert_scalar: null, question: "Stage-D 512k REFG_prune replicate (seed 44); Stage-C PSNR winner."}
+  - {tag: D_REFG_prune_s45, family: STAGED_REFG, base: cells_512, overrides: {ref_volume_path: __REF_NPY__, ref_guided_pruning: True, seed: 45}, assert_scalar: null, question: "Stage-D 512k REFG_prune replicate (seed 45); Stage-C PSNR winner."}
+
 stages:
   A: "5 replicates of the unmodified 256k baseline (BASE_s42..46) -> sigma_psnr, sigma_chamfer, and REF_NPY = output/sweep_revalidate/BASE_s42/volume_hard_ss4.npy."
   B: "50 screen arms (all families above except SMOKE), one replicate each, base 256k unless family is CELLS."
