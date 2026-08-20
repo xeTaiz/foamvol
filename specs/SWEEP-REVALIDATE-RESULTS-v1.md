@@ -2,26 +2,18 @@
 
 ## Status
 
-Stage A, Stage B, and Stage C are complete and final: 88 completed runs
-(5 baseline + 50 screen + 33 Stage-C confirmations), all scored through the
-corrected evaluator. Eight Stage-C arms clear the precommitted two-standard-
-deviation rule; `REFG_prune` is the single best by mean volume PSNR and is
-therefore the Stage-D candidate.
-
-**Stage D is running.** Three 512k plain-baseline and three 512k
-`REFG_prune` replicates (seeds 43/44/45) were launched after the Stage-C
-decision. `REFG_prune` uses the fixed Stage-A `BASE_s42` SS4 reconstruction
-as its reference signal, exactly as it did at 256k. The source volume was
-copied to `KW60995` by chunked, checksummed transfer before its two
-replicates were launched: source and destination SHA-256 are both
-`d506b3ce1e93fbb774f91affec79e8a37b6dbafd22f4be9f6daefe0a0e633f59`.
+The final analysis contains 94 completed runs (5 baseline + 50 screen + 33
+Stage-C confirmations + 6 matched-host Stage-D runs), all scored through the
+corrected evaluator. Eight Stage-C candidates clear the precommitted
+two-standard-deviation rule. `REFG_prune` is the Stage-C PSNR winner, but
+its 512k result does **not** retain a significant PSNR improvement over the
+matched 512k baseline; the low-budget-artifact hypothesis survives.
 
 The earlier worker-harness outage is resolved. During it, the connector
 reported `runtime: failed to create new OS thread (have 7 already; errno=11)
 ... fatal error: newosproc`; this blocked result retrieval despite completed
 training. The recovered connection confirmed all 33 Stage-C markers,
-including `S_he40_s44`, then retrieved every evaluation JSON. The Stage-D
-aggregate and legacy-summary cross-reference remain pending below.
+including `S_he40_s44`, then retrieved every evaluation JSON.
 
 ## Stage A — noise floor
 
@@ -253,9 +245,28 @@ plainly non-robust.
 
 ## Stage D — 512k re-test
 
-Running: `D_BASE_s43..45` and `D_REFG_prune_s43..45`. The winner must retain
-its PSNR advantage against the matched 512k baseline before it can reject
-the low-budget-artifact hypothesis.
+All reported Stage-D rows ran on `KW60996` (torch 2.13.0+cu126), so the
+comparison is host- and runtime-matched. `D_BASE_s43..45` and
+`D_REFG_prune_s43..45` retain the Stage-A `BASE_s42` SS4 reconstruction as
+the fixed reference signal for the REFG arm.
+
+| arm | PSNR mean ± sd | SSIM-3D mean ± sd | dice mean ± sd | chamfer mean ± sd | HD95 mean ± sd |
+|---|---:|---:|---:|---:|---:|
+| plain 512k baseline | 34.9141 ± 0.1355 | 0.925552 ± 0.002008 | 0.857264 ± 0.001629 | **1.1884 ± 0.0328** | **9.0044 ± 0.2138** |
+| REFG_prune 512k | **35.0318 ± 0.0396** | **0.927563 ± 0.000211** | **0.859012 ± 0.000701** | 1.2757 ± 0.0910 | 10.5475 ± 1.1792 |
+
+`REFG_prune` is nominally +0.1176 dB at 512k, but the matched baseline's
+$2\sigma_\mathrm{PSNR}=0.2710$ dB, so it does not meet the same
+precommitted significance rule that promoted it from Stage C. Chamfer is
+also worse by 0.0873. **Verdict: the 256k PSNR win does not survive the 512k
+re-test; the evidence supports a low-budget artifact, not a scalable
+improvement.**
+
+Two initial `D_REFG_prune_s44/s45` executions on `KW60995` completed after
+a checksummed transfer of `BASE_s42`, but were excluded from the comparison:
+they would have mixed torch 2.7.1+cu126 with the `KW60996` baseline. Both
+were re-run with the same tags on `KW60996` before aggregation; only those
+matched-host results are reported above.
 
 ## Legacy `summary.csv` cross-reference
 
