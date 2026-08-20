@@ -4,14 +4,14 @@ import sys
 from pathlib import Path
 
 import cmake_build_extension
+import importlib.util
 import setuptools
-import sysconfig
-import subprocess
 
-lib_path = sysconfig.get_path("purelib")
-assert os.path.exists(
-    f"{lib_path}/torch"
-), "Could not find PyTorch; please make sure it is installed in your environment before installing radfoam."
+torch_spec = importlib.util.find_spec("torch")
+assert torch_spec is not None and torch_spec.origin is not None, (
+    "Could not find PyTorch; please make sure it is installed in your environment before installing radfoam."
+)
+torch_dir = Path(torch_spec.origin).parent
 
 cmake_options = []
 
@@ -57,7 +57,7 @@ setuptools.setup(
                 "-DBUILD_SHARED_LIBS:BOOL=OFF",
                 "-DGPU_DEBUG:BOOL=OFF",
                 "-DEXAMPLE_WITH_PYBIND11:BOOL=ON",
-                f"-DTorch_DIR={lib_path}/torch/share/cmake/Torch",
+                f"-DTorch_DIR={torch_dir}/share/cmake/Torch",
                 "-DPIP_GLFW:BOOL=ON",
             ]
             + cmake_options,
