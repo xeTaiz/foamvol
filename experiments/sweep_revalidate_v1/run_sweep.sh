@@ -19,8 +19,6 @@ ARMS=("$@")
 
 REPO=/code/lc64-radfoam
 CFG_DIR=experiments/sweep_revalidate_v1/configs
-DATA=r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone
-GT="$DATA/vol_gt.npy"
 PY=/code/lc64-venv/bin/python
 
 cd "$REPO" || exit 1
@@ -38,7 +36,26 @@ for ARM in "${ARMS[@]}"; do
         continue
     fi
 
-    echo "=== [$ARM] gpu=$GPU start $(date -Is) ==="
+    DATA="$(
+        $PY -c 'import sys, yaml; print(yaml.safe_load(open(sys.argv[1]))["data_path"])' "$CFG"
+    )"
+    GT="$DATA/vol_gt.npy"
+    if [ ! -f "$GT" ]; then
+        echo "[$ARM] MISSING GT $GT" >&2
+        mkdir -p "$RUN"
+        touch "$RUN/FAILED"
+        continue
+    fi
+    if ! RESOLUTION="$(
+        $PY -c 'import numpy as np, sys; shape = np.load(sys.argv[1], mmap_mode="r").shape; assert len(shape) == 3 and len(set(shape)) == 1, f"expected cubic GT, got {shape}"; print(shape[0])' "$GT"
+    )"; then
+        echo "[$ARM] INVALID GT GRID $GT" >&2
+        mkdir -p "$RUN"
+        touch "$RUN/FAILED"
+        continue
+    fi
+
+    echo "=== [$ARM] gpu=$GPU start $(date -Is) gt=$GT resolution=$RESOLUTION ==="
     rm -rf "$RUN"
     mkdir -p "$RUN"
 
@@ -48,12 +65,11 @@ for ARM in "${ARMS[@]}"; do
         continue
     fi
 
-    # Centre-registered hard SS4 voxelization: falls back to scalar softplus
-    # density automatically (no arm in this sweep uses split cells), so all
-    # arms are voxelized identically. No --side_map: no arm here splits.
+    # Centre-registered hard SS4 voxelization at the GT's cubic resolution.
+    # This makes the evaluator's equal-grid contract explicit for every scene.
     if ! $PY split_voxelize.py \
             --model "$RUN/model.pt" \
-            --resolution 256 --supersample 4 \
+            --resolution "$RESOLUTION" --supersample 4 \
             --output "$RUN/volume_hard_ss4.npy" \
             --gt "$GT" >>"$RUN/run.log" 2>&1; then
         echo "[$ARM] VOXELIZE FAILED" >&2

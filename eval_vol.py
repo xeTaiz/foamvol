@@ -184,8 +184,10 @@ def evaluate(pred_path, gt_path, device="cuda"):
     gt_np   = np.load(gt_path).astype(np.float32)
 
     if pred_np.shape != gt_np.shape:
-        print(f"  [WARN] shape mismatch: pred={pred_np.shape}, gt={gt_np.shape} — skipping")
-        return None
+        raise ValueError(
+            f"shape mismatch: pred={pred_np.shape}, gt={gt_np.shape}; "
+            "evaluation requires equal voxel grids"
+        )
 
     pred = _to_tensor(pred_np, device)
     gt   = _to_tensor(gt_np,   device)
