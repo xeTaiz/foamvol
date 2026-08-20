@@ -17,9 +17,9 @@ set -u
 GPU="$1"; shift
 ARMS=("$@")
 
-REPO=/code/lc64-radfoam
-CFG_DIR=experiments/sweep_revalidate_v1/configs
-PY=/code/lc64-venv/bin/python
+REPO="${REPO:-/code/lc64-radfoam}"
+CFG_DIR="${CFG_DIR:-experiments/sweep_revalidate_v1/configs}"
+PY="${PY:-/code/lc64-venv/bin/python}"
 
 cd "$REPO" || exit 1
 export CUDA_VISIBLE_DEVICES="$GPU"
@@ -29,12 +29,21 @@ export MPLBACKEND=Agg
 
 for ARM in "${ARMS[@]}"; do
     CFG="$CFG_DIR/$ARM.yaml"
-    RUN="output/sweep_revalidate/$ARM"
 
     if [ ! -f "$CFG" ]; then
         echo "[$ARM] MISSING CONFIG $CFG" >&2
         continue
     fi
+    EXPERIMENT_NAME="$(
+        $PY -c 'import sys, yaml; print(yaml.safe_load(open(sys.argv[1]))["experiment_name"])' "$CFG"
+    )"
+    case "$EXPERIMENT_NAME" in
+        ""|/*|*..*)
+            echo "[$ARM] INVALID experiment_name $EXPERIMENT_NAME" >&2
+            continue
+            ;;
+    esac
+    RUN="output/$EXPERIMENT_NAME"
 
     DATA="$(
         $PY -c 'import sys, yaml; print(yaml.safe_load(open(sys.argv[1]))["data_path"])' "$CFG"
@@ -93,10 +102,11 @@ for ARM in "${ARMS[@]}"; do
         continue
     fi
 
-    # Activation guard. A non-zero exit records INACTIVE and keeps the run
-    # (see module docstring) -- it must never `continue` here.
+    # Multi-scene configs use <scene>__<source-tag> filenames. The source
+    # tag retains its activation assertion from the authoritative manifest.
+    ASSERT_TAG="${ARM##*__}"
     $PY experiments/sweep_revalidate_v1/assert_active.py \
-            --run "$RUN" --config "$CFG" >>"$RUN/run.log" 2>&1
+            --run "$RUN" --config "$CFG" --tag "$ASSERT_TAG" >>"$RUN/run.log" 2>&1
 
     touch "$RUN/DONE"
     echo "=== [$ARM] gpu=$GPU done $(date -Is) ==="

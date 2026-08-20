@@ -1,0 +1,1946 @@
+[
+  {
+    "file_tag": "chest__BASE_s42",
+    "scene": "chest",
+    "tag": "BASE_s42",
+    "family": "BASE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__BASE_s43",
+    "scene": "chest",
+    "tag": "BASE_s43",
+    "family": "BASE",
+    "seed": 43,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__BASE_s44",
+    "scene": "chest",
+    "tag": "BASE_s44",
+    "family": "BASE",
+    "seed": 44,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__BASE_s45",
+    "scene": "chest",
+    "tag": "BASE_s45",
+    "family": "BASE",
+    "seed": 45,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__BASE_s46",
+    "scene": "chest",
+    "tag": "BASE_s46",
+    "family": "BASE",
+    "seed": 46,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__SMOKE_tv",
+    "scene": "chest",
+    "tag": "SMOKE_tv",
+    "family": "SMOKE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__TV_1e4",
+    "scene": "chest",
+    "tag": "TV_1e4",
+    "family": "TV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__TV_1e3",
+    "scene": "chest",
+    "tag": "TV_1e3",
+    "family": "TV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__TV_1e4_area",
+    "scene": "chest",
+    "tag": "TV_1e4_area",
+    "family": "TV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__TV_1e4_border",
+    "scene": "chest",
+    "tag": "TV_1e4_border",
+    "family": "TV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__NV_1e4",
+    "scene": "chest",
+    "tag": "NV_1e4",
+    "family": "NV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__NV_1e3",
+    "scene": "chest",
+    "tag": "NV_1e3",
+    "family": "NV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__NV_1e3_huber",
+    "scene": "chest",
+    "tag": "NV_1e3_huber",
+    "family": "NV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__NV_1e3_median",
+    "scene": "chest",
+    "tag": "NV_1e3_median",
+    "family": "NV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__NV_1e3_sharp",
+    "scene": "chest",
+    "tag": "NV_1e3_sharp",
+    "family": "NV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__VV_1e4",
+    "scene": "chest",
+    "tag": "VV_1e4",
+    "family": "VV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__VV_1e3",
+    "scene": "chest",
+    "tag": "VV_1e3",
+    "family": "VV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__VV_1e2",
+    "scene": "chest",
+    "tag": "VV_1e2",
+    "family": "VV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__EIG_1e3",
+    "scene": "chest",
+    "tag": "EIG_1e3",
+    "family": "EIG",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__EIG_1e2",
+    "scene": "chest",
+    "tag": "EIG_1e2",
+    "family": "EIG",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__LAP_1e3",
+    "scene": "chest",
+    "tag": "LAP_1e3",
+    "family": "LAP",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__LAP_1e2",
+    "scene": "chest",
+    "tag": "LAP_1e2",
+    "family": "LAP",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__CVT_1e3",
+    "scene": "chest",
+    "tag": "CVT_1e3",
+    "family": "CVT",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__CVT_1e2",
+    "scene": "chest",
+    "tag": "CVT_1e2",
+    "family": "CVT",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__GS_0",
+    "scene": "chest",
+    "tag": "GS_0",
+    "family": "GS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__GS_2",
+    "scene": "chest",
+    "tag": "GS_2",
+    "family": "GS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__D_ent0",
+    "scene": "chest",
+    "tag": "D_ent0",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__D_entonly",
+    "scene": "chest",
+    "tag": "D_entonly",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__D_gradheavy",
+    "scene": "chest",
+    "tag": "D_gradheavy",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__D_bins3",
+    "scene": "chest",
+    "tag": "D_bins3",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__D_bins12",
+    "scene": "chest",
+    "tag": "D_bins12",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__D_ca1",
+    "scene": "chest",
+    "tag": "D_ca1",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__D_ca4",
+    "scene": "chest",
+    "tag": "D_ca4",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__D_thr500",
+    "scene": "chest",
+    "tag": "D_thr500",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__D_thr1000",
+    "scene": "chest",
+    "tag": "D_thr1000",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__D_thr1000_v5e3",
+    "scene": "chest",
+    "tag": "D_thr1000_v5e3",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__P_idw",
+    "scene": "chest",
+    "tag": "P_idw",
+    "family": "PRUNE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__P_cap03",
+    "scene": "chest",
+    "tag": "P_cap03",
+    "family": "PRUNE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__P_cap10",
+    "scene": "chest",
+    "tag": "P_cap10",
+    "family": "PRUNE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__P_hops2",
+    "scene": "chest",
+    "tag": "P_hops2",
+    "family": "PRUNE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__S_tgt0",
+    "scene": "chest",
+    "tag": "S_tgt0",
+    "family": "SAMPLE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__S_tgt30",
+    "scene": "chest",
+    "tag": "S_tgt30",
+    "family": "SAMPLE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__S_he0",
+    "scene": "chest",
+    "tag": "S_he0",
+    "family": "SAMPLE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__S_he40",
+    "scene": "chest",
+    "tag": "S_he40",
+    "family": "SAMPLE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__S_he_p2",
+    "scene": "chest",
+    "tag": "S_he_p2",
+    "family": "SAMPLE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__BF_dens",
+    "scene": "chest",
+    "tag": "BF_dens",
+    "family": "BF",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__BF_late",
+    "scene": "chest",
+    "tag": "BF_late",
+    "family": "BF",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__REF_1e3",
+    "scene": "chest",
+    "tag": "REF_1e3",
+    "family": "REF",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "chest__REF_1e2",
+    "scene": "chest",
+    "tag": "REF_1e2",
+    "family": "REF",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "chest__REF_1e3_noedge",
+    "scene": "chest",
+    "tag": "REF_1e3_noedge",
+    "family": "REF",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "chest__REFG_dens",
+    "scene": "chest",
+    "tag": "REFG_dens",
+    "family": "REFG",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "chest__REFG_prune",
+    "scene": "chest",
+    "tag": "REFG_prune",
+    "family": "REFG",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "chest__INIT_ref",
+    "scene": "chest",
+    "tag": "INIT_ref",
+    "family": "INIT",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "chest__C512",
+    "scene": "chest",
+    "tag": "C512",
+    "family": "CELLS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__C1M",
+    "scene": "chest",
+    "tag": "C1M",
+    "family": "CELLS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__C2M",
+    "scene": "chest",
+    "tag": "C2M",
+    "family": "CELLS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__P_cap01",
+    "scene": "chest",
+    "tag": "P_cap01",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__P_cap02",
+    "scene": "chest",
+    "tag": "P_cap02",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__P_cap04",
+    "scene": "chest",
+    "tag": "P_cap04",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__P_cap06",
+    "scene": "chest",
+    "tag": "P_cap06",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__P_cap08",
+    "scene": "chest",
+    "tag": "P_cap08",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__P_idw_cap03",
+    "scene": "chest",
+    "tag": "P_idw_cap03",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__P_idw_cap05",
+    "scene": "chest",
+    "tag": "P_idw_cap05",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__P_idw_cap10",
+    "scene": "chest",
+    "tag": "P_idw_cap10",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__REFG_prune_eps005",
+    "scene": "chest",
+    "tag": "REFG_prune_eps005",
+    "family": "REFG_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "chest__REFG_prune_eps020",
+    "scene": "chest",
+    "tag": "REFG_prune_eps020",
+    "family": "REFG_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "chest__REFG_prune_eps050",
+    "scene": "chest",
+    "tag": "REFG_prune_eps050",
+    "family": "REFG_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "chest__REFG_prune_eps100",
+    "scene": "chest",
+    "tag": "REFG_prune_eps100",
+    "family": "REFG_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "chest__D_bins2",
+    "scene": "chest",
+    "tag": "D_bins2",
+    "family": "DENS_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__D_bins4",
+    "scene": "chest",
+    "tag": "D_bins4",
+    "family": "DENS_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__D_bins6",
+    "scene": "chest",
+    "tag": "D_bins6",
+    "family": "DENS_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "chest__D_bins8",
+    "scene": "chest",
+    "tag": "D_bins8",
+    "family": "DENS_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__BASE_s42",
+    "scene": "pepper",
+    "tag": "BASE_s42",
+    "family": "BASE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__BASE_s43",
+    "scene": "pepper",
+    "tag": "BASE_s43",
+    "family": "BASE",
+    "seed": 43,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__BASE_s44",
+    "scene": "pepper",
+    "tag": "BASE_s44",
+    "family": "BASE",
+    "seed": 44,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__BASE_s45",
+    "scene": "pepper",
+    "tag": "BASE_s45",
+    "family": "BASE",
+    "seed": 45,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__BASE_s46",
+    "scene": "pepper",
+    "tag": "BASE_s46",
+    "family": "BASE",
+    "seed": 46,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__SMOKE_tv",
+    "scene": "pepper",
+    "tag": "SMOKE_tv",
+    "family": "SMOKE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__TV_1e4",
+    "scene": "pepper",
+    "tag": "TV_1e4",
+    "family": "TV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__TV_1e3",
+    "scene": "pepper",
+    "tag": "TV_1e3",
+    "family": "TV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__TV_1e4_area",
+    "scene": "pepper",
+    "tag": "TV_1e4_area",
+    "family": "TV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__TV_1e4_border",
+    "scene": "pepper",
+    "tag": "TV_1e4_border",
+    "family": "TV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__NV_1e4",
+    "scene": "pepper",
+    "tag": "NV_1e4",
+    "family": "NV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__NV_1e3",
+    "scene": "pepper",
+    "tag": "NV_1e3",
+    "family": "NV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__NV_1e3_huber",
+    "scene": "pepper",
+    "tag": "NV_1e3_huber",
+    "family": "NV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__NV_1e3_median",
+    "scene": "pepper",
+    "tag": "NV_1e3_median",
+    "family": "NV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__NV_1e3_sharp",
+    "scene": "pepper",
+    "tag": "NV_1e3_sharp",
+    "family": "NV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__VV_1e4",
+    "scene": "pepper",
+    "tag": "VV_1e4",
+    "family": "VV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__VV_1e3",
+    "scene": "pepper",
+    "tag": "VV_1e3",
+    "family": "VV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__VV_1e2",
+    "scene": "pepper",
+    "tag": "VV_1e2",
+    "family": "VV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__EIG_1e3",
+    "scene": "pepper",
+    "tag": "EIG_1e3",
+    "family": "EIG",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__EIG_1e2",
+    "scene": "pepper",
+    "tag": "EIG_1e2",
+    "family": "EIG",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__LAP_1e3",
+    "scene": "pepper",
+    "tag": "LAP_1e3",
+    "family": "LAP",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__LAP_1e2",
+    "scene": "pepper",
+    "tag": "LAP_1e2",
+    "family": "LAP",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__CVT_1e3",
+    "scene": "pepper",
+    "tag": "CVT_1e3",
+    "family": "CVT",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__CVT_1e2",
+    "scene": "pepper",
+    "tag": "CVT_1e2",
+    "family": "CVT",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__GS_0",
+    "scene": "pepper",
+    "tag": "GS_0",
+    "family": "GS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__GS_2",
+    "scene": "pepper",
+    "tag": "GS_2",
+    "family": "GS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__D_ent0",
+    "scene": "pepper",
+    "tag": "D_ent0",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__D_entonly",
+    "scene": "pepper",
+    "tag": "D_entonly",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__D_gradheavy",
+    "scene": "pepper",
+    "tag": "D_gradheavy",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__D_bins3",
+    "scene": "pepper",
+    "tag": "D_bins3",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__D_bins12",
+    "scene": "pepper",
+    "tag": "D_bins12",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__D_ca1",
+    "scene": "pepper",
+    "tag": "D_ca1",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__D_ca4",
+    "scene": "pepper",
+    "tag": "D_ca4",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__D_thr500",
+    "scene": "pepper",
+    "tag": "D_thr500",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__D_thr1000",
+    "scene": "pepper",
+    "tag": "D_thr1000",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__D_thr1000_v5e3",
+    "scene": "pepper",
+    "tag": "D_thr1000_v5e3",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__P_idw",
+    "scene": "pepper",
+    "tag": "P_idw",
+    "family": "PRUNE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__P_cap03",
+    "scene": "pepper",
+    "tag": "P_cap03",
+    "family": "PRUNE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__P_cap10",
+    "scene": "pepper",
+    "tag": "P_cap10",
+    "family": "PRUNE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__P_hops2",
+    "scene": "pepper",
+    "tag": "P_hops2",
+    "family": "PRUNE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__S_tgt0",
+    "scene": "pepper",
+    "tag": "S_tgt0",
+    "family": "SAMPLE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__S_tgt30",
+    "scene": "pepper",
+    "tag": "S_tgt30",
+    "family": "SAMPLE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__S_he0",
+    "scene": "pepper",
+    "tag": "S_he0",
+    "family": "SAMPLE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__S_he40",
+    "scene": "pepper",
+    "tag": "S_he40",
+    "family": "SAMPLE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__S_he_p2",
+    "scene": "pepper",
+    "tag": "S_he_p2",
+    "family": "SAMPLE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__BF_dens",
+    "scene": "pepper",
+    "tag": "BF_dens",
+    "family": "BF",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__BF_late",
+    "scene": "pepper",
+    "tag": "BF_late",
+    "family": "BF",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__REF_1e3",
+    "scene": "pepper",
+    "tag": "REF_1e3",
+    "family": "REF",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "pepper__REF_1e2",
+    "scene": "pepper",
+    "tag": "REF_1e2",
+    "family": "REF",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "pepper__REF_1e3_noedge",
+    "scene": "pepper",
+    "tag": "REF_1e3_noedge",
+    "family": "REF",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "pepper__REFG_dens",
+    "scene": "pepper",
+    "tag": "REFG_dens",
+    "family": "REFG",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "pepper__REFG_prune",
+    "scene": "pepper",
+    "tag": "REFG_prune",
+    "family": "REFG",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "pepper__INIT_ref",
+    "scene": "pepper",
+    "tag": "INIT_ref",
+    "family": "INIT",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "pepper__C512",
+    "scene": "pepper",
+    "tag": "C512",
+    "family": "CELLS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__C1M",
+    "scene": "pepper",
+    "tag": "C1M",
+    "family": "CELLS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__C2M",
+    "scene": "pepper",
+    "tag": "C2M",
+    "family": "CELLS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__P_cap01",
+    "scene": "pepper",
+    "tag": "P_cap01",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__P_cap02",
+    "scene": "pepper",
+    "tag": "P_cap02",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__P_cap04",
+    "scene": "pepper",
+    "tag": "P_cap04",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__P_cap06",
+    "scene": "pepper",
+    "tag": "P_cap06",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__P_cap08",
+    "scene": "pepper",
+    "tag": "P_cap08",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__P_idw_cap03",
+    "scene": "pepper",
+    "tag": "P_idw_cap03",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__P_idw_cap05",
+    "scene": "pepper",
+    "tag": "P_idw_cap05",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__P_idw_cap10",
+    "scene": "pepper",
+    "tag": "P_idw_cap10",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__REFG_prune_eps005",
+    "scene": "pepper",
+    "tag": "REFG_prune_eps005",
+    "family": "REFG_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "pepper__REFG_prune_eps020",
+    "scene": "pepper",
+    "tag": "REFG_prune_eps020",
+    "family": "REFG_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "pepper__REFG_prune_eps050",
+    "scene": "pepper",
+    "tag": "REFG_prune_eps050",
+    "family": "REFG_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "pepper__REFG_prune_eps100",
+    "scene": "pepper",
+    "tag": "REFG_prune_eps100",
+    "family": "REFG_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "pepper__D_bins2",
+    "scene": "pepper",
+    "tag": "D_bins2",
+    "family": "DENS_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__D_bins4",
+    "scene": "pepper",
+    "tag": "D_bins4",
+    "family": "DENS_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__D_bins6",
+    "scene": "pepper",
+    "tag": "D_bins6",
+    "family": "DENS_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "pepper__D_bins8",
+    "scene": "pepper",
+    "tag": "D_bins8",
+    "family": "DENS_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__BASE_s42",
+    "scene": "engine",
+    "tag": "BASE_s42",
+    "family": "BASE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__BASE_s43",
+    "scene": "engine",
+    "tag": "BASE_s43",
+    "family": "BASE",
+    "seed": 43,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__BASE_s44",
+    "scene": "engine",
+    "tag": "BASE_s44",
+    "family": "BASE",
+    "seed": 44,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__BASE_s45",
+    "scene": "engine",
+    "tag": "BASE_s45",
+    "family": "BASE",
+    "seed": 45,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__BASE_s46",
+    "scene": "engine",
+    "tag": "BASE_s46",
+    "family": "BASE",
+    "seed": 46,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__SMOKE_tv",
+    "scene": "engine",
+    "tag": "SMOKE_tv",
+    "family": "SMOKE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__TV_1e4",
+    "scene": "engine",
+    "tag": "TV_1e4",
+    "family": "TV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__TV_1e3",
+    "scene": "engine",
+    "tag": "TV_1e3",
+    "family": "TV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__TV_1e4_area",
+    "scene": "engine",
+    "tag": "TV_1e4_area",
+    "family": "TV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__TV_1e4_border",
+    "scene": "engine",
+    "tag": "TV_1e4_border",
+    "family": "TV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__NV_1e4",
+    "scene": "engine",
+    "tag": "NV_1e4",
+    "family": "NV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__NV_1e3",
+    "scene": "engine",
+    "tag": "NV_1e3",
+    "family": "NV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__NV_1e3_huber",
+    "scene": "engine",
+    "tag": "NV_1e3_huber",
+    "family": "NV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__NV_1e3_median",
+    "scene": "engine",
+    "tag": "NV_1e3_median",
+    "family": "NV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__NV_1e3_sharp",
+    "scene": "engine",
+    "tag": "NV_1e3_sharp",
+    "family": "NV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__VV_1e4",
+    "scene": "engine",
+    "tag": "VV_1e4",
+    "family": "VV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__VV_1e3",
+    "scene": "engine",
+    "tag": "VV_1e3",
+    "family": "VV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__VV_1e2",
+    "scene": "engine",
+    "tag": "VV_1e2",
+    "family": "VV",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__EIG_1e3",
+    "scene": "engine",
+    "tag": "EIG_1e3",
+    "family": "EIG",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__EIG_1e2",
+    "scene": "engine",
+    "tag": "EIG_1e2",
+    "family": "EIG",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__LAP_1e3",
+    "scene": "engine",
+    "tag": "LAP_1e3",
+    "family": "LAP",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__LAP_1e2",
+    "scene": "engine",
+    "tag": "LAP_1e2",
+    "family": "LAP",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__CVT_1e3",
+    "scene": "engine",
+    "tag": "CVT_1e3",
+    "family": "CVT",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__CVT_1e2",
+    "scene": "engine",
+    "tag": "CVT_1e2",
+    "family": "CVT",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__GS_0",
+    "scene": "engine",
+    "tag": "GS_0",
+    "family": "GS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__GS_2",
+    "scene": "engine",
+    "tag": "GS_2",
+    "family": "GS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__D_ent0",
+    "scene": "engine",
+    "tag": "D_ent0",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__D_entonly",
+    "scene": "engine",
+    "tag": "D_entonly",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__D_gradheavy",
+    "scene": "engine",
+    "tag": "D_gradheavy",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__D_bins3",
+    "scene": "engine",
+    "tag": "D_bins3",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__D_bins12",
+    "scene": "engine",
+    "tag": "D_bins12",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__D_ca1",
+    "scene": "engine",
+    "tag": "D_ca1",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__D_ca4",
+    "scene": "engine",
+    "tag": "D_ca4",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__D_thr500",
+    "scene": "engine",
+    "tag": "D_thr500",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__D_thr1000",
+    "scene": "engine",
+    "tag": "D_thr1000",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__D_thr1000_v5e3",
+    "scene": "engine",
+    "tag": "D_thr1000_v5e3",
+    "family": "DENS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__P_idw",
+    "scene": "engine",
+    "tag": "P_idw",
+    "family": "PRUNE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__P_cap03",
+    "scene": "engine",
+    "tag": "P_cap03",
+    "family": "PRUNE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__P_cap10",
+    "scene": "engine",
+    "tag": "P_cap10",
+    "family": "PRUNE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__P_hops2",
+    "scene": "engine",
+    "tag": "P_hops2",
+    "family": "PRUNE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__S_tgt0",
+    "scene": "engine",
+    "tag": "S_tgt0",
+    "family": "SAMPLE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__S_tgt30",
+    "scene": "engine",
+    "tag": "S_tgt30",
+    "family": "SAMPLE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__S_he0",
+    "scene": "engine",
+    "tag": "S_he0",
+    "family": "SAMPLE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__S_he40",
+    "scene": "engine",
+    "tag": "S_he40",
+    "family": "SAMPLE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__S_he_p2",
+    "scene": "engine",
+    "tag": "S_he_p2",
+    "family": "SAMPLE",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__BF_dens",
+    "scene": "engine",
+    "tag": "BF_dens",
+    "family": "BF",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__BF_late",
+    "scene": "engine",
+    "tag": "BF_late",
+    "family": "BF",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__REF_1e3",
+    "scene": "engine",
+    "tag": "REF_1e3",
+    "family": "REF",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "engine__REF_1e2",
+    "scene": "engine",
+    "tag": "REF_1e2",
+    "family": "REF",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "engine__REF_1e3_noedge",
+    "scene": "engine",
+    "tag": "REF_1e3_noedge",
+    "family": "REF",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "engine__REFG_dens",
+    "scene": "engine",
+    "tag": "REFG_dens",
+    "family": "REFG",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "engine__REFG_prune",
+    "scene": "engine",
+    "tag": "REFG_prune",
+    "family": "REFG",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "engine__INIT_ref",
+    "scene": "engine",
+    "tag": "INIT_ref",
+    "family": "INIT",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "engine__C512",
+    "scene": "engine",
+    "tag": "C512",
+    "family": "CELLS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__C1M",
+    "scene": "engine",
+    "tag": "C1M",
+    "family": "CELLS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__C2M",
+    "scene": "engine",
+    "tag": "C2M",
+    "family": "CELLS",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__P_cap01",
+    "scene": "engine",
+    "tag": "P_cap01",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__P_cap02",
+    "scene": "engine",
+    "tag": "P_cap02",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__P_cap04",
+    "scene": "engine",
+    "tag": "P_cap04",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__P_cap06",
+    "scene": "engine",
+    "tag": "P_cap06",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__P_cap08",
+    "scene": "engine",
+    "tag": "P_cap08",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__P_idw_cap03",
+    "scene": "engine",
+    "tag": "P_idw_cap03",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__P_idw_cap05",
+    "scene": "engine",
+    "tag": "P_idw_cap05",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__P_idw_cap10",
+    "scene": "engine",
+    "tag": "P_idw_cap10",
+    "family": "PRUNE_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__REFG_prune_eps005",
+    "scene": "engine",
+    "tag": "REFG_prune_eps005",
+    "family": "REFG_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "engine__REFG_prune_eps020",
+    "scene": "engine",
+    "tag": "REFG_prune_eps020",
+    "family": "REFG_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "engine__REFG_prune_eps050",
+    "scene": "engine",
+    "tag": "REFG_prune_eps050",
+    "family": "REFG_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "engine__REFG_prune_eps100",
+    "scene": "engine",
+    "tag": "REFG_prune_eps100",
+    "family": "REFG_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": true
+  },
+  {
+    "file_tag": "engine__D_bins2",
+    "scene": "engine",
+    "tag": "D_bins2",
+    "family": "DENS_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__D_bins4",
+    "scene": "engine",
+    "tag": "D_bins4",
+    "family": "DENS_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__D_bins6",
+    "scene": "engine",
+    "tag": "D_bins6",
+    "family": "DENS_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  },
+  {
+    "file_tag": "engine__D_bins8",
+    "scene": "engine",
+    "tag": "D_bins8",
+    "family": "DENS_GRID",
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "needs_reference": false
+  }
+]

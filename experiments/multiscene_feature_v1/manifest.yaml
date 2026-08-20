@@ -1,0 +1,109 @@
+name: multiscene_feature_v1
+purpose: >
+  Screen every pre-existing Stage-B feature arm from sweep_revalidate_v1 on
+  three representative 256-cubed scenes, then fill local hyperparameter gaps
+  around the confirmed 256k winners. This is exhaustive one-factor coverage,
+  not an infeasible Cartesian product of continuous controls.
+source_manifest: experiments/sweep_revalidate_v1/manifest.yaml
+base_config: configs/fixed_final/256k.yaml
+output_prefix: multiscene_feature_v1
+seeds:
+  baseline: [42, 43, 44, 45, 46]
+  screen: 42
+smoke_source_tag: SMOKE_tv
+scenes:
+  chest:
+    data_path: r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone
+    class: medical
+  pepper:
+    data_path: r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone
+    class: organic
+  engine:
+    data_path: r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone
+    class: hard-surface
+# These are all 50 one-factor Stage-B arms in the source manifest. The source
+# remains authoritative for their overrides and activation assertions.
+source_stage_b_tags:
+  - TV_1e4
+  - TV_1e3
+  - TV_1e4_area
+  - TV_1e4_border
+  - NV_1e4
+  - NV_1e3
+  - NV_1e3_huber
+  - NV_1e3_median
+  - NV_1e3_sharp
+  - VV_1e4
+  - VV_1e3
+  - VV_1e2
+  - EIG_1e3
+  - EIG_1e2
+  - LAP_1e3
+  - LAP_1e2
+  - CVT_1e3
+  - CVT_1e2
+  - GS_0
+  - GS_2
+  - D_ent0
+  - D_entonly
+  - D_gradheavy
+  - D_bins3
+  - D_bins12
+  - D_ca1
+  - D_ca4
+  - D_thr500
+  - D_thr1000
+  - D_thr1000_v5e3
+  - P_idw
+  - P_cap03
+  - P_cap10
+  - P_hops2
+  - S_tgt0
+  - S_tgt30
+  - S_he0
+  - S_he40
+  - S_he_p2
+  - BF_dens
+  - BF_late
+  - REF_1e3
+  - REF_1e2
+  - REF_1e3_noedge
+  - REFG_dens
+  - REFG_prune
+  - INIT_ref
+  - C512
+  - C1M
+  - C2M
+# Targeted local grids; these add settings absent from the source screen.
+extra_arms:
+  - {tag: P_cap01, family: PRUNE_GRID, overrides: {redundancy_cap: 0.01}}
+  - {tag: P_cap02, family: PRUNE_GRID, overrides: {redundancy_cap: 0.02}}
+  - {tag: P_cap04, family: PRUNE_GRID, overrides: {redundancy_cap: 0.04}}
+  - {tag: P_cap06, family: PRUNE_GRID, overrides: {redundancy_cap: 0.06}}
+  - {tag: P_cap08, family: PRUNE_GRID, overrides: {redundancy_cap: 0.08}}
+  - {tag: P_idw_cap03, family: PRUNE_GRID, overrides: {prune_variance_criterion: false, redundancy_cap: 0.03}}
+  - {tag: P_idw_cap05, family: PRUNE_GRID, overrides: {prune_variance_criterion: false, redundancy_cap: 0.05}}
+  - {tag: P_idw_cap10, family: PRUNE_GRID, overrides: {prune_variance_criterion: false, redundancy_cap: 0.10}}
+  - {tag: REFG_prune_eps005, family: REFG_GRID, overrides: {ref_volume_path: __SCENE_REF_NPY__, ref_guided_pruning: true, ref_guided_eps: 0.005}}
+  - {tag: REFG_prune_eps020, family: REFG_GRID, overrides: {ref_volume_path: __SCENE_REF_NPY__, ref_guided_pruning: true, ref_guided_eps: 0.020}}
+  - {tag: REFG_prune_eps050, family: REFG_GRID, overrides: {ref_volume_path: __SCENE_REF_NPY__, ref_guided_pruning: true, ref_guided_eps: 0.050}}
+  - {tag: REFG_prune_eps100, family: REFG_GRID, overrides: {ref_volume_path: __SCENE_REF_NPY__, ref_guided_pruning: true, ref_guided_eps: 0.100}}
+  - {tag: D_bins2, family: DENS_GRID, overrides: {entropy_bins: 2}}
+  - {tag: D_bins4, family: DENS_GRID, overrides: {entropy_bins: 4}}
+  - {tag: D_bins6, family: DENS_GRID, overrides: {entropy_bins: 6}}
+  - {tag: D_bins8, family: DENS_GRID, overrides: {entropy_bins: 8}}
+non_combinable_features:
+  thin_surface: >
+    Thin-surface/independent-side modes retain their own gated LC64-AIR
+    protocol; they cannot join this scalar-volume screen without replacing
+    its side-map evaluator and gate criteria.
+  gaussian: >
+    Gaussian mode has separate optimizer/state semantics and needs a
+    standalone baseline before it can be compared to scalar RadFoam.
+coverage:
+  smoke_runs: 3
+  baseline_runs: 15
+  source_feature_runs: 150
+  extra_grid_runs: 48
+  total_initial_runs: 213
+  total_configs: 216
