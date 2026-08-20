@@ -7,7 +7,9 @@ Stage-C confirmations + 6 matched-host Stage-D runs), all scored through the
 corrected evaluator. Eight Stage-C candidates clear the precommitted
 two-standard-deviation rule. `REFG_prune` is the Stage-C PSNR winner, but
 its 512k result does **not** retain a significant PSNR improvement over the
-matched 512k baseline; the low-budget-artifact hypothesis survives.
+matched 512k baseline. This is evidence that **REFG_prune's** gain is a
+low-budget artifact; `P_idw` and `P_cap03`, the other confirmed PSNR winners,
+were not re-tested at 512k.
 
 The earlier worker-harness outage is resolved. During it, the connector
 reported `runtime: failed to create new OS thread (have 7 already; errno=11)
@@ -258,9 +260,11 @@ the fixed reference signal for the REFG arm.
 `REFG_prune` is nominally +0.1176 dB at 512k, but the matched baseline's
 $2\sigma_\mathrm{PSNR}=0.2710$ dB, so it does not meet the same
 precommitted significance rule that promoted it from Stage C. Chamfer is
-also worse by 0.0873. **Verdict: the 256k PSNR win does not survive the 512k
-re-test; the evidence supports a low-budget artifact, not a scalable
-improvement.**
+also worse by 0.0873. **Verdict: REFG_prune's 256k PSNR win does not survive
+the 512k re-test; for this arm, the evidence supports a low-budget artifact,
+not a scalable improvement.** `P_idw` and `P_cap03` also cleared the Stage-C
+PSNR bar (35.1807 and 35.1548 dB respectively) and remain the obvious
+512k follow-ups; Stage D did not test them.
 
 Two initial `D_REFG_prune_s44/s45` executions on `KW60995` completed after
 a checksummed transfer of `BASE_s42`, but were excluded from the comparison:
