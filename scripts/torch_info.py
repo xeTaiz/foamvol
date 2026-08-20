@@ -1,8 +1,10 @@
 import sys
-import sysconfig
 import importlib.util
+from pathlib import Path
 
-lib_path = sysconfig.get_path("purelib")
+torch_spec = importlib.util.find_spec("torch")
+assert torch_spec is not None and torch_spec.origin is not None, "Could not find torch"
+torch_dir = Path(torch_spec.origin).parent
 
 def import_module_from_path(module_name, file_path):
     spec = importlib.util.spec_from_file_location(module_name, file_path)
@@ -10,7 +12,7 @@ def import_module_from_path(module_name, file_path):
     spec.loader.exec_module(module)
     return module
 
-file_path = f"{lib_path}/torch/version.py"
+file_path = torch_dir / "version.py"
 module = import_module_from_path("version", file_path)
 
 if sys.argv[1] == "torch":
