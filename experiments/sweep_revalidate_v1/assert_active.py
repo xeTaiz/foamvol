@@ -73,10 +73,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", required=True, help="Run output directory")
     parser.add_argument("--config", required=True, help="Path to the arm's config YAML")
+    parser.add_argument("--tag", help="Manifest arm tag; defaults to the config filename")
     args = parser.parse_args()
 
     run_dir = args.run
-    tag = os.path.splitext(os.path.basename(args.config))[0]
+    tag = args.tag or os.path.splitext(os.path.basename(args.config))[0]
 
     manifest = load_manifest()
     arm = find_arm(manifest, tag)
