@@ -1,10 +1,10 @@
 execute_process(
-  COMMAND python ${CMAKE_SOURCE_DIR}/scripts/torch_info.py torch
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/torch_info.py torch
   OUTPUT_VARIABLE TORCH_VERSION
   OUTPUT_STRIP_TRAILING_WHITESPACE)
 
 execute_process(
-  COMMAND python ${CMAKE_SOURCE_DIR}/scripts/torch_info.py cuda
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/torch_info.py cuda
   OUTPUT_VARIABLE TORCH_CUDA_VERSION
   OUTPUT_STRIP_TRAILING_WHITESPACE)
 
