@@ -2,14 +2,32 @@
 
 ## Status
 
-Stage A and Stage B are complete (55 runs: 5 baseline + 50 screen arms, all scored
-through the corrected evaluator). Stage C (3-replicate confirmation of the 11
-Stage-B screening passes, 33 runs) trained to completion — 32 of 33 replicate
-runs reached `DONE` before a worker-harness connectivity outage on `KW60996`
-interrupted result retrieval for the last arm (`S_he40_s44`). This document
-will be updated with the Stage C aggregate table and Stage D once connectivity
-is restored and that arm is confirmed/re-run. Everything below this line is
-final and not expected to change.
+Stage A and Stage B are complete and final (55 runs: 5 baseline + 50 screen
+arms, all scored through the corrected evaluator; see tables below).
+
+**Stage C is blocked, not complete.** All 33 replicate training runs were
+launched; job-completion timestamps captured before an infrastructure
+outage confirm 32 of 33 reached `DONE` (all except `S_he40_s44`, last
+observed mid-training). However, the run artifacts live only on
+`KW60996`'s disk, and retrieving them (to run `summarize.py` or even
+`download_file` a single marker) has been unreachable since: every
+`wh_dispatch` call to `KW60996` and `KW60995` fails, and a direct
+`download_file` probe surfaces the underlying cause verbatim —
+`SSH download failed: runtime: failed to create new OS thread (have 7
+already; errno=11) ... fatal error: newosproc` — a host-level OS-thread/
+process-limit exhaustion in the connector, not a problem in this repo, the
+training runs, or the sweep scaffold. Two `wh_admin_restart` triggers on
+`KW60996` and >25 retries over ~100 minutes did not clear it. No Stage-C
+numeric result (not even a single `eval_vol.json`) has been retrieved, so
+the Stage-C aggregate table, the Stage-D 512k re-test, and the legacy
+`summary.csv` cross-reference cannot be produced right now. **Everything
+below this line is complete and final.** Once connectivity to `KW60996` is
+restored, the remaining work is mechanical: run
+`experiments/sweep_revalidate_v1/summarize.py` there (it already reads all
+90 manifest arms, including the 33 Stage-C tags), confirm/re-run
+`S_he40_s44` if it did not finish, compute mean±sd per arm against the 2σ
+bar, launch Stage D for the best confirmed arm, and append those sections
+here.
 
 ## Stage A — noise floor
 
