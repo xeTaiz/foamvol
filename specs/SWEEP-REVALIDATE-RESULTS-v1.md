@@ -2,32 +2,26 @@
 
 ## Status
 
-Stage A and Stage B are complete and final (55 runs: 5 baseline + 50 screen
-arms, all scored through the corrected evaluator; see tables below).
+Stage A, Stage B, and Stage C are complete and final: 88 completed runs
+(5 baseline + 50 screen + 33 Stage-C confirmations), all scored through the
+corrected evaluator. Eight Stage-C arms clear the precommitted two-standard-
+deviation rule; `REFG_prune` is the single best by mean volume PSNR and is
+therefore the Stage-D candidate.
 
-**Stage C is blocked, not complete.** All 33 replicate training runs were
-launched; job-completion timestamps captured before an infrastructure
-outage confirm 32 of 33 reached `DONE` (all except `S_he40_s44`, last
-observed mid-training). However, the run artifacts live only on
-`KW60996`'s disk, and retrieving them (to run `summarize.py` or even
-`download_file` a single marker) has been unreachable since: every
-`wh_dispatch` call to `KW60996` and `KW60995` fails, and a direct
-`download_file` probe surfaces the underlying cause verbatim —
-`SSH download failed: runtime: failed to create new OS thread (have 7
-already; errno=11) ... fatal error: newosproc` — a host-level OS-thread/
-process-limit exhaustion in the connector, not a problem in this repo, the
-training runs, or the sweep scaffold. Two `wh_admin_restart` triggers on
-`KW60996` and >25 retries over ~100 minutes did not clear it. No Stage-C
-numeric result (not even a single `eval_vol.json`) has been retrieved, so
-the Stage-C aggregate table, the Stage-D 512k re-test, and the legacy
-`summary.csv` cross-reference cannot be produced right now. **Everything
-below this line is complete and final.** Once connectivity to `KW60996` is
-restored, the remaining work is mechanical: run
-`experiments/sweep_revalidate_v1/summarize.py` there (it already reads all
-90 manifest arms, including the 33 Stage-C tags), confirm/re-run
-`S_he40_s44` if it did not finish, compute mean±sd per arm against the 2σ
-bar, launch Stage D for the best confirmed arm, and append those sections
-here.
+**Stage D is running.** Three 512k plain-baseline and three 512k
+`REFG_prune` replicates (seeds 43/44/45) were launched after the Stage-C
+decision. `REFG_prune` uses the fixed Stage-A `BASE_s42` SS4 reconstruction
+as its reference signal, exactly as it did at 256k. The source volume was
+copied to `KW60995` by chunked, checksummed transfer before its two
+replicates were launched: source and destination SHA-256 are both
+`d506b3ce1e93fbb774f91affec79e8a37b6dbafd22f4be9f6daefe0a0e633f59`.
+
+The earlier worker-harness outage is resolved. During it, the connector
+reported `runtime: failed to create new OS thread (have 7 already; errno=11)
+... fatal error: newosproc`; this blocked result retrieval despite completed
+training. The recovered connection confirmed all 33 Stage-C markers,
+including `S_he40_s44`, then retrieved every evaluation JSON. The Stage-D
+aggregate and legacy-summary cross-reference remain pending below.
 
 ## Stage A — noise floor
 
@@ -224,9 +218,53 @@ Immediate caveats visible even before Stage C:
   restarts because `/code` is a durable volume; only in-flight training
   processes were lost.
 
-## Stage C, Stage D, write-up remainder
+## Stage C — confirmation (11 candidates × seeds 43/44/45)
 
-Pending: Stage C aggregate (mean ± sd over `seed 43/44/45` for each of the 11
-arms above, confirmed against the `2σ` bar), the single best arm carried into
-Stage D (512k re-test), and the legacy `summary.csv` cross-reference. To be
-appended once `KW60996` connectivity is restored.
+Stage-A baseline: $34.8725 \pm 0.0655$ dB PSNR and
+$1.5388 \pm 0.0759$ chamfer ($n=5$). The precommitted confirmation bars are
+$0.1311$ dB PSNR or $0.1518$ chamfer improvement; chamfer deltas below are
+`baseline mean − candidate mean`, so positive is favourable.
+
+| arm | PSNR mean ± sd | ΔPSNR | chamfer mean ± sd | Δchamfer | Stage-C verdict |
+|---|---:|---:|---:|---:|---|
+| C1M | 34.5899 ± 0.0377 | -0.2826 | 1.0378 ± 0.0558 | +0.5010 | **win (chamfer)** |
+| C2M | 33.7415 ± 0.0288 | -1.1310 | 1.0437 ± 0.0416 | +0.4951 | **win (chamfer)** |
+| C512 | 34.8307 ± 0.2635 | -0.0418 | 1.1637 ± 0.0409 | +0.3751 | **win (chamfer)** |
+| D_bins3 | 34.9352 ± 0.0466 | +0.0628 | 1.2418 ± 0.0245 | +0.2970 | **win (chamfer)** |
+| D_entonly | 34.7355 ± 0.0884 | -0.1370 | 1.2892 ± 0.0809 | +0.2496 | **win (chamfer)** |
+| NV_1e4 | 34.9317 ± 0.0214 | +0.0593 | 1.5100 ± 0.0801 | +0.0288 | noise |
+| P_cap03 | 35.1548 ± 0.0231 | +0.2823 | 1.5281 ± 0.0751 | +0.0107 | **win (PSNR)** |
+| P_idw | 35.1807 ± 0.0750 | +0.3082 | 1.6090 ± 0.0268 | -0.0702 | **win (PSNR)** |
+| REFG_prune | **35.1991 ± 0.0594** | **+0.3266** | 1.4892 ± 0.0166 | +0.0496 | **win (PSNR; Stage-D winner)** |
+| S_he40 | 34.6524 ± 0.3867 | -0.2201 | 1.5180 ± 0.0159 | +0.0208 | noise |
+| TV_1e4 | 34.9854 ± 0.0551 | +0.1129 | 1.5111 ± 0.0234 | +0.0277 | noise |
+
+Eight candidates replicate a result beyond the two-sigma bar. The five
+chamfer wins are not interchangeable with a PSNR win: all three CELLS arms
+and `D_entonly` lose PSNR, while `D_bins3` remains PSNR-neutral. `P_cap03`,
+`P_idw`, and `REFG_prune` clear the PSNR bar; `REFG_prune` is the unique
+highest mean-PSNR arm, so Stage D tests it rather than selecting on a
+single-seed screen outcome.
+
+`NV_1e4`, `S_he40`, and `TV_1e4` fail confirmation. In particular, the
+borderline Stage-B `NV_1e4` chamfer result vanishes under replication, and
+the `S_he40_s43` low outlier ($34.2081$ dB) makes the sample-family result
+plainly non-robust.
+
+## Stage D — 512k re-test
+
+Running: `D_BASE_s43..45` and `D_REFG_prune_s43..45`. The winner must retain
+its PSNR advantage against the matched 512k baseline before it can reject
+the low-budget-artifact hypothesis.
+
+## Legacy `summary.csv` cross-reference
+
+`KW60898:/data_ibex_c2324/foamvol/output/` is reachable again and contains
+historical `summary.csv` files for `sweep12`, `sweep13`, `sweep15`, and
+`sweep16`. Their arm identifiers (for example `A5-sv05`, `C1-ss01`, and
+`B4-sv-flat`) do not map to this manifest's independently named arms, and
+the files omit the corresponding resolved configurations. No claimed
+old-to-new pairing is therefore defensible. Their `vol_raw_psnr` fields
+remain deliberately unquoted rather than fabricating a correspondence; in
+any event they use the older, misregistered single-sample evaluator and
+must never be differenced from the corrected values above.
