@@ -59,6 +59,15 @@ def main() -> int:
     signature_config = {
         key: value for key, value in config.items() if key != "experiment_name"
     }
+    ref_volume_value = str(config.get("ref_volume_path", ""))
+    ref_volume_path = Path(ref_volume_value) if ref_volume_value else None
+    if ref_volume_path is not None and not ref_volume_path.is_absolute():
+        ref_volume_path = REPO / ref_volume_path
+    ref_volume_sha256 = (
+        sha256_file(ref_volume_path)
+        if ref_volume_path is not None and ref_volume_path.is_file()
+        else None
+    )
     state = next(
         (name for name in ("FAILED", "DONE") if (args.run / name).is_file()),
         "NONTERMINAL",
@@ -78,6 +87,7 @@ def main() -> int:
         "config_path": str(args.config),
         "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
         "repeat_signature_sha256": canonical_sha(signature_config),
+        "ref_volume_sha256": ref_volume_sha256,
         "git_commit": command_output("git", "rev-parse", "HEAD"),
         "hostname": socket.gethostname(),
         "gpu_index": args.gpu_index,

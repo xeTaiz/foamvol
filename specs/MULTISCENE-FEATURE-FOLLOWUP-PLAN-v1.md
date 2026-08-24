@@ -141,6 +141,15 @@ Report PSNR and Chamfer range and sample sd, config hash, commit, GPU,
 Torch/CUDA versions, and exact achieved cell count. Do not promote Stage-1
 margins until this gate quantifies the fixed-seed runtime floor.
 
+Stage 0 completed all 15 runs. Per the launch decision, engine `S0_BASE_r2`
+on `gpu609-02` (34.1061 dB) is excluded as an outlier; the other four engine
+runs give PSNR sd 0.05236 dB and Chamfer sd 0.002915. The resulting Stage-1
+engine floors are 0.15 dB PSNR (the protocol minimum dominates `2 × sd`) and
+0.005829 Chamfer. Chest and pepper retain their five-run Stage-0 floors:
+0.150425/0.162207 and 0.157908/0.026762 for PSNR/Chamfer, respectively. This
+exclusion and all exact values are frozen in `stage1_manifest.yaml` before
+Stage 1 begins.
+
 ## Stage 1 — replicated main-effect matrix
 
 Every setting runs on all three scenes with seeds 42, 43, and 44.

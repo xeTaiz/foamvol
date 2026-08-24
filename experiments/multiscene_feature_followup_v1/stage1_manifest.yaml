@@ -1,0 +1,50 @@
+version: 1
+base_config: configs/fixed_final/256k.yaml
+output_prefix: multiscene_feature_followup_v1/stage1
+seeds: [42, 43, 44]
+scenes:
+  chest:
+    data_path: r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone
+    ref_volume_path: output/multiscene_feature_v1/chest/BASE_s42/volume_hard_ss4.npy
+  pepper:
+    data_path: r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone
+    ref_volume_path: output/multiscene_feature_v1/pepper/BASE_s42/volume_hard_ss4.npy
+  engine:
+    data_path: r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone
+    ref_volume_path: output/multiscene_feature_v1/engine/BASE_s42/volume_hard_ss4.npy
+stage0_floors:
+  chest: {psnr_sd: 0.07521262340218773, psnr: 0.15042524680437547, chamfer_sd: 0.08110371708500823, chamfer: 0.16220743417001646}
+  pepper: {psnr_sd: 0.0789540785557835, psnr: 0.157908157111567, chamfer_sd: 0.013381063678842309, chamfer: 0.026762127357684618}
+  engine:
+    psnr_sd: 0.05236370866891691
+    psnr: 0.15
+    chamfer_sd: 0.0029147368222713793
+    chamfer: 0.0058294736445427585
+    excluded_repeat: S0_BASE_r2
+    exclusion_reason: user-directed removal of the gpu609-02 fixed-seed outlier
+settings:
+  - {tag: F_BASE, family: control, overrides: {}}
+  - {tag: F_CAP015, family: variance_cap, overrides: {redundancy_cap: 0.015}}
+  - {tag: F_CAP020, family: variance_cap, overrides: {redundancy_cap: 0.02}}
+  - {tag: F_CAP025, family: variance_cap, overrides: {redundancy_cap: 0.025}}
+  - {tag: F_CAP030, family: variance_cap, overrides: {redundancy_cap: 0.03}}
+  - {tag: F_IDW005, family: actual_idw, overrides: {prune_variance_criterion: false, redundancy_threshold: 0.005, redundancy_cap: 0.02}}
+  - {tag: F_IDW010, family: actual_idw, overrides: {prune_variance_criterion: false, redundancy_threshold: 0.01, redundancy_cap: 0.02}}
+  - {tag: F_IDW020, family: actual_idw, overrides: {prune_variance_criterion: false, redundancy_threshold: 0.02, redundancy_cap: 0.02}}
+  - {tag: F_NOPRUNE, family: no_redundancy_prune, overrides: {prune_variance_criterion: false, redundancy_threshold: 0.0, redundancy_cap: 0.0}}
+  - {tag: F_REFG_C02_A5, family: refg, overrides: {ref_volume_path: __SCENE_REF_NPY__, ref_guided_pruning: true, redundancy_cap: 0.02, ref_volume_edge_alpha: 5, ref_volume_blur_sigma: 0.0}}
+  - {tag: F_REFG_C02_A10, family: refg, overrides: {ref_volume_path: __SCENE_REF_NPY__, ref_guided_pruning: true, redundancy_cap: 0.02, ref_volume_edge_alpha: 10, ref_volume_blur_sigma: 0.0}}
+  - {tag: F_REFG_C02_A20, family: refg, overrides: {ref_volume_path: __SCENE_REF_NPY__, ref_guided_pruning: true, redundancy_cap: 0.02, ref_volume_edge_alpha: 20, ref_volume_blur_sigma: 0.0}}
+  - {tag: F_REFG_C03_A10, family: refg, overrides: {ref_volume_path: __SCENE_REF_NPY__, ref_guided_pruning: true, redundancy_cap: 0.03, ref_volume_edge_alpha: 10, ref_volume_blur_sigma: 0.0}}
+  - {tag: F_REFG_C02_A10_B1, family: refg, overrides: {ref_volume_path: __SCENE_REF_NPY__, ref_guided_pruning: true, redundancy_cap: 0.02, ref_volume_edge_alpha: 10, ref_volume_blur_sigma: 1.0}}
+  - {tag: F_TV_3e4, family: tv, overrides: {tv_weight: 3e-4}}
+  - {tag: F_TV_1e3, family: tv, overrides: {tv_weight: 1e-3}}
+  - {tag: F_TV_3e3, family: tv, overrides: {tv_weight: 3e-3}}
+  - {tag: F_BINS3, family: entropy_geometry, overrides: {entropy_bins: 3}}
+  - {tag: F_ENT60_B3, family: entropy_geometry, overrides: {gradient_fraction: 0.2, idw_fraction: 0.2, entropy_fraction: 0.6, entropy_bins: 3}}
+  - {tag: F_ENT80_B3, family: entropy_geometry, overrides: {gradient_fraction: 0.1, idw_fraction: 0.1, entropy_fraction: 0.8, entropy_bins: 3}}
+coverage:
+  settings: 20
+  scenes: 3
+  seeds: 3
+  total_configs: 180

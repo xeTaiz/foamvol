@@ -1,0 +1,11 @@
+[
+  {"scene": "chest", "seed": 42, "worker": "gpu211-18", "worker_id": "3cfc558b-c162-411f-9ca1-b792cc071bad", "gpu_index": 0},
+  {"scene": "chest", "seed": 43, "worker": "gpu213-06", "worker_id": "cfd5ff62-851e-49a8-b005-738582699552", "gpu_index": 0},
+  {"scene": "chest", "seed": 44, "worker": "gpu214-10", "worker_id": "bab1e8bc-41bd-432b-b3cb-2a6afb7e3324", "gpu_index": 0},
+  {"scene": "pepper", "seed": 42, "worker": "gpu212-18", "worker_id": "70f2f627-1597-4840-8adf-81780d4fe1e6", "gpu_index": 0},
+  {"scene": "pepper", "seed": 43, "worker": "gpu213-10", "worker_id": "da074eb2-ef5f-4315-af60-cb62f3d29041", "gpu_index": 0},
+  {"scene": "pepper", "seed": 44, "worker": "gpu214-14", "worker_id": "65db6883-4d5d-44f3-af49-be719ebec8db", "gpu_index": 0},
+  {"scene": "engine", "seed": 42, "worker": "gpu213-02", "worker_id": "3386151b-5994-4809-b3bd-a5c92d099bf0", "gpu_index": 0},
+  {"scene": "engine", "seed": 43, "worker": "gpu213-18", "worker_id": "9e9e5cc1-9c85-4817-b21a-37777a490058", "gpu_index": 0},
+  {"scene": "engine", "seed": 44, "worker": "gpu609-03", "worker_id": "d4bc407c-1ef2-4b96-a114-5f2ddeda9d75", "gpu_index": 0}
+]
