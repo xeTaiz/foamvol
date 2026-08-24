@@ -27,6 +27,16 @@ for ARM in "${ARMS[@]}"; do
     CFG_DIR="$CFG_DIR_REL" REPO="$REPO" PY="$PY" \
         "$SHARED_RUNNER" "$GPU" "$ARM"
 
+    TAG="${ARM#*__}"
+    TAG="${TAG%_s[0-9]*}"
+    if [ -f "$RUN/DONE" ]; then
+        if ! "$PY" "$HERE/assert_stage1_active.py" \
+                --run "$RUN" --config "$CFG" --tag "$TAG" >>"$RUN/run.log" 2>&1; then
+            rm -f "$RUN/DONE"
+            touch "$RUN/FAILED"
+        fi
+    fi
+
     "$PY" "$HERE/record_provenance.py" \
         --arm "$ARM" \
         --config "$CFG" \
