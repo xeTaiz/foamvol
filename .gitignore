@@ -21,3 +21,4 @@ src/radfoam/*.so
 *.png
 *.sif
 .ipynb_checkpoints
+.pi-subagents/artifacts
