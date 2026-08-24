@@ -1,0 +1,14 @@
+version: 1
+base_config: configs/fixed_final/256k.yaml
+output_prefix: multiscene_feature_followup_v1/stage0
+seed: 42
+repeats: 5
+scenes:
+  chest:
+    data_path: r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone
+  pepper:
+    data_path: r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone
+  engine:
+    data_path: r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone
+coverage:
+  total_configs: 15

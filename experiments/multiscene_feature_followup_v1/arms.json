@@ -1,0 +1,167 @@
+[
+  {
+    "file_tag": "chest__S0_BASE_r1",
+    "scene": "chest",
+    "tag": "S0_BASE_r1",
+    "repeat": 1,
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "experiment_name": "multiscene_feature_followup_v1/stage0/chest/S0_BASE_r1",
+    "config_sha256": "9da9e421680d3275a53bae5a7ca15e0e9a2a653691f1eddee4d96c4d76dce021",
+    "repeat_signature_sha256": "e5747474e9c26e114e2e3e3f8187772c353534f41cbf4536dd5b5d5bb1e2e401"
+  },
+  {
+    "file_tag": "chest__S0_BASE_r2",
+    "scene": "chest",
+    "tag": "S0_BASE_r2",
+    "repeat": 2,
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "experiment_name": "multiscene_feature_followup_v1/stage0/chest/S0_BASE_r2",
+    "config_sha256": "50a18e94dacb6c0f6624662c01bc76a705f8aecaaa9d5427e5a60f6aca511c5f",
+    "repeat_signature_sha256": "e5747474e9c26e114e2e3e3f8187772c353534f41cbf4536dd5b5d5bb1e2e401"
+  },
+  {
+    "file_tag": "chest__S0_BASE_r3",
+    "scene": "chest",
+    "tag": "S0_BASE_r3",
+    "repeat": 3,
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "experiment_name": "multiscene_feature_followup_v1/stage0/chest/S0_BASE_r3",
+    "config_sha256": "167a73ff7c8d25cc6976859f8434de5e89b2355bb0d3a0b5489a0a67e7a8d38f",
+    "repeat_signature_sha256": "e5747474e9c26e114e2e3e3f8187772c353534f41cbf4536dd5b5d5bb1e2e401"
+  },
+  {
+    "file_tag": "chest__S0_BASE_r4",
+    "scene": "chest",
+    "tag": "S0_BASE_r4",
+    "repeat": 4,
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "experiment_name": "multiscene_feature_followup_v1/stage0/chest/S0_BASE_r4",
+    "config_sha256": "935e6e2b838518030669ff8f27cb4f15db0bf5c5aa4a2fee959ef6a8987c85fc",
+    "repeat_signature_sha256": "e5747474e9c26e114e2e3e3f8187772c353534f41cbf4536dd5b5d5bb1e2e401"
+  },
+  {
+    "file_tag": "chest__S0_BASE_r5",
+    "scene": "chest",
+    "tag": "S0_BASE_r5",
+    "repeat": 5,
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/0_chest_cone",
+    "experiment_name": "multiscene_feature_followup_v1/stage0/chest/S0_BASE_r5",
+    "config_sha256": "ec6223708ad09043e97eb266a9f91a3725de06a1ea6f075ccc30647c9a0a1783",
+    "repeat_signature_sha256": "e5747474e9c26e114e2e3e3f8187772c353534f41cbf4536dd5b5d5bb1e2e401"
+  },
+  {
+    "file_tag": "pepper__S0_BASE_r1",
+    "scene": "pepper",
+    "tag": "S0_BASE_r1",
+    "repeat": 1,
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "experiment_name": "multiscene_feature_followup_v1/stage0/pepper/S0_BASE_r1",
+    "config_sha256": "9773eccfb39c6899f769c39da7b905770f5b4577e38b20ffe7486d48eb39380e",
+    "repeat_signature_sha256": "0758f590cd5ff4bc5386bc7e71cdd218bb55bb5ba2a76da22087be2c88b575a9"
+  },
+  {
+    "file_tag": "pepper__S0_BASE_r2",
+    "scene": "pepper",
+    "tag": "S0_BASE_r2",
+    "repeat": 2,
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "experiment_name": "multiscene_feature_followup_v1/stage0/pepper/S0_BASE_r2",
+    "config_sha256": "34679f9ab9df939aab25eccbef831d10fcf7b8d8e820115ebc193f00de2b0c69",
+    "repeat_signature_sha256": "0758f590cd5ff4bc5386bc7e71cdd218bb55bb5ba2a76da22087be2c88b575a9"
+  },
+  {
+    "file_tag": "pepper__S0_BASE_r3",
+    "scene": "pepper",
+    "tag": "S0_BASE_r3",
+    "repeat": 3,
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "experiment_name": "multiscene_feature_followup_v1/stage0/pepper/S0_BASE_r3",
+    "config_sha256": "a605afc70ab4cb0b9cc87bf020b7dd0c84a05929f9c8734ab0270626496db393",
+    "repeat_signature_sha256": "0758f590cd5ff4bc5386bc7e71cdd218bb55bb5ba2a76da22087be2c88b575a9"
+  },
+  {
+    "file_tag": "pepper__S0_BASE_r4",
+    "scene": "pepper",
+    "tag": "S0_BASE_r4",
+    "repeat": 4,
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "experiment_name": "multiscene_feature_followup_v1/stage0/pepper/S0_BASE_r4",
+    "config_sha256": "472bd2da6c8d9ebf6a4de3e085b786aa3d4973b2d502cee62b73da4d69ade8ae",
+    "repeat_signature_sha256": "0758f590cd5ff4bc5386bc7e71cdd218bb55bb5ba2a76da22087be2c88b575a9"
+  },
+  {
+    "file_tag": "pepper__S0_BASE_r5",
+    "scene": "pepper",
+    "tag": "S0_BASE_r5",
+    "repeat": 5,
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/1_pepper_cone",
+    "experiment_name": "multiscene_feature_followup_v1/stage0/pepper/S0_BASE_r5",
+    "config_sha256": "db815f046fee75855f18ce27b56dbdab3f594cfdcb23db39cbd5423409e673ca",
+    "repeat_signature_sha256": "0758f590cd5ff4bc5386bc7e71cdd218bb55bb5ba2a76da22087be2c88b575a9"
+  },
+  {
+    "file_tag": "engine__S0_BASE_r1",
+    "scene": "engine",
+    "tag": "S0_BASE_r1",
+    "repeat": 1,
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "experiment_name": "multiscene_feature_followup_v1/stage0/engine/S0_BASE_r1",
+    "config_sha256": "79a08a4f769ce99c80f47f41a68b6d2bc001dd8689c2bbd4c2759007fc972758",
+    "repeat_signature_sha256": "5aeda2b8645f16b0b87ccdab9d26d3f8b98c8f92a0b2ee753c80b465a9b17b40"
+  },
+  {
+    "file_tag": "engine__S0_BASE_r2",
+    "scene": "engine",
+    "tag": "S0_BASE_r2",
+    "repeat": 2,
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "experiment_name": "multiscene_feature_followup_v1/stage0/engine/S0_BASE_r2",
+    "config_sha256": "fde905539e9d538908b2cb7dc3d1e7c8208792fb0b67c46bf8a7224d33a6e9ee",
+    "repeat_signature_sha256": "5aeda2b8645f16b0b87ccdab9d26d3f8b98c8f92a0b2ee753c80b465a9b17b40"
+  },
+  {
+    "file_tag": "engine__S0_BASE_r3",
+    "scene": "engine",
+    "tag": "S0_BASE_r3",
+    "repeat": 3,
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "experiment_name": "multiscene_feature_followup_v1/stage0/engine/S0_BASE_r3",
+    "config_sha256": "637af82823a6391d31c6460e394db385c87905444c5386b4926e11b00c426d90",
+    "repeat_signature_sha256": "5aeda2b8645f16b0b87ccdab9d26d3f8b98c8f92a0b2ee753c80b465a9b17b40"
+  },
+  {
+    "file_tag": "engine__S0_BASE_r4",
+    "scene": "engine",
+    "tag": "S0_BASE_r4",
+    "repeat": 4,
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "experiment_name": "multiscene_feature_followup_v1/stage0/engine/S0_BASE_r4",
+    "config_sha256": "e8359e08cf9b3b8df04f3bc43b735d2d04cb54e68fead21cdb9d6f4ff9256634",
+    "repeat_signature_sha256": "5aeda2b8645f16b0b87ccdab9d26d3f8b98c8f92a0b2ee753c80b465a9b17b40"
+  },
+  {
+    "file_tag": "engine__S0_BASE_r5",
+    "scene": "engine",
+    "tag": "S0_BASE_r5",
+    "repeat": 5,
+    "seed": 42,
+    "data_path": "r2_data/synthetic_dataset/cone_ntrain_75_angle_360/2_engine_cone",
+    "experiment_name": "multiscene_feature_followup_v1/stage0/engine/S0_BASE_r5",
+    "config_sha256": "957c70ddad8748f2d8eff35e4f92aa0c0713c75e00ccbf8c2530dc8787a23ddd",
+    "repeat_signature_sha256": "5aeda2b8645f16b0b87ccdab9d26d3f8b98c8f92a0b2ee753c80b465a9b17b40"
+  }
+]
