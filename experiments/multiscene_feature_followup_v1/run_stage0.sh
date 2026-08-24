@@ -8,7 +8,7 @@ ARMS=("$@")
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-/code/lc64-radfoam}"
 PY="${PY:-python3}"
-CFG_DIR_REL="experiments/multiscene_feature_followup_v1/configs"
+CFG_DIR_REL="${CFG_DIR_REL:-experiments/multiscene_feature_followup_v1/configs}"
 SHARED_RUNNER="$HERE/../sweep_revalidate_v1/run_sweep.sh"
 
 cd "$REPO"
