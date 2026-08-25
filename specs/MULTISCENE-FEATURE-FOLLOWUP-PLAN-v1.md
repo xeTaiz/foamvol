@@ -216,24 +216,41 @@ Use candidate-minus-baseline paired deltas for each scene/seed block.
   scene loses more than 0.10 dB PSNR.
 - Report scene specialists even when they do not promote as universal settings.
 
-## Stage 2 — bounded interaction matrix
+## Stage 2A — approved two-way interaction matrix
 
-Within each family, choose the Stage-1 member with the highest mean paired
-ΔPSNR subject to the promotion rule. Run each eligible combination on all three
-scenes and seeds 42/43/44; skip a row when its named parent did not promote.
+Stage 1 completed 180/180 runs with all activation assertions passing. Its
+scene/seed-paired parents already have three seeds each, so Stage 2A reuses
+those parent and baseline measurements on the same nine worker assignments.
+Treat the leading pruning settings as a tie band rather than ranking their
+sub-0.06 dB spread.
 
-1. best variance cap + best TV;
-2. best variance cap + `F_BINS3`;
-3. best variance cap + best entropy-mixture arm;
-4. best reference-guided pruning arm + best TV;
-5. `F_NOPRUNE` + best TV, only if `F_NOPRUNE` itself promotes.
+The approved parent set spans distinct outcomes:
+
+- pruning alternatives: `F_CAP030`, `F_IDW020`, `F_NOPRUNE`,
+  `F_REFG_C02_A20`;
+- TV alternatives: `F_TV_3e4` (joint PSNR/Chamfer promotion) and `F_TV_1e3`
+  (PSNR promotion);
+- geometry specialist: `F_ENT60_B3` (Chamfer promotion).
+
+Run every pruning × TV pair (8), every pruning × entropy pair (4), and both
+TV × entropy pairs (2). Pruning alternatives are mutually exclusive and TV
+weights are alternative scalar levels, so neither is crossed within its own
+axis.
+
+Run count: 14 combinations × 3 scenes × 3 seeds = **126 new runs**. Keep each
+scene/seed block on its Stage-1 worker, randomize the 14 combination runs, and
+retain the corrected evaluator, provenance, activation assertions, and exact
+achieved cell counts.
 
 A combination is complementary only when it beats its better single parent by
 `max(0.10 dB, 2 × paired-difference sd)` in at least two scenes without a loss
-greater than 0.10 dB in the third. Beating the baseline alone is insufficient.
+greater than 0.10 dB in the third. For Chamfer, improvement is
+`min(parent Chamfer) - combination Chamfer`, so positive values are better.
+Beating the baseline alone is insufficient.
 
-Maximum Stage-2 size: 5 combinations × 3 scenes × 3 seeds = **45 runs**.
-The actual count may be smaller because non-promoting-parent rows are skipped.
+Three-way pruning × TV × entropy combinations remain gated on Stage-2A
+complementarity. Their maximum size is 8 settings × 3 scenes × 3 seeds =
+**72 runs**.
 
 ## Stage 3 — finalist confirmation and scaling
 

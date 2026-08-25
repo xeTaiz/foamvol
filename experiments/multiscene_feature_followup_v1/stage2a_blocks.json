@@ -1,0 +1,182 @@
+[
+  {
+    "scene": "chest",
+    "seed": 42,
+    "arms": [
+      "chest__S2A_CAP030_TV1e3_s42",
+      "chest__S2A_TV3e4_ENT60_B3_s42",
+      "chest__S2A_IDW020_ENT60_B3_s42",
+      "chest__S2A_CAP030_ENT60_B3_s42",
+      "chest__S2A_REFG_A20_ENT60_B3_s42",
+      "chest__S2A_CAP030_TV3e4_s42",
+      "chest__S2A_NOPRUNE_TV1e3_s42",
+      "chest__S2A_REFG_A20_TV1e3_s42",
+      "chest__S2A_NOPRUNE_ENT60_B3_s42",
+      "chest__S2A_TV1e3_ENT60_B3_s42",
+      "chest__S2A_NOPRUNE_TV3e4_s42",
+      "chest__S2A_REFG_A20_TV3e4_s42",
+      "chest__S2A_IDW020_TV3e4_s42",
+      "chest__S2A_IDW020_TV1e3_s42"
+    ]
+  },
+  {
+    "scene": "chest",
+    "seed": 43,
+    "arms": [
+      "chest__S2A_IDW020_TV3e4_s43",
+      "chest__S2A_NOPRUNE_TV1e3_s43",
+      "chest__S2A_NOPRUNE_ENT60_B3_s43",
+      "chest__S2A_REFG_A20_ENT60_B3_s43",
+      "chest__S2A_TV3e4_ENT60_B3_s43",
+      "chest__S2A_IDW020_ENT60_B3_s43",
+      "chest__S2A_CAP030_TV1e3_s43",
+      "chest__S2A_IDW020_TV1e3_s43",
+      "chest__S2A_CAP030_ENT60_B3_s43",
+      "chest__S2A_REFG_A20_TV1e3_s43",
+      "chest__S2A_NOPRUNE_TV3e4_s43",
+      "chest__S2A_TV1e3_ENT60_B3_s43",
+      "chest__S2A_CAP030_TV3e4_s43",
+      "chest__S2A_REFG_A20_TV3e4_s43"
+    ]
+  },
+  {
+    "scene": "chest",
+    "seed": 44,
+    "arms": [
+      "chest__S2A_IDW020_ENT60_B3_s44",
+      "chest__S2A_NOPRUNE_TV3e4_s44",
+      "chest__S2A_CAP030_TV1e3_s44",
+      "chest__S2A_REFG_A20_ENT60_B3_s44",
+      "chest__S2A_IDW020_TV1e3_s44",
+      "chest__S2A_REFG_A20_TV3e4_s44",
+      "chest__S2A_TV1e3_ENT60_B3_s44",
+      "chest__S2A_NOPRUNE_TV1e3_s44",
+      "chest__S2A_CAP030_ENT60_B3_s44",
+      "chest__S2A_REFG_A20_TV1e3_s44",
+      "chest__S2A_NOPRUNE_ENT60_B3_s44",
+      "chest__S2A_IDW020_TV3e4_s44",
+      "chest__S2A_CAP030_TV3e4_s44",
+      "chest__S2A_TV3e4_ENT60_B3_s44"
+    ]
+  },
+  {
+    "scene": "pepper",
+    "seed": 42,
+    "arms": [
+      "pepper__S2A_NOPRUNE_ENT60_B3_s42",
+      "pepper__S2A_IDW020_TV1e3_s42",
+      "pepper__S2A_NOPRUNE_TV1e3_s42",
+      "pepper__S2A_NOPRUNE_TV3e4_s42",
+      "pepper__S2A_CAP030_TV3e4_s42",
+      "pepper__S2A_CAP030_TV1e3_s42",
+      "pepper__S2A_REFG_A20_TV3e4_s42",
+      "pepper__S2A_CAP030_ENT60_B3_s42",
+      "pepper__S2A_TV1e3_ENT60_B3_s42",
+      "pepper__S2A_IDW020_TV3e4_s42",
+      "pepper__S2A_REFG_A20_TV1e3_s42",
+      "pepper__S2A_REFG_A20_ENT60_B3_s42",
+      "pepper__S2A_IDW020_ENT60_B3_s42",
+      "pepper__S2A_TV3e4_ENT60_B3_s42"
+    ]
+  },
+  {
+    "scene": "pepper",
+    "seed": 43,
+    "arms": [
+      "pepper__S2A_IDW020_TV3e4_s43",
+      "pepper__S2A_NOPRUNE_TV3e4_s43",
+      "pepper__S2A_NOPRUNE_ENT60_B3_s43",
+      "pepper__S2A_TV3e4_ENT60_B3_s43",
+      "pepper__S2A_CAP030_ENT60_B3_s43",
+      "pepper__S2A_REFG_A20_ENT60_B3_s43",
+      "pepper__S2A_REFG_A20_TV1e3_s43",
+      "pepper__S2A_IDW020_ENT60_B3_s43",
+      "pepper__S2A_CAP030_TV3e4_s43",
+      "pepper__S2A_REFG_A20_TV3e4_s43",
+      "pepper__S2A_CAP030_TV1e3_s43",
+      "pepper__S2A_TV1e3_ENT60_B3_s43",
+      "pepper__S2A_IDW020_TV1e3_s43",
+      "pepper__S2A_NOPRUNE_TV1e3_s43"
+    ]
+  },
+  {
+    "scene": "pepper",
+    "seed": 44,
+    "arms": [
+      "pepper__S2A_IDW020_TV1e3_s44",
+      "pepper__S2A_IDW020_TV3e4_s44",
+      "pepper__S2A_TV1e3_ENT60_B3_s44",
+      "pepper__S2A_NOPRUNE_TV1e3_s44",
+      "pepper__S2A_REFG_A20_ENT60_B3_s44",
+      "pepper__S2A_TV3e4_ENT60_B3_s44",
+      "pepper__S2A_NOPRUNE_TV3e4_s44",
+      "pepper__S2A_IDW020_ENT60_B3_s44",
+      "pepper__S2A_CAP030_TV3e4_s44",
+      "pepper__S2A_CAP030_TV1e3_s44",
+      "pepper__S2A_REFG_A20_TV1e3_s44",
+      "pepper__S2A_NOPRUNE_ENT60_B3_s44",
+      "pepper__S2A_CAP030_ENT60_B3_s44",
+      "pepper__S2A_REFG_A20_TV3e4_s44"
+    ]
+  },
+  {
+    "scene": "engine",
+    "seed": 42,
+    "arms": [
+      "engine__S2A_IDW020_ENT60_B3_s42",
+      "engine__S2A_CAP030_ENT60_B3_s42",
+      "engine__S2A_REFG_A20_TV3e4_s42",
+      "engine__S2A_TV1e3_ENT60_B3_s42",
+      "engine__S2A_NOPRUNE_TV1e3_s42",
+      "engine__S2A_REFG_A20_ENT60_B3_s42",
+      "engine__S2A_NOPRUNE_ENT60_B3_s42",
+      "engine__S2A_IDW020_TV1e3_s42",
+      "engine__S2A_NOPRUNE_TV3e4_s42",
+      "engine__S2A_REFG_A20_TV1e3_s42",
+      "engine__S2A_IDW020_TV3e4_s42",
+      "engine__S2A_CAP030_TV3e4_s42",
+      "engine__S2A_CAP030_TV1e3_s42",
+      "engine__S2A_TV3e4_ENT60_B3_s42"
+    ]
+  },
+  {
+    "scene": "engine",
+    "seed": 43,
+    "arms": [
+      "engine__S2A_NOPRUNE_TV1e3_s43",
+      "engine__S2A_NOPRUNE_ENT60_B3_s43",
+      "engine__S2A_CAP030_TV3e4_s43",
+      "engine__S2A_REFG_A20_TV3e4_s43",
+      "engine__S2A_IDW020_TV1e3_s43",
+      "engine__S2A_CAP030_ENT60_B3_s43",
+      "engine__S2A_NOPRUNE_TV3e4_s43",
+      "engine__S2A_REFG_A20_TV1e3_s43",
+      "engine__S2A_IDW020_TV3e4_s43",
+      "engine__S2A_REFG_A20_ENT60_B3_s43",
+      "engine__S2A_CAP030_TV1e3_s43",
+      "engine__S2A_TV3e4_ENT60_B3_s43",
+      "engine__S2A_IDW020_ENT60_B3_s43",
+      "engine__S2A_TV1e3_ENT60_B3_s43"
+    ]
+  },
+  {
+    "scene": "engine",
+    "seed": 44,
+    "arms": [
+      "engine__S2A_TV3e4_ENT60_B3_s44",
+      "engine__S2A_CAP030_TV1e3_s44",
+      "engine__S2A_IDW020_ENT60_B3_s44",
+      "engine__S2A_NOPRUNE_TV1e3_s44",
+      "engine__S2A_REFG_A20_TV1e3_s44",
+      "engine__S2A_IDW020_TV3e4_s44",
+      "engine__S2A_NOPRUNE_ENT60_B3_s44",
+      "engine__S2A_REFG_A20_TV3e4_s44",
+      "engine__S2A_CAP030_ENT60_B3_s44",
+      "engine__S2A_IDW020_TV1e3_s44",
+      "engine__S2A_TV1e3_ENT60_B3_s44",
+      "engine__S2A_NOPRUNE_TV3e4_s44",
+      "engine__S2A_REFG_A20_ENT60_B3_s44",
+      "engine__S2A_CAP030_TV3e4_s44"
+    ]
+  }
+]
