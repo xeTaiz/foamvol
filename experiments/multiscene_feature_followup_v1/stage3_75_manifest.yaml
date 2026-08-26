@@ -1,0 +1,49 @@
+version: 1
+base_config: configs/fixed_final/256k.yaml
+output_prefix: multiscene_feature_followup_v1/stage3_75
+seed: 45
+data_root: r2_data/synthetic_dataset/cone_ntrain_75_angle_360
+volumes:
+  chest: 0_chest_cone
+  foot: 0_foot_cone
+  head: 0_head_cone
+  jaw: 0_jaw_cone
+  pancreas: 0_pancreas_cone
+  beetle: 1_beetle_cone
+  bonsai: 1_bonsai_cone
+  broccoli: 1_broccoli_cone
+  kingsnake: 1_kingsnake_cone
+  pepper: 1_pepper_cone
+  backpack: 2_backpack_cone
+  engine: 2_engine_cone
+  mount: 2_mount_cone
+  present: 2_present_cone
+  teapot: 2_teapot_cone
+components:
+  CAP030: {redundancy_cap: 0.03}
+  IDW020: {prune_variance_criterion: false, redundancy_threshold: 0.02, redundancy_cap: 0.02}
+  NOPRUNE: {prune_variance_criterion: false, redundancy_threshold: 0.0, redundancy_cap: 0.0}
+  REFG_A20: {ref_guided_pruning: true, redundancy_cap: 0.02, ref_volume_edge_alpha: 20, ref_volume_blur_sigma: 0.0}
+  TV3e4: {tv_weight: 3e-4}
+  TV1e3: {tv_weight: 1e-3}
+  ENT60_B3: {gradient_fraction: 0.2, idw_fraction: 0.2, entropy_fraction: 0.6, entropy_bins: 3}
+settings:
+  - {tag: BASE, components: []}
+  - {tag: TV1e3, components: [TV1e3]}
+  - {tag: TV3e4, components: [TV3e4]}
+  - {tag: CAP030, components: [CAP030]}
+  - {tag: IDW020, components: [IDW020]}
+  - {tag: NOPRUNE, components: [NOPRUNE]}
+  - {tag: REFG_A20, components: [REFG_A20]}
+  - {tag: ENT60_B3, components: [ENT60_B3]}
+  - {tag: CAP030_TV1e3, components: [CAP030, TV1e3]}
+  - {tag: CAP030_TV3e4, components: [CAP030, TV3e4]}
+  - {tag: IDW020_TV1e3, components: [IDW020, TV1e3]}
+  - {tag: IDW020_TV3e4, components: [IDW020, TV3e4]}
+  - {tag: NOPRUNE_TV1e3, components: [NOPRUNE, TV1e3]}
+  - {tag: NOPRUNE_TV3e4, components: [NOPRUNE, TV3e4]}
+  - {tag: REFG_A20_TV1e3, components: [REFG_A20, TV1e3]}
+  - {tag: REFG_A20_TV3e4, components: [REFG_A20, TV3e4]}
+  - {tag: TV3e4_ENT60_B3, components: [TV3e4, ENT60_B3]}
+  - {tag: CAP030_TV3e4_ENT60_B3, components: [CAP030, TV3e4, ENT60_B3]}
+coverage: {volumes: 15, settings: 18, total_configs: 270}
