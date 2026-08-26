@@ -5,7 +5,7 @@ set -u
 GPU="${1:-0}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-/code/lc64-radfoam}"
-PY="${PY:-/code/lc64-venv/bin/python}"
+PY="${PY:-python3}"
 CFG_DIR_REL="experiments/multiscene_feature_followup_v1/stage3_75_configs"
 QUEUE_REL="experiments/multiscene_feature_followup_v1/stage3_75_queue.txt"
 SHARED_RUNNER="$HERE/../sweep_revalidate_v1/run_sweep.sh"
